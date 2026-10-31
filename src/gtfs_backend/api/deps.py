@@ -1,0 +1,65 @@
+"""Dependencies shared by the routers: the service context and parsed query parameters."""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Annotated
+
+from fastapi import Depends, Query, Request
+
+from gtfs_backend.api.context import Context
+from gtfs_backend.api.data.geo import BBOX_FORMAT, POINT_FORMAT, Bbox, Point
+from gtfs_backend.api.errors import InvalidInput
+from gtfs_backend.keys import InvalidKey, parse_service_date
+
+
+def bare_context(request: Request) -> Context:
+    """The context without refreshing the catalog (works while the database is down)."""
+    return request.app.state.ctx
+
+
+async def context(request: Request) -> Context:
+    ctx = bare_context(request)
+    await ctx.catalog.ensure_fresh()
+    return ctx
+
+
+def parse_date(value: str) -> date:
+    try:
+        return parse_service_date(value)
+    except InvalidKey as exc:
+        raise InvalidInput(str(exc)) from None
+
+
+def split_csv(values: list[str] | None) -> set[str]:
+    """`?modes=tram,bus` and `?modes=tram&modes=bus` alike."""
+    return {v.strip() for x in values or [] for v in x.split(",") if v.strip()}
+
+
+def _bbox(bbox: Annotated[str, Query(description=BBOX_FORMAT)]) -> Bbox:
+    return Bbox.parse(bbox)
+
+
+def _near(near: Annotated[str | None, Query(description=f"{POINT_FORMAT}: closer stops first among equal matches")] = None):
+    return Point.parse(near) if near else None
+
+
+def _query_date(date_: Annotated[str | None, Query(alias="date", description="YYYYMMDD, default today")] = None):
+    return parse_date(date_) if date_ else None
+
+
+def _modes(modes: Annotated[list[str] | None, Query(description="e.g. tram,bus")] = None) -> set[str]:
+    return split_csv(modes)
+
+
+def _routes(route: Annotated[list[str] | None, Query(description="line names, e.g. 52,4")] = None) -> set[str]:
+    return split_csv(route)
+
+
+Ctx = Annotated[Context, Depends(context)]
+BareCtx = Annotated[Context, Depends(bare_context)]
+BboxQuery = Annotated[Bbox, Depends(_bbox)]
+NearQuery = Annotated[Point | None, Depends(_near)]
+DateQuery = Annotated[date | None, Depends(_query_date)]
+ModesQuery = Annotated[set[str], Depends(_modes)]
+RouteNamesQuery = Annotated[set[str], Depends(_routes)]

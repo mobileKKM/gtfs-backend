@@ -1,0 +1,63 @@
+# Feeds to ingest. Connections and other settings are env vars (see .env.example).
+#
+# realtime_poll_interval: how often this feed's realtime files are polled (default REALTIME_POLL_INTERVAL).
+# realtime_max_age: how long the last data stays live while the files don't change (default REALTIME_MAX_AGE).
+#
+# stop_namespace: feeds with the same namespace share stop codes. ZTP's three feeds use one numbering
+# (`802-01` is the same platform in all of them); other feeds keep their codes to themselves.
+# realtime kinds: vehicle_positions, trip_updates, service_alerts, or `combined` for one file with all.
+
+# Stop search only finds stops of these namespaces (default: all): ZTP's, where the metropolitan card is valid.
+search_namespaces: [ztp]
+
+feeds:
+  - feed_id: kmk_a # MPK buses
+    stop_namespace: ztp
+    realtime_poll_interval: 5 # ZTP updates every ~5 s and answers 304 via ETag in between
+    static: https://gtfs.ztp.krakow.pl/GTFS_KRK_A.zip
+    realtime:
+      vehicle_positions: https://gtfs.ztp.krakow.pl/VehiclePositions_A.pb
+      trip_updates: https://gtfs.ztp.krakow.pl/TripUpdates_A.pb
+      service_alerts: https://gtfs.ztp.krakow.pl/ServiceAlerts_A.pb
+
+  - feed_id: kmk_m # Mobilis buses
+    stop_namespace: ztp
+    realtime_poll_interval: 5 # ZTP updates every ~5 s and answers 304 via ETag in between
+    static: https://gtfs.ztp.krakow.pl/GTFS_KRK_M.zip
+    realtime:
+      vehicle_positions: https://gtfs.ztp.krakow.pl/VehiclePositions_M.pb
+      trip_updates: https://gtfs.ztp.krakow.pl/TripUpdates_M.pb
+      service_alerts: https://gtfs.ztp.krakow.pl/ServiceAlerts_M.pb
+
+  - feed_id: kmk_t # Trams
+    stop_namespace: ztp
+    realtime_poll_interval: 5 # ZTP updates every ~5 s and answers 304 via ETag in between
+    # The tram system counts times from local midnight, not noon - 12h (seen on the 2026-10-25 clock change).
+    day_start: midnight
+    # After midnight the realtime ids of still-running trips end in today's `_service_N`, not yesterday's (seen 2026-10-31).
+    ignore_service_suffix: true
+    static: https://gtfs.ztp.krakow.pl/GTFS_KRK_T.zip
+    realtime:
+      vehicle_positions: https://gtfs.ztp.krakow.pl/VehiclePositions_T.pb
+      trip_updates: https://gtfs.ztp.krakow.pl/TripUpdates_T.pb
+      service_alerts: https://gtfs.ztp.krakow.pl/ServiceAlerts_T.pb
+
+  # Koleje Małopolskie, trains ("Kolej"). The site serves files via base64-encoded paths.
+  - feed_id: km_kolej
+    # The realtime file changes only every ~5 min (measured 2026-10-27).
+    realtime_poll_interval: 30
+    realtime_max_age: 600
+    static: https://gtfs.kolejemalopolskie.com.pl/?download=L2hvbWUva21sL3JvemtsYWR5X2phemR5L2tvbGVqL2d0ZnMuemlw
+    realtime:
+      combined: https://gtfs.kolejemalopolskie.com.pl/?download=L2hvbWUva21sL3JvemtsYWR5X2phemR5L2tvbGVqL3JlYWx0aW1lLnBi
+
+  # Koleje Małopolskie, feeder buses ("MLD", Małopolskie Linie Dowozowe). GTFS.zip, not GTFS_GOOGLE.zip:
+  # the Google variant rewrites pickup/drop_off_type 3 (arrange with driver) to 0.
+  # Realtime files change every 20 s, all three together (measured 2026-10-27); no ETag, ~8 KB each.
+  - feed_id: km_mld
+    share_stops_with: [ztp] # in Kraków MLD buses mostly use ZTP's poles (not all, e.g. Kraków MDA)
+    static: https://gtfs.kolejemalopolskie.com.pl/?download=L2hvbWUvcmdfdXNlci9yZ191c2VyL0dURlMtU1QvR1RGUy56aXA%3D
+    realtime:
+      vehicle_positions: https://gtfs.kolejemalopolskie.com.pl/?download=L2hvbWUvcmdfdXNlci9yZ191c2VyL0dURlMtUlQvdmVoaWNsZV9wb3NpdGlvbnMucGI%3D
+      trip_updates: https://gtfs.kolejemalopolskie.com.pl/?download=L2hvbWUvcmdfdXNlci9yZ191c2VyL0dURlMtUlQvdHJpcF91cGRhdGVzLnBi
+      service_alerts: https://gtfs.kolejemalopolskie.com.pl/?download=L2hvbWUvcmdfdXNlci9yZ191c2VyL0dURlMtUlQvYWxlcnRzLnBi

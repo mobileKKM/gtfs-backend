@@ -1,0 +1,92 @@
+# Production: Postgres/PostGIS + Redis + the worker (one process running every static/realtime task) + the HTTP API
+# (API_WORKERS processes behind one port).
+# The worker and the API are separate images (Dockerfile targets) with separate dependencies.
+#   POSTGRES_PASSWORD=... docker compose up -d --build
+# The API also joins the external `nginx_proxy` network (create it once: docker network create nginx_proxy), so a
+# reverse proxy on that network reaches it as http://api:8000.
+services:
+  postgres:
+    image: ${POSTGIS_IMAGE:-postgis/postgis:17-3.5}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gtfs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-gtfs}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"] # live data only, nothing to persist
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    build:
+      context: .
+      target: worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gtfs}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gtfs}
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ARCHIVE_DIR: /data/archive
+      OSM_STOPS_FILE: /data/osm/stops.json
+    command: ["sh", "-c", "alembic upgrade head && exec gtfs-worker run"]
+    volumes:
+      - ./data:/data
+      - ./feeds.yml:/app/feeds.yml:ro
+    # the worker touches /tmp/gtfs-worker.alive every 30 s while all realtime tasks keep polling (and exits, so it is
+    # restarted, when one is stuck for WATCHDOG_TIMEOUT); unhealthy = no touch for 2 minutes
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/gtfs-worker.alive') > 120)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  api:
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gtfs}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gtfs}
+      REDIS_URL: redis://redis:6379/0
+      API_WORKERS: ${API_WORKERS:-4}
+    networks:
+      - default
+      - nginx_proxy
+    volumes:
+      - ./feeds.yml:/app/feeds.yml:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+networks:
+  nginx_proxy:
+    external: true
+
+volumes:
+  pgdata:

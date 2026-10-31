@@ -1,0 +1,31 @@
+# Development: only Postgres/PostGIS and Redis. The worker runs on the host via `uv run`.
+services:
+  postgres:
+    # Multi-arch build of the official postgis/postgis image (the official one is amd64-only).
+    image: ${POSTGIS_IMAGE:-imresamu/postgis:17-3.5}
+    environment:
+      POSTGRES_USER: gtfs
+      POSTGRES_PASSWORD: gtfs
+      POSTGRES_DB: gtfs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gtfs -d gtfs"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

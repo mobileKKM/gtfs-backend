@@ -5,7 +5,7 @@ description = "GTFS static + realtime ingestion and map API for mobileKKM (ZTP K
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 # Shared by the worker and the API (the modules at the gtfs_backend root).
 dependencies = [
     "psycopg[binary,pool]>=3.3.6",
@@ -40,7 +40,7 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 130
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

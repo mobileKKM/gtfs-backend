@@ -14,7 +14,7 @@ after the last change, or the feed's `realtime_max_age` (`km_kolej`: 600).
 
 ## Running it
 
-Requirements: Python 3.13 with [uv](https://docs.astral.sh/uv/), Docker.
+Requirements: Python 3.12+ with [uv](https://docs.astral.sh/uv/), Docker.
 
 ```sh
 docker compose -f docker-compose.dev.yml up -d   # Postgres/PostGIS + Redis only

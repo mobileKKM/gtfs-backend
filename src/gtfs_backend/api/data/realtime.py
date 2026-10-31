@@ -23,7 +23,9 @@ async def vehicle_json(redis: Redis, ids: list[str]) -> list[dict]:
 
 async def vehicles_near(redis: Redis, lat: float, lon: float, width_km: float, height_km: float) -> list[str]:
     """Vehicle keys in a box around a point."""
-    return await redis.geosearch(live_layout.VEHICLES_GEO, longitude=lon, latitude=lat, width=width_km, height=height_km, unit="km")
+    return await redis.geosearch(
+        live_layout.VEHICLES_GEO, longitude=lon, latitude=lat, width=width_km, height=height_km, unit="km"
+    )
 
 
 async def alerts_json(redis: Redis, feed_ids: list[str]) -> list[dict]:

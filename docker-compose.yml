@@ -7,6 +7,7 @@
 services:
   postgres:
     image: ${POSTGIS_IMAGE:-postgis/postgis:17-3.5}
+    container_name: mkkm-gtfs-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-gtfs}
@@ -22,6 +23,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    container_name: mkkm-gtfs-redis
     restart: unless-stopped
     command: ["redis-server", "--save", "", "--appendonly", "no"] # live data only, nothing to persist
     healthcheck:
@@ -34,6 +36,7 @@ services:
     build:
       context: .
       target: worker
+    container_name: mkkm-gtfs-worker
     restart: unless-stopped
     depends_on:
       postgres:
@@ -63,6 +66,7 @@ services:
     build:
       context: .
       target: api
+    container_name: mkkm-gtfs-api
     restart: unless-stopped
     depends_on:
       postgres:

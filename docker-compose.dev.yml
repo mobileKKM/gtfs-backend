@@ -1,8 +1,7 @@
-# Development: only Postgres/PostGIS and Redis. The worker runs on the host via `uv run`.
 services:
   postgres:
-    # Multi-arch build of the official postgis/postgis image (the official one is amd64-only).
     image: ${POSTGIS_IMAGE:-imresamu/postgis:17-3.5}
+    container_name: mkkm-gtfs-dev-postgres
     environment:
       POSTGRES_USER: gtfs
       POSTGRES_PASSWORD: gtfs
@@ -19,6 +18,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    container_name: mkkm-gtfs-dev-redis
     ports:
       - "6379:6379"
     healthcheck:

@@ -8,13 +8,13 @@ COPY pyproject.toml uv.lock ./
 
 FROM build-base AS build-api
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project --extra api
-COPY README.md ./
+COPY README.md LICENSE ./
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --extra api
 
 FROM build-base AS build-worker
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project --extra worker
-COPY README.md alembic.ini ./
+COPY README.md LICENSE alembic.ini ./
 COPY src ./src
 COPY migrations ./migrations
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --extra worker

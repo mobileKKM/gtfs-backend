@@ -32,6 +32,10 @@ EXPOSE 8000
 CMD ["gtfs-api", "--host", "0.0.0.0", "--port", "8000"]
 
 FROM runtime AS worker
+# pyosmium links against the system libexpat, which the slim image lacks.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build-worker --chown=app:app /app /app
 COPY --chown=app:app feeds.yml ./
 ENV ARCHIVE_DIR=/data/archive

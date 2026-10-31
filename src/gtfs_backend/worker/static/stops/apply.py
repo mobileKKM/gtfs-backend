@@ -200,6 +200,9 @@ def apply_matches(
         for stop_id, pid in shared_links.items():
             cp.write_row((feed_version_id, stop_id, pid))
 
+    # the rows written above are uncommitted, so autovacuum can't have analyzed them; refresh_stop_state and the
+    # platform directions query join them with millions of stop_times and would be planned blind
+    cur.execute("ANALYZE core.stop_link, core.stop_platform")
     refresh_stop_state(conn, current_versions(cur, feed_id, feed_version_id))
     methods = Counter(plan.method_for_key.values())
     for k, n in shared_plan.methods.items():

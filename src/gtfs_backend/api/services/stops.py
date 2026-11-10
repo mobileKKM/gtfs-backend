@@ -192,15 +192,33 @@ async def served_routes(conn: AsyncConnection, catalog: Catalog, platforms: list
 # ------------------------------------------------------------------------------------------------- endpoints
 
 
-async def in_bbox(ctx: Context, bbox: Bbox) -> StopList:
-    """Active platforms inside the box, at most MAX_RESULTS. Groups are only for search."""
+async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], kind: str) -> StopList:
+    """Active platforms (or groups, `kind="group"`) inside the box, at most MAX_RESULTS. With `modes`, only stops
+    served by any of them; a group is placed (and so found) at its centroid."""
     limit = MAX_RESULTS
-    async with ctx.pool.connection() as conn:
-        cur = await conn.execute(
-            f"SELECT {PLATFORM_COLS} FROM core.stop_platform p WHERE {SERVED} "
-            "AND p.geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326) ORDER BY p.id LIMIT %s",
-            (bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat, limit + 1),
+    envelope = "ST_MakeEnvelope(%(min_lon)s, %(min_lat)s, %(max_lon)s, %(max_lat)s, 4326)"
+    has_mode = "(cardinality(%(modes)s::text[]) = 0 OR p.modes && %(modes)s::text[])"
+    if kind == "group":
+        query = (
+            f"SELECT {GROUP_COLS} FROM core.stop_group g WHERE g.active AND g.geom && {envelope} "
+            f"AND EXISTS (SELECT 1 FROM core.stop_platform p WHERE p.stop_group_id = g.id AND {SERVED} AND {has_mode}) "
+            "ORDER BY g.id LIMIT %(limit)s"
         )
+    else:
+        query = (
+            f"SELECT {PLATFORM_COLS} FROM core.stop_platform p WHERE {SERVED} AND {has_mode} "
+            f"AND p.geom && {envelope} ORDER BY p.id LIMIT %(limit)s"
+        )
+    params = {
+        "min_lon": bbox.min_lon,
+        "min_lat": bbox.min_lat,
+        "max_lon": bbox.max_lon,
+        "max_lat": bbox.max_lat,
+        "modes": sorted(modes),
+        "limit": limit + 1,
+    }
+    async with ctx.pool.connection() as conn:
+        cur = await conn.execute(query, params)
         rows = await cur.fetchall()
     return StopList(truncated=len(rows) > limit, stops=[stop_from_row(r) for r in rows[:limit]])
 

@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request
 
 from gtfs_backend.api.cache import LIVE, cached, json_response, public
-from gtfs_backend.api.deps import BboxQuery, Ctx, NearQuery
+from gtfs_backend.api.deps import BboxQuery, Ctx, ModesQuery, NearQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import DepartureBoard, SearchResult, StopList
 from gtfs_backend.api.services import departures, stops
@@ -14,9 +14,12 @@ router = APIRouter(prefix=PREFIX, tags=["stops"])
 
 
 @router.get("/stops", response_model=StopList)
-async def stops_in_bbox(request: Request, ctx: Ctx, bbox: BboxQuery):
-    """Active physical stops (platforms) inside a bounding box, for the map. Logical stops are only in search."""
-    return json_response(request, await stops.in_bbox(ctx, bbox), public(ctx.settings.cache_ttl_static))
+async def stops_in_bbox(request: Request, ctx: Ctx, bbox: BboxQuery, modes: ModesQuery, kind: StopKindQuery):
+    """Active stops inside a bounding box, for the map: physical ones (platforms) by default, or logical ones
+    (`kind=group`, one marker per stop at its platforms' centroid) for far zoom levels.
+
+    `modes` keeps stops served by any of them, e.g. `kind=group&modes=rail` for train stations."""
+    return json_response(request, await stops.in_bbox(ctx, bbox, modes, kind), public(ctx.settings.cache_ttl_static))
 
 
 @router.get("/stops/search", response_model=SearchResult)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, Query, Request
 
@@ -52,6 +52,15 @@ def _modes(modes: Annotated[list[str] | None, Query(description="e.g. tram,bus")
     return split_csv(modes)
 
 
+StopKind = Literal["platform", "group"]
+
+
+def _stop_kind(
+    kind: Annotated[StopKind, Query(description="`platform` (default) or `group`: one logical stop per marker")] = "platform",
+) -> StopKind:
+    return kind
+
+
 def _routes(route: Annotated[list[str] | None, Query(description="line names, e.g. 52,4")] = None) -> set[str]:
     return split_csv(route)
 
@@ -63,3 +72,4 @@ NearQuery = Annotated[Point | None, Depends(_near)]
 DateQuery = Annotated[date | None, Depends(_query_date)]
 ModesQuery = Annotated[set[str], Depends(_modes)]
 RouteNamesQuery = Annotated[set[str], Depends(_routes)]
+StopKindQuery = Annotated[StopKind, Depends(_stop_kind)]

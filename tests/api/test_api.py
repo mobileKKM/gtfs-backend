@@ -166,6 +166,29 @@ async def test_stops_on_map_are_platforms(api, sql):
     assert {"bus", "tram"} <= {m for p in rondo for m in p["modes"]}
 
 
+async def test_stops_on_map_as_groups(api, sql):
+    body = (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=group")).json()
+    assert not body["truncated"] and body["stops"] and all(s["kind"] == "group" for s in body["stops"])
+    assert all(s["group_id"] is None and s["platform"] is None for s in body["stops"])
+    rondo = next(s for s in body["stops"] if s["id"] == group_id(sql, "802"))
+    assert rondo["key"] == f"rondo-mogilskie-{rondo['id']}" and {"bus", "tram"} <= set(rondo["modes"])
+    assert (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=bogus")).status_code == 422
+
+
+@pytest.mark.parametrize("kind", ["platform", "group"])
+async def test_stops_on_map_by_mode(api, kind):
+    async def ids(modes: str = "") -> set[str]:
+        body = (await api.get(f"/stops?bbox={CITY_BBOX}&kind={kind}&modes={modes}")).json()
+        assert not body["truncated"]
+        assert not modes or all(set(s["modes"]) & set(modes.split(",")) for s in body["stops"])
+        return {s["id"] for s in body["stops"]}
+
+    everything, tram, bus = await ids(), await ids("tram"), await ids("bus")
+    assert tram and bus and tram < everything and bus < everything
+    assert await ids("tram,bus") == tram | bus
+    assert await ids("nonexistent") == set()
+
+
 async def test_stop_search(api, sql):
     results = (await api.get("/stops/search?q=rondo mog")).json()["results"]
     rondo = results[0]
@@ -227,6 +250,7 @@ async def test_stops_without_trips_are_never_returned(api, sql, loaded):
         clear_modes("stop_group_id", gid)
         assert gid not in {r["id"] for r in (await api.get("/stops/search?q=rondo mog")).json()["results"]}
         assert not {s["id"] for s in (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"] if s["group_id"] == gid}
+        assert gid not in {s["id"] for s in (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=group")).json()["stops"]}
     finally:
         with psycopg.connect(loaded) as conn:
             conn.cursor().executemany("UPDATE core.stop_platform SET modes = %s WHERE id = %s", [(m, i) for i, m in saved])

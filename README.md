@@ -153,18 +153,18 @@ The source id comes last and is kept whole, so ids with `:` or `/` work.
 
 | endpoint | what |
 |---|---|
-| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&route=52]` | live vehicles in a box (≤ 50 km): position, bearing, line, headsign, delay, `trip_key` |
+| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, line, headsign, delay, `trip_key` |
 | `GET /vehicles/{vehicle_key}/trip` | trip view of the vehicle's current trip (polling follows it onto the next) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | platforms with `group_id`, or logical stops (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…[&near=lat,lon]` | logical stops by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with platforms, directions and lines |
-| `GET /stops/{key}/departures[?cursor=…][&limit=20]` | timetable + realtime, paged both ways; alerts on the first page |
+| `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and line names; alerts included |
 | `GET /trips/{trip_key}` | shape polyline, every stop with scheduled/estimated times, live vehicle, alerts |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts as published |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
 
 **Errors**: `{"error": {"code": "not_found" | "invalid_input" | "method_not_allowed" | …, "message": "…"}}`: 404
-unknown things, 422 malformed keys/dates/boxes/cursors, 503 `unavailable` with `Retry-After` when connections are
+unknown things, 422 malformed keys/dates/boxes/times, unknown feeds, 503 `unavailable` with `Retry-After` when connections are
 busy or a store is down, 500 `internal` without details.
 
 **Several processes.** `API_WORKERS` processes share one port, each with bounded pools (`DB_POOL_MAX_SIZE`,
@@ -189,8 +189,13 @@ Notes:
   delayed departures stay. Predictions are used only for the same version. `status`: `scheduled`, `live`,
   `departed`, `canceled`, `skipped`; `time` is the estimate if known. Last stops and stops without pickup are not
   departures; `on_demand` marks GTFS pickup type 2/3.
-- **Paging**: the first page starts now; follow `later`/`earlier` (opaque cursors). The window widens (2 h, 6 h,
-  24 h) until a page is full; a direction with nothing more gets `null`.
+- **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
+  show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
+  (tell them apart by `trip_key` + `stop_sequence`). The window widens (2 h, 6 h, 24 h) until a page is full.
+- **Filters**: `feeds` (feed ids) and `routes` (line names), comma separated or repeated; they narrow the board and
+  its alerts, and an unknown feed is a 422. The board lists `lines`, every route departing from the stop today, so
+  clients know what to filter by. Feeds publish line variants as separate routes (km_mld has two `A18`), so a name
+  can repeat: dedupe by name for display. `/vehicles` takes `routes` as well.
 - **Trip view**: `shape.source` is `shape`, or `stops` when the feed has none (trains). `current_index` is the
   first stop not yet passed; `vehicle` is set while one runs the trip.
 - **Polling**: live responses are `no-cache`; clients refetch the open view about every 10 s with `If-None-Match`

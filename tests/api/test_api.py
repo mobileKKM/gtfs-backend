@@ -145,7 +145,7 @@ async def test_vehicles_in_bbox(api):
     trams = (await api.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"]
     assert trams and all(v["mode"] == "tram" for v in trams)
     line = tram["line"]["name"]
-    on_line = (await api.get(f"/vehicles?bbox={CITY_BBOX}&route={line}")).json()["vehicles"]
+    on_line = (await api.get(f"/vehicles?bbox={CITY_BBOX}&routes={line}")).json()["vehicles"]
     assert on_line and all(v["line"]["name"] == line for v in on_line)
 
 
@@ -322,37 +322,59 @@ async def test_departure_board_merges_feeds_with_realtime(api, sql):
     assert tram["scheduled"] == 1792879200 + secs  # 2026-10-25 00:00 CEST
 
 
-async def test_departure_board_pages_both_ways(api, sql):
+async def test_departure_board_pages_by_time(api, sql):
     url = f"/stops/{group_id(sql, '802')}/departures"
     first = (await api.get(f"{url}?limit=10")).json()
-    assert first["alerts"] is not None and first["earlier"] and first["later"]
+    assert first["alerts"] is not None and "earlier" not in first and "later" not in first
 
-    # forward: continuous, no duplicates, no alerts on scroll pages
+    # forward from the last time: no gaps, repeats only within the same second
     seen = [(d["trip_key"], d["stop_sequence"]) for d in first["departures"]]
     page = first
     for _ in range(3):
-        page = (await api.get(f"{url}?limit=10&cursor={page['later']}")).json()
-        assert page["alerts"] == [] and page["departures"]
-        assert page["departures"][0]["time"] >= first["departures"][-1]["time"]
-        seen += [(d["trip_key"], d["stop_sequence"]) for d in page["departures"]]
-    assert len(seen) == len(set(seen)) == 40
-    times = [d["time"] for d in first["departures"]]
-    big = (await api.get(f"{url}?limit=40")).json()["departures"]
-    assert [(d["trip_key"], d["stop_sequence"]) for d in big] == seen and times == [d["time"] for d in big[:10]]
+        page = (await api.get(f"{url}?limit=10&time={page['departures'][-1]['time']}")).json()
+        assert page["alerts"] is not None and page["departures"]
+        seen += [
+            (d["trip_key"], d["stop_sequence"]) for d in page["departures"] if (d["trip_key"], d["stop_sequence"]) not in seen
+        ]
+    big = (await api.get(f"{url}?limit=100")).json()["departures"]
+    assert [(d["trip_key"], d["stop_sequence"]) for d in big[: len(seen)]] == seen
 
-    # back: departures that have left, oldest first, ending right before the first page
-    back = (await api.get(f"{url}?limit=10&cursor={first['earlier']}")).json()
-    deps = back["departures"]
-    assert len(deps) == 10 and back["earlier"] and back["later"]
-    assert [d["time"] for d in deps] == sorted(d["time"] for d in deps)
-    assert deps[-1]["time"] <= first["departures"][0]["time"]
-    assert all(d["status"] in ("departed", "canceled", "skipped") for d in deps)
+    # a time in the past: departures that have left show up
+    past = (await api.get(f"{url}?limit=100&time={NOW - 3600}")).json()["departures"]
+    assert [d["time"] for d in past] == sorted(d["time"] for d in past)
+    assert all(d["time"] >= NOW - 3600 for d in past)
+    assert any(d["status"] == "departed" for d in past)
     # vehicles that passed keep the last time realtime had
-    assert any(d["realtime"] and d["estimated"] for d in deps)
-    older = (await api.get(f"{url}?limit=10&cursor={back['earlier']}")).json()["departures"]
-    assert older and older[-1]["time"] <= deps[0]["time"]
+    assert any(d["status"] == "departed" and d["realtime"] and d["estimated"] for d in past)
 
-    assert (await api.get(f"{url}?cursor=garbage")).status_code == 422
+    assert (await api.get(f"{url}?time=garbage")).status_code == 422
+    assert (await api.get(f"{url}?time=-1")).status_code == 422
+
+
+async def test_departure_board_filters(api, sql):
+    url = f"/stops/{group_id(sql, '802')}/departures"
+    deps = (await api.get(f"{url}?limit=100")).json()["departures"]
+    assert {d["feed_id"] for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
+
+    only = (await api.get(f"{url}?limit=20&feeds=kmk_t")).json()["departures"]
+    assert len(only) == 20 and {d["feed_id"] for d in only} == {"kmk_t"}
+    both = (await api.get(f"{url}?limit=100&feeds=kmk_t,kmk_a")).json()["departures"]
+    assert {d["feed_id"] for d in both} == {"kmk_t", "kmk_a"}
+    assert both == (await api.get(f"{url}?limit=100&feeds=kmk_t&feeds=kmk_a")).json()["departures"]
+    assert (await api.get(f"{url}?feeds=nope")).status_code == 422
+
+    board = (await api.get(f"{url}?feeds=kmk_t&routes=no-such-line")).json()
+    assert {"kmk_a", "kmk_m", "kmk_t"} <= {ln["feed_id"] for ln in board["lines"]}  # not narrowed by the filters
+    assert len({ln["key"] for ln in board["lines"]}) == len(board["lines"])  # routes, each once (names may repeat)
+    assert {d["line"]["key"] for d in deps} <= {ln["key"] for ln in board["lines"]}
+    name = next(d["line"]["name"] for d in deps if d["feed_id"] == "kmk_t")
+    on_line = (await api.get(f"{url}?limit=20&routes={name}")).json()["departures"]
+    assert on_line and all(d["line"]["name"] == name for d in on_line)
+    assert (await api.get(f"{url}?routes=no-such-line")).json()["departures"] == []
+    narrow = (await api.get(f"{url}?limit=20&feeds=kmk_a&routes={name}")).json()["departures"]
+    assert all(d["feed_id"] == "kmk_a" and d["line"]["name"] == name for d in narrow)
+    # filters are part of the cached response
+    assert (await api.get(f"{url}?limit=20&feeds=kmk_t")).json()["departures"] == only
 
 
 async def test_departure_board_platform_and_other_days(api, sql):
@@ -360,15 +382,15 @@ async def test_departure_board_platform_and_other_days(api, sql):
     deps = (await api.get(f"/stops/{pid}/departures?limit=5")).json()["departures"]
     assert 0 < len(deps) <= 5 and {d["platform"]["id"] for d in deps} == {pid}
 
-    # scrolling back far enough reaches the day before (another service day, its own base, CEST)
+    # starting far enough back reaches the day before (another service day, its own base, CEST)
     url = f"/stops/{group_id(sql, '360')}/departures"
-    cursor, dates = (await api.get(f"{url}?limit=50")).json()["earlier"], set()
-    for _ in range(20):
-        page = (await api.get(f"{url}?limit=50&cursor={cursor}")).json()
-        dates |= {d["service_date"] for d in page["departures"] if d["feed_id"] == "kmk_a"}
-        if "20261024" in dates or not page["earlier"]:
+    time, dates = NOW - 36 * 3600, set()
+    for _ in range(40):
+        page = (await api.get(f"{url}?limit=100&time={time}")).json()["departures"]
+        dates |= {d["service_date"] for d in page if d["feed_id"] == "kmk_a"}
+        if "20261024" in dates or not page:
             break
-        cursor = page["earlier"]
+        time = max(page[-1]["time"], time + 1)
     assert "20261024" in dates
     assert (await api.get("/stops/zzzzz/departures")).status_code == 404
 

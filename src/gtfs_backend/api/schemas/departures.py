@@ -37,6 +37,5 @@ class DepartureBoard(BaseModel):
     stop: Stop
     timestamp: int
     departures: list[Departure]
-    earlier: str | None = None  # cursor for the page before, None when there is nothing earlier
-    later: str | None = None  # cursor for the page after, None when there is nothing later
-    alerts: list[Alert]  # first page only
+    lines: list[Line]  # routes departing from the stop today, whatever the filters; names can repeat
+    alerts: list[Alert]

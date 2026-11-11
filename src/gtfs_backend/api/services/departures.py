@@ -4,25 +4,22 @@ The timetable query covers every authoritative service day that can run in the w
 yesterday's service can still be running) and reaches back LOOKBACK_S so delayed trips stay on the board until
 they leave (and GRACE_S after).
 
-Boards page both ways with opaque cursors. The first page (no cursor) starts now and leaves out departures that
-have left; `earlier` pages scroll into the past and include them as `departed`, with the last time realtime knew.
+A board starts at `time` (epoch). Without it, it starts now and leaves out departures that have left; with it, rows
+from that time on include departed ones as `departed`, with the last time realtime knew. Clients page by passing
+the last departure's time. `feeds` and `routes` (line names) narrow the board, and its alerts with it.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 from dataclasses import dataclass
 from datetime import date
-from typing import Literal
 
 from psycopg import AsyncConnection
 
 from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
-from gtfs_backend.api.data.catalog import Catalog, Day
+from gtfs_backend.api.data.catalog import Catalog, Day, RouteInfo
 from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.data.sql import union_per_version
 from gtfs_backend.api.errors import InvalidInput
@@ -78,30 +75,6 @@ class Row:
     @property
     def key(self) -> SortKey:
         return (self.time, self.s.trip_key, self.s.stop_sequence)
-
-
-# ------------------------------------------------------------------------------------------------- cursors
-
-
-@dataclass(frozen=True)
-class Cursor:
-    direction: Literal["earlier", "later"]
-    key: SortKey
-
-    def encode(self) -> str:
-        raw = json.dumps([self.direction[0], *self.key], separators=(",", ":")).encode()
-        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-    @classmethod
-    def decode(cls, text: str) -> Cursor:
-        try:
-            d, t, trip_key, seq = json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)))
-            direction = {"e": "earlier", "l": "later"}[d]
-            if not (isinstance(t, int) and isinstance(trip_key, str) and isinstance(seq, int)):
-                raise TypeError
-        except (binascii.Error, UnicodeDecodeError, ValueError, KeyError, TypeError):
-            raise InvalidInput("invalid cursor") from None
-        return cls(direction, (t, trip_key, seq))
 
 
 # ------------------------------------------------------------------------------------------------- timetable + realtime
@@ -185,33 +158,44 @@ def _upcoming(row: Row, now: int, grace: int) -> bool:
     return row.live.status != "departed" and row.time >= now - grace
 
 
-def select(rows: list[Row], cursor: Cursor | None, now: int, limit: int, start: int, end: int, grace: int = GRACE_S) -> list[Row]:
-    """One page, ascending. First page: upcoming rows from now on. Later/earlier: the rows after/before the cursor.
+def select(rows: list[Row], now: int, limit: int, start: int, end: int, live: bool, grace: int = GRACE_S) -> list[Row]:
+    """One page, ascending: the rows from `start` on. `live` (no time asked): only upcoming rows, delayed ones
+    included, those that have left excluded.
     Only rows whose time is within [start, end] count: outside it, the timetable query may have missed some.
     """
     rows = sorted((r for r in rows if start <= r.time <= end), key=lambda r: r.key)
-    if cursor is None:
-        return [r for r in rows if _upcoming(r, now, grace)][:limit]
-    if cursor.direction == "later":
-        return [r for r in rows if r.key > cursor.key][:limit]
-    return [r for r in rows if r.key < cursor.key][-limit:]
+    if live:
+        rows = [r for r in rows if _upcoming(r, now, grace)]
+    return rows[:limit]
 
 
-async def _page(ctx: Context, conn: AsyncConnection, pids: list[str], cursor: Cursor | None, now: int, limit: int) -> list[Row]:
-    """Rows of one page, widening the window until it is full."""
-    anchor = now if cursor is None else cursor.key[0]
+async def _page(
+    ctx: Context,
+    conn: AsyncConnection,
+    pids: list[str],
+    start: int,
+    live: bool,
+    feeds: set[str],
+    routes: set[str],
+    now: int,
+    limit: int,
+) -> tuple[list[Row], dict[tuple[str, str], Line]]:
+    """Rows of one page with their lines, widening the window until it is full."""
     page: list[Row] = []
+    lines: dict[tuple[str, str], Line] = {}
     for span in WINDOWS_S:
-        start, end = (anchor - span, anchor) if cursor and cursor.direction == "earlier" else (anchor, anchor + span)
-        if cursor is None:
-            start = anchor - GRACE_S
-        found = await scheduled(conn, await ctx.catalog.days_between(start, end), pids, start, end)
+        lo, hi = (start - GRACE_S if live else start), start + span
+        days = [d for d in await ctx.catalog.days_between(lo, hi) if not feeds or d.feed_id in feeds]
+        found = await scheduled(conn, days, pids, lo, hi)
+        lines = await ctx.catalog.lines({(f.feed_version_id, f.route_id) for f in found})
+        if routes:
+            found = [f for f in found if (line := lines.get((f.feed_version_id, f.route_id))) and line.name in routes]
         updates = await realtime.trip_updates(ctx.redis, [s.trip_key for s in found])
         rows = [Row(f, overlay(f, updates.get(f.trip_key), now)) for f in found]
-        page = select(rows, cursor, now, limit, start, end)
+        page = select(rows, now, limit, lo, hi, live)
         if len(page) >= limit:
             break
-    return page
+    return page, lines
 
 
 def _departure(row: Row, line: Line | None, platform) -> Departure:
@@ -237,15 +221,29 @@ def _departure(row: Row, line: Line | None, platform) -> Departure:
     )
 
 
-async def _alerts(ctx: Context, conn: AsyncConnection, catalog: Catalog, pids: list[str], out: list[Departure]):
-    """Alerts for the stop and every line departing from it today, not only the ones on this page."""
+async def _served(conn: AsyncConnection, catalog: Catalog, pids: list[str]) -> list[RouteInfo]:
+    """The routes departing from these platforms today, by feed and line name."""
     served = await stops.served_routes(conn, catalog, pids)
-    routes = await catalog.routes({fv for fv, _ in served})
+    infos = await catalog.routes({fv for fv, _ in served})
+    return sorted((infos[k] for k in served if k in infos), key=lambda i: (i.feed_id, i.line().name, i.route_id))
+
+
+async def _alerts(
+    ctx: Context,
+    conn: AsyncConnection,
+    pids: list[str],
+    out: list[Departure],
+    served: list[RouteInfo],
+    feeds: set[str],
+    routes: set[str],
+):
+    """Alerts for the stop and every line departing from it today (within the filters), not only the ones on this page."""
+    shown = [i for i in served if (not feeds or i.feed_id in feeds) and (not routes or i.line().name in routes)]
     scope = alerts.Scope(
-        routes={(routes[k].feed_id, routes[k].route_id): routes[k].route_type for k in served if k in routes},
+        routes={(i.feed_id, i.route_id): i.route_type for i in shown},
         platforms=set(pids),
         trips={(d.feed_id, d.trip_id) for d in out},
-        feeds={routes[k].feed_id for k in served if k in routes} | {d.feed_id for d in out},
+        feeds={i.feed_id for i in shown} | {d.feed_id for d in out},
     )
     for d in out:
         if d.line:
@@ -253,37 +251,22 @@ async def _alerts(ctx: Context, conn: AsyncConnection, catalog: Catalog, pids: l
     return await alerts.in_scope(ctx, conn, scope)
 
 
-async def board(ctx: Context, key: str, cursor_text: str | None, limit: int) -> DepartureBoard:
-    """A page of departures from a logical stop (all its platforms) or one platform, with realtime; alerts on the
-    first page only.
+async def board(ctx: Context, key: str, time: int | None, feeds: set[str], routes: set[str], limit: int) -> DepartureBoard:
+    """A page of departures from a logical stop (all its platforms) or one platform, from `time` (default now) on,
+    with realtime and the alerts that apply. `lines` are all the lines that depart from the stop today, whatever
+    the filters, so clients know what they can filter by.
     """
-    cursor = Cursor.decode(cursor_text) if cursor_text else None
+    if unknown := feeds - set(ctx.feed_ids):
+        raise InvalidInput(f"unknown feed: {', '.join(sorted(unknown))}")
     now = ctx.now()
     async with ctx.pool.connection() as conn:
         stop = await stops.get(conn, key)
         pids = await stops.platform_ids(conn, stop)
-        page = await _page(ctx, conn, pids, cursor, now, limit)
+        page, lines = await _page(ctx, conn, pids, now if time is None else time, time is None, feeds, routes, now, limit)
 
         platforms = await stops.platforms_by_id(conn, {r.s.stop_platform_id for r in page})
-        lines = await ctx.catalog.lines((r.s.feed_version_id, r.s.route_id) for r in page)
         out = [_departure(r, lines.get((r.s.feed_version_id, r.s.route_id)), platforms[r.s.stop_platform_id]) for r in page]
-        board_alerts = []
-        if cursor is None:
-            board_alerts = await _alerts(ctx, conn, ctx.catalog, pids, out)
+        served = await _served(conn, ctx.catalog, pids)
+        board_alerts = await _alerts(ctx, conn, pids, out, served, feeds, routes)
 
-    # Cursors from the page's ends; a partial page still gets them, the next request searches on from there.
-    # An empty page has none in its direction (nothing within the widest window); the first page can always go
-    # back, from now.
-    earlier = Cursor("earlier", page[0].key if page else (now, "", 0)).encode()
-    later = Cursor("later", page[-1].key).encode() if page else None
-    if cursor is not None and cursor.direction == "earlier" and not page:
-        earlier = None
-
-    return DepartureBoard(
-        stop=stop,
-        timestamp=now,
-        departures=out,
-        earlier=earlier,
-        later=later,
-        alerts=board_alerts,
-    )
+    return DepartureBoard(stop=stop, timestamp=now, lines=[i.line() for i in served], departures=out, alerts=board_alerts)

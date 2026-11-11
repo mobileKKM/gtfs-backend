@@ -61,8 +61,12 @@ def _stop_kind(
     return kind
 
 
-def _routes(route: Annotated[list[str] | None, Query(description="line names, e.g. 52,4")] = None) -> set[str]:
-    return split_csv(route)
+def _feeds(feeds: Annotated[list[str] | None, Query(description="feed ids, e.g. ztp,kmk_t")] = None) -> set[str]:
+    return split_csv(feeds)
+
+
+def _routes(routes: Annotated[list[str] | None, Query(description="line names, e.g. 52,4")] = None) -> set[str]:
+    return split_csv(routes)
 
 
 Ctx = Annotated[Context, Depends(context)]
@@ -71,5 +75,6 @@ BboxQuery = Annotated[Bbox, Depends(_bbox)]
 NearQuery = Annotated[Point | None, Depends(_near)]
 DateQuery = Annotated[date | None, Depends(_query_date)]
 ModesQuery = Annotated[set[str], Depends(_modes)]
-RouteNamesQuery = Annotated[set[str], Depends(_routes)]
+FeedsQuery = Annotated[set[str], Depends(_feeds)]
+RoutesQuery = Annotated[set[str], Depends(_routes)]
 StopKindQuery = Annotated[StopKind, Depends(_stop_kind)]

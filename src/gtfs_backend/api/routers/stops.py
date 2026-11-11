@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request
 
 from gtfs_backend.api.cache import LIVE, cached, json_response, public
-from gtfs_backend.api.deps import BboxQuery, Ctx, ModesQuery, NearQuery, StopKindQuery
+from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, NearQuery, RoutesQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import DepartureBoard, SearchResult, StopList
 from gtfs_backend.api.services import departures, stops
@@ -45,13 +45,18 @@ async def departure_board(
     request: Request,
     ctx: Ctx,
     key: str,
-    cursor: Annotated[str | None, Query(description="`earlier` or `later` of a previous page; none: from now")] = None,
+    feeds: FeedsQuery,
+    routes: RoutesQuery,
+    time: Annotated[int | None, Query(ge=0, description="epoch seconds: departures from then on; none: from now")] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ):
-    """Departures from a logical stop (all its platforms) or one platform, with realtime, a page at a time.
+    """Departures from a logical stop (all its platforms) or one platform, with realtime.
 
-    Without a cursor: the next departures (delayed ones stay until they leave). Follow `later` to scroll forward and
-    `earlier` to scroll back, where departures that have left show as `departed`. Canceled trips and skipped stops
-    stay with their status. Alerts come with the first page. Poll the first page again for updates.
+    Without `time`: the next departures (delayed ones stay until they leave). With it: the departures from then on,
+    where those that have left show as `departed`. Page forward by passing the last departure's `time` (departures
+    in the same second can repeat: tell them apart by `trip_key` and `stop_sequence`). `feeds` and `routes` (line
+    names) narrow the board and its alerts. Canceled trips and skipped stops stay with their status.
     """
-    return await cached(request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: departures.board(ctx, key, cursor, limit))
+    return await cached(
+        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: departures.board(ctx, key, time, feeds, routes, limit)
+    )

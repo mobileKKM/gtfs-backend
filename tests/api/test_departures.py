@@ -2,10 +2,7 @@
 
 from datetime import date
 
-import pytest
-
-from gtfs_backend.api.errors import InvalidInput
-from gtfs_backend.api.services.departures import GRACE_S, Cursor, Row, Scheduled, overlay, select
+from gtfs_backend.api.services.departures import GRACE_S, Row, Scheduled, overlay, select
 
 NOW = 1_800_000_000
 
@@ -76,44 +73,37 @@ def rows(scheduled, updates=None):
     return [Row(s, overlay(s, updates.get(s.trip_key), NOW)) for s in scheduled]
 
 
-def test_first_page_sorts_by_live_time_and_keeps_late_departures():
+def test_live_board_sorts_by_live_time_and_keeps_late_departures():
     late = sched("late", dep=NOW - 900)  # scheduled 15 min ago, 20 min late
     early = sched("early", dep=NOW + 300)
     gone = sched("gone", dep=NOW - GRACE_S - 1)  # no realtime, left already
     just_left = sched("just_left", dep=NOW - GRACE_S + 5)
     rs = rows([early, gone, late, just_left], {late.trip_key: rt((5, NOW + 301, 1201, {}))})
-    out = select(rs, None, NOW, limit=10, start=NOW - GRACE_S, end=NOW + 3600)
+    out = select(rs, NOW, limit=10, start=NOW - GRACE_S, end=NOW + 3600, live=True)
     assert [r.s.trip_id for r in out] == ["just_left", "early", "late"]
     assert out[2].time == NOW + 301
-    assert [r.s.trip_id for r in select(rs, None, NOW, limit=1, start=NOW - GRACE_S, end=NOW + 3600)] == ["just_left"]
+    assert [r.s.trip_id for r in select(rs, NOW, limit=1, start=NOW - GRACE_S, end=NOW + 3600, live=True)] == ["just_left"]
     # outside the window
-    assert select(rows([sched(dep=NOW + 7200)]), None, NOW, limit=10, start=NOW, end=NOW + 3600) == []
+    assert select(rows([sched(dep=NOW + 7200)]), NOW, limit=10, start=NOW, end=NOW + 3600, live=True) == []
 
 
-def test_paging_both_ways_without_gaps():
-    # five departures at the same minute, then more later; two have left
-    trips = [sched(f"t{i}", dep=NOW + 60 * (i // 5)) for i in range(12)] + [
-        sched("old1", dep=NOW - 600),
-        sched("old2", dep=NOW - 300),
-    ]
+def test_board_from_a_time_includes_departed():
+    trips = [sched("old1", dep=NOW - 600), sched("old2", dep=NOW - 300), sched("next", dep=NOW + 60)]
     rs = rows(trips)
-    first = select(rs, None, NOW, limit=4, start=NOW - GRACE_S, end=NOW + 3600)
-    seen = [r.s.trip_id for r in first]
-    cursor = Cursor("later", first[-1].key)
-    while page := select(rs, cursor, NOW, limit=4, start=cursor.key[0], end=NOW + 3600):
-        seen += [r.s.trip_id for r in page]
-        cursor = Cursor("later", page[-1].key)
-    assert sorted(seen) == sorted(f"t{i}" for i in range(12)) and len(seen) == 12
-
-    back = select(rs, Cursor("earlier", first[0].key), NOW, limit=1, start=NOW - 3600, end=first[0].key[0])
-    assert [(r.s.trip_id, r.live.status) for r in back] == [("old2", "departed")]
-    back = select(rs, Cursor("earlier", first[0].key), NOW, limit=5, start=NOW - 3600, end=first[0].key[0])
-    assert [r.s.trip_id for r in back] == ["old1", "old2"]
+    out = select(rs, NOW, limit=10, start=NOW - 400, end=NOW + 3600, live=False)
+    assert [(r.s.trip_id, r.live.status) for r in out] == [("old2", "departed"), ("next", "scheduled")]
+    assert [r.s.trip_id for r in select(rs, NOW, limit=1, start=NOW - 3600, end=NOW + 3600, live=False)] == ["old1"]
 
 
-def test_cursor_round_trip_and_garbage():
-    c = Cursor("earlier", (NOW, "kmk_t:a:b|c:20270115", 7))
-    assert Cursor.decode(c.encode()) == c
-    for bad in ["", "x", "bm9wZQ", Cursor("later", (NOW, "k", 1)).encode()[:-3]]:
-        with pytest.raises(InvalidInput):
-            Cursor.decode(bad)
+def test_paging_forward_by_time_without_gaps():
+    # five departures per minute; the next page starts at the last time, repeats stay within that second
+    trips = [sched(f"t{i}", dep=NOW + 60 * (i // 5)) for i in range(12)]
+    rs = rows(trips)
+    seen, start = [], NOW
+    while True:
+        new = [r.s.trip_id for r in select(rs, NOW, limit=6, start=start, end=NOW + 3600, live=False) if r.s.trip_id not in seen]
+        if not new:
+            break
+        seen += new
+        start = max(r.time for r in rs if r.s.trip_id in seen)
+    assert len(seen) == 12

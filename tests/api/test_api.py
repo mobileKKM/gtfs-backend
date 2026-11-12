@@ -194,7 +194,7 @@ async def test_stop_search(api, sql):
     rondo = results[0]
     assert rondo["name"] == "Rondo Mogilskie" and rondo["id"] == group_id(sql, "802")
     assert rondo["key"] == f"rondo-mogilskie-{rondo['id']}"
-    assert {"tram", "bus"} <= {line["mode"] for line in rondo["lines"]}
+    assert {"tram", "bus"} <= {line["mode"] for p in rondo["platforms"] for d in p["directions"] for line in d["lines"]}
     served = [p for p in rondo["platforms"] if p["directions"]]
     assert len(served) >= 4
     for p in served:
@@ -221,8 +221,6 @@ async def test_stop_search(api, sql):
 
     results = (await api.get("/stops/search?q=WZGORZA krzeslaw")).json()["results"]
     assert results[0]["name"] == "Wzgórza Krzesławickie"
-    near = (await api.get("/stops/search?q=rondo&near=50.0658,19.9597&limit=5")).json()["results"]
-    assert near and all(h["distance_m"] is not None for h in near)
     assert (await api.get("/stops/search?q=")).status_code == 422
     assert (await api.get("/stops/search?q=%_%")).json()["results"] == []  # LIKE wildcards are literal
 

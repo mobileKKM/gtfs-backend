@@ -156,7 +156,7 @@ The source id comes last and is kept whole, so ids with `:` or `/` work.
 | `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, line, headsign, delay, `trip_key` |
 | `GET /vehicles/{vehicle_key}/trip` | trip view of the vehicle's current trip (polling follows it onto the next) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | platforms with `group_id`, or logical stops (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for stations (≤ 3000, `truncated`) |
-| `GET /stops/search?q=…[&near=lat,lon]` | logical stops by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with platforms, directions and lines |
+| `GET /stops/search?q=…` | logical stops by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with platforms and directions |
 | `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and line names; alerts included |
 | `GET /trips/{trip_key}` | shape polyline, every stop with scheduled/estimated times, live vehicle, alerts |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |

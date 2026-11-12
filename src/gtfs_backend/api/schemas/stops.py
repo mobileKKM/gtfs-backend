@@ -43,8 +43,6 @@ class PlatformInfo(Stop):
 
 class StopGroupInfo(Stop):
     platforms: list[PlatformInfo] = Field(default_factory=list)  # active ones
-    lines: list[Line] = Field(default_factory=list)  # lines departing here today
-    distance_m: float | None = None  # search with `near` only
 
 
 class SearchResult(BaseModel):

@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request
 
 from gtfs_backend.api.cache import LIVE, cached, json_response, public
-from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, NearQuery, RoutesQuery, StopKindQuery
+from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, RoutesQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import DepartureBoard, SearchResult, StopList
 from gtfs_backend.api.services import departures, stops
@@ -27,17 +27,15 @@ async def search_stops(
     request: Request,
     ctx: Ctx,
     q: Annotated[str, Query(min_length=1, max_length=100)],
-    near: NearQuery,
     limit: Annotated[int, Query(ge=1, le=50)] = 20,
 ):
     """Logical ZTP stops (where the metropolitan card is valid) by name; Polish letters and case don't matter
     ("rondo mog" finds "Rondo Mogilskie"). Other feeds' stops are on the map and in departures, but not searched.
 
-    Each result has its platforms with directions (`towards` = the next stop trips go to, with lines) and the
-    lines departing from it today."""
+    Each result has its platforms with directions (`towards` = the next stop trips go to, with lines)."""
     s = ctx.settings
     cache_control = public(s.cache_ttl_static)
-    return await cached(request, ctx, s.cache_ttl_static, cache_control, lambda: stops.search(ctx, q, near, limit))
+    return await cached(request, ctx, s.cache_ttl_static, cache_control, lambda: stops.search(ctx, q, limit))
 
 
 @router.get("/stops/{key}/departures", response_model=DepartureBoard)

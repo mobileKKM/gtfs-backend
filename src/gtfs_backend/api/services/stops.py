@@ -8,7 +8,7 @@ from psycopg import AsyncConnection
 
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog
-from gtfs_backend.api.data.geo import Bbox, Point
+from gtfs_backend.api.data.geo import Bbox
 from gtfs_backend.api.errors import NotFound
 from gtfs_backend.api.schemas import (
     Direction,
@@ -132,23 +132,20 @@ async def _direction_rows(conn: AsyncConnection, catalog: Catalog, platforms: li
 
 async def directions(
     conn: AsyncConnection, catalog: Catalog, platforms: list[str], min_share: float = MIN_DIRECTION_SHARE
-) -> tuple[dict[str, list[Direction]], dict[str, list[Line]]]:
+) -> dict[str, list[Direction]]:
     """Where trips from each platform go next in today's timetables (all feeds, so ZTP's shared platforms get
-    trams and buses), most served first, and every line departing from each platform. Platforms without
-    departures today get neither.
+    trams and buses), most served first. Platforms without departures today get none.
     """
     rows = await _direction_rows(conn, catalog, platforms)
     lines = await catalog.lines((fv, route) for _, _, _, fv, route, _, _ in rows)
 
     # platform -> next group -> [name, trips, lines, headsign counts]
     acc: dict[str, dict[str, list]] = defaultdict(dict)
-    all_lines: dict[str, list[Line]] = defaultdict(list)
     for pid, gid, name, fv, route_id, headsign, trips in rows:
         d = acc[pid].setdefault(gid, [name, 0, [], Counter()])
         d[1] += trips
         if line := lines.get((fv, route_id)):
             d[2].append(line)
-            all_lines[pid].append(line)
         if headsign:
             d[3][headsign] += trips
 
@@ -166,19 +163,18 @@ async def directions(
             for i, (gid, (name, trips, group_lines, headsigns)) in enumerate(ranked)
             if i == 0 or trips >= min_share * total
         ]
-    return out, {pid: sorted_lines(ls) for pid, ls in all_lines.items()}
+    return out
 
 
 async def group_info(ctx: Context, conn: AsyncConnection, groups: list[Stop]) -> list[StopGroupInfo]:
-    """Groups with their active platforms, each platform's directions, and the lines departing from the group."""
+    """Groups with their active platforms, and each platform's directions."""
     by_group = await group_platforms(conn, [g.id for g in groups])
     platforms = [p.id for ps in by_group.values() for p in ps]
-    dirs, lines = await directions(conn, ctx.catalog, platforms, MIN_DIRECTION_SHARE)
+    dirs = await directions(conn, ctx.catalog, platforms, MIN_DIRECTION_SHARE)
     return [
         StopGroupInfo(
             **g.model_dump(),
             platforms=[PlatformInfo(**p.model_dump(), directions=dirs.get(p.id, [])) for p in by_group[g.id]],
-            lines=sorted_lines(line for p in by_group[g.id] for line in lines.get(p.id, [])),
         )
         for g in groups
     ]
@@ -223,7 +219,7 @@ async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], kind: str) -> StopL
     return StopList(truncated=len(rows) > limit, stops=[stop_from_row(r) for r in rows[:limit]])
 
 
-async def search(ctx: Context, query: str, near: Point | None, limit: int) -> SearchResult:
+async def search(ctx: Context, query: str, limit: int) -> SearchResult:
     """Logical stops by name: prefix matches first, then substring, then fuzzy (trigram); accents and case ignored.
     Only stops of feeds.yml `search_namespaces` (ZTP) are found, including other feeds' stops merged into them."""
     async with ctx.pool.connection() as conn:
@@ -231,10 +227,7 @@ async def search(ctx: Context, query: str, near: Point | None, limit: int) -> Se
             f"""
             WITH u AS (SELECT core.immutable_unaccent(lower(%(q)s)) AS q),
             x AS (SELECT q, replace(replace(replace(q, '\\', '\\\\'), '%%', '\\%%'), '_', '\\_') AS esc FROM u)
-            SELECT {GROUP_COLS},
-                   CASE WHEN %(lon)s::float8 IS NOT NULL
-                        THEN ST_Distance(g.geom::geography, ST_SetSRID(ST_MakePoint(%(lon)s, %(lat)s), 4326)::geography)
-                   END AS dist
+            SELECT {GROUP_COLS}
             FROM core.stop_group g, x
             WHERE g.active AND g.code_namespace = ANY(%(ns)s)
               AND EXISTS (SELECT 1 FROM core.stop_platform p WHERE p.stop_group_id = g.id AND {SERVED})
@@ -243,19 +236,15 @@ async def search(ctx: Context, query: str, near: Point | None, limit: int) -> Se
                      g.name_search LIKE '%%' || x.esc || '%%' DESC,
                      word_similarity(x.q, g.name_search) DESC,
                      similarity(x.q, g.name_search) DESC,
-                     dist NULLS LAST, g.name
+                     g.name
             LIMIT %(limit)s
             """,
             {
                 "q": query.strip(),
-                "lon": near.lon if near else None,
-                "lat": near.lat if near else None,
                 "limit": limit,
                 "ns": ctx.feeds.searchable_namespaces,
             },
         )
         rows = await cur.fetchall()
         results = await group_info(ctx, conn, [stop_from_row(r) for r in rows])
-    for info, r in zip(results, rows, strict=True):
-        info.distance_m = round(r[9], 1) if r[9] is not None else None
     return SearchResult(query=query, results=results)

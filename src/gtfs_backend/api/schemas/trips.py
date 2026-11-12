@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from gtfs_backend.api.schemas.alerts import AlertRef
 from gtfs_backend.api.schemas.common import Route, StopRef
-from gtfs_backend.api.schemas.vehicles import MapVehicle
+from gtfs_backend.api.schemas.vehicles import Vehicle
 
 
 class TripStop(BaseModel):
@@ -56,7 +56,7 @@ class TripLive(BaseModel):
     status: Literal["scheduled", "live", "canceled"]
     delay_s: int | None = None
     timestamp: int | None  # of the newest realtime data shown (trip update, vehicle position); None: none
-    vehicle: MapVehicle | None = None
+    vehicle: Vehicle | None = None
     stops: list[TripStopLive]
     current_index: int | None = None  # index in these `stops` of the next stop not yet passed
     alerts: list[AlertRef]

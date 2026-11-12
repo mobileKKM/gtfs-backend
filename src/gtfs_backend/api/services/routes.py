@@ -35,7 +35,7 @@ async def shapes(ctx: Context, route_key: str, service_date: date | None) -> Rou
             {"d": d, "fv": day.feed_version_id, "route": route_id},
         )
         shapes = [
-            RouteShape(shape_id=sid, direction_id=direction, headsign=headsign, trips=n, polyline=polyline, bbox=bbox)
-            for sid, direction, headsign, n, polyline, bbox in await cur.fetchall()
+            RouteShape(direction_id=direction, headsign=headsign, trips=n, polyline=polyline, bbox=bbox)
+            for _, direction, headsign, n, polyline, bbox in await cur.fetchall()
         ]
     return RouteShapes(route=info.model(), service_date=keys.service_date_str(d), shapes=shapes)

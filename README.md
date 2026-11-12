@@ -155,17 +155,19 @@ dates `YYYYMMDD`.
 | alert | `{feed_id}:{id}` | `/alerts/{key}` |
 
 The source id comes last and is kept whole, so ids with `:` or `/` work. Responses carry no id a key already
-holds (no `feed_id`/`trip_id` next to `trip_key`). Every field of a schema is always present (`null` when unset).
+holds (no `feed_id`/`trip_id` next to `trip_key`, no `feed_id` next to a route's `key`): the feed id is a key's
+first part. Routes appear in full (`Route`, with names, type, agency and the feed's `route_id`, which alert entities
+name) or as a `RouteRef` (`key`, `name`, `mode`) in lists. Every field of a schema is always present (`null` when unset).
 Polled responses (vehicles, boards, live trips) carry the `timestamp` of the newest realtime data they show, not
 of the request, so their ETag only changes with the data.
 
 | endpoint | what |
 |---|---|
-| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, line (with its mode), headsign, delay, `trip_key` |
+| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, route (`RouteRef`, with its mode), headsign, delay, `trip_key` |
 | `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_id` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
-| `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and line names; `vehicle_key` to follow; alerts as refs |
+| `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and passed/skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
@@ -191,7 +193,7 @@ in logs).
 
 Notes:
 
-- **Directions**: each stop lists where its trips go next (`towards`: the next stop group), with lines and
+- **Directions**: each stop lists where its trips go next (`towards`: the next stop group), with routes and
   headsigns, most served first; under 5 % of trips are left out. Precomputed per version (`core.stop_direction`).
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
@@ -201,10 +203,11 @@ Notes:
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
   show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
   (tell them apart by `trip_key` + `stop_sequence`). The window widens (2 h, 6 h, 24 h) until a page is full.
-- **Filters**: `feeds` (feed ids) and `routes` (line names), comma separated or repeated; they narrow the board and
-  its alerts, and an unknown feed is a 422. The board lists `lines`, every route departing from the stop today, so
-  clients know what to filter by. Feeds publish line variants as separate routes (km_mld has two `A18`), so a name
-  can repeat: dedupe by name for display. `/vehicles` takes `routes` as well.
+- **Filters**: `feeds` (feed ids) and `routes` (route names, `RouteRef.name`), comma separated or repeated; they
+  narrow the board and its alerts, and an unknown feed is a 422. The board lists `routes`, every route departing from
+  the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish
+  line variants as separate routes (km_mld has two `A18`), so a name can repeat: dedupe by name for display.
+  `/vehicles` takes `routes` as well.
 - **Trip view**: `shape.source` is `shape`, or `stops` when the feed has none (trains). `current_index` is the
   first stop not yet passed; `vehicle` is set while one runs the trip.
 - **Polling**: live responses are `no-cache`; clients refetch the open view about every 10 s with `If-None-Match`

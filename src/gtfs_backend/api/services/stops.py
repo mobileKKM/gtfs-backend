@@ -1,4 +1,4 @@
-"""Stop groups (logical) and stops (physical poles): lookups, map queries, search, directions and lines."""
+"""Stop groups (logical) and stops (physical poles): lookups, map queries, search, directions and routes."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from gtfs_backend.api.data.geo import Bbox
 from gtfs_backend.api.errors import NotFound
 from gtfs_backend.api.schemas import (
     Direction,
-    Line,
+    RouteRef,
     SearchResult,
     Stop,
     StopGroupInfo,
@@ -21,6 +21,7 @@ from gtfs_backend.api.schemas import (
     StopRef,
 )
 from gtfs_backend.ids import parse_url_key
+from gtfs_backend.keys import split_feed
 
 MIN_DIRECTION_SHARE = 0.05  # rarer directions are short turns, depot runs etc.
 MAX_RESULTS = 3000  # stops per map request
@@ -115,18 +116,19 @@ async def public_stop_ids(conn: AsyncConnection, stop: Stop) -> list[str]:
     return [r[0] for r in await cur.fetchall()]
 
 
-def route_sort_key(r: Line):
+def route_sort_key(r: RouteRef):
     """Modes together, then numeric names numerically (2 < 10 < 52 < 152 < 902 < N1)."""
     return (r.mode, not r.name.isdigit(), int(r.name) if r.name.isdigit() else 0, r.name)
 
 
-def sorted_lines(lines) -> list[Line]:
-    """One chip per line name: feeds may split a line into several route_ids (MLD's A67)."""
-    return sorted({(x.feed_id, x.name): x for x in lines}.values(), key=route_sort_key)
+def sorted_routes(routes) -> list[RouteRef]:
+    """One chip per name: feeds may split a line into several route_ids (MLD's A67)."""
+    return sorted({(split_feed(x.key)[0], x.name): x for x in routes}.values(), key=route_sort_key)
 
 
 async def _direction_rows(conn: AsyncConnection, catalog: Catalog, stops: list[str]) -> list[tuple]:
-    """(stop, next group id, its name, feed_version_id, route_id, headsign, trips) in today's timetables."""
+    """(stop, next group id, its name, feed_version_id, route_id, headsign, trips) in the timetable versions serving
+    today: all their trips, whatever day they run."""
     versions = sorted({d.feed_version_id for d in catalog.today_days()})
     if not stops or not versions:
         return []
@@ -148,15 +150,15 @@ async def directions(
     trams and buses), most served first. Stops without departures today get none.
     """
     rows = await _direction_rows(conn, catalog, stops)
-    lines = await catalog.lines((fv, route) for _, _, _, fv, route, _, _ in rows)
+    refs = await catalog.route_refs((fv, route) for _, _, _, fv, route, _, _ in rows)
 
-    # stop -> next group -> [name, trips, lines, headsign counts]
+    # stop -> next group -> [name, trips, routes, headsign counts]
     acc: dict[str, dict[str, list]] = defaultdict(dict)
     for pid, gid, name, fv, route_id, headsign, trips in rows:
         d = acc[pid].setdefault(gid, [name, 0, [], Counter()])
         d[1] += trips
-        if line := lines.get((fv, route_id)):
-            d[2].append(line)
+        if ref := refs.get((fv, route_id)):
+            d[2].append(ref)
         if headsign:
             d[3][headsign] += trips
 
@@ -168,10 +170,10 @@ async def directions(
             Direction(
                 towards=name,
                 towards_id=gid,
-                lines=sorted_lines(group_lines),
+                routes=sorted_routes(group_routes),
                 headsigns=[h for h, _ in headsigns.most_common(3)],
             )
-            for i, (gid, (name, trips, group_lines, headsigns)) in enumerate(ranked)
+            for i, (gid, (name, trips, group_routes, headsigns)) in enumerate(ranked)
             if i == 0 or trips >= min_share * total
         ]
     return out
@@ -192,7 +194,8 @@ async def group_info(ctx: Context, conn: AsyncConnection, groups: list[Stop]) ->
 
 
 async def served_routes(conn: AsyncConnection, catalog: Catalog, stops: list[str]) -> set[tuple[str, str]]:
-    """(feed_version_id, route_id) of the routes departing from these stops today."""
+    """(feed_version_id, route_id) of the routes departing from these stops in today's timetable versions, on any day
+    (weekend routes too)."""
     return {(fv, route) for _, _, _, fv, route, _, _ in await _direction_rows(conn, catalog, stops)}
 
 

@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from gtfs_backend.api.schemas.common import Line
+from gtfs_backend.api.schemas.common import RouteRef
 
 
 class Stop(BaseModel):
@@ -33,7 +33,7 @@ class Direction(BaseModel):
 
     towards: str  # name of the next stop group
     towards_id: str
-    lines: list[Line]
+    routes: list[RouteRef]
     headsigns: list[str]  # most frequent first, at most 3
 
 

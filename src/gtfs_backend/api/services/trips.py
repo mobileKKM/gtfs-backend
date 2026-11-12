@@ -13,7 +13,7 @@ from gtfs_backend.api.data.catalog import Day
 from gtfs_backend.api.data.geo import bbox_of, encode_polyline
 from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.errors import NotFound
-from gtfs_backend.api.schemas import MapVehicle, StopRef, TripLive, TripShape, TripStop, TripStopLive, TripView
+from gtfs_backend.api.schemas import StopRef, TripLive, TripShape, TripStop, TripStopLive, TripView, Vehicle
 from gtfs_backend.api.services import alerts, vehicles
 from gtfs_backend.api.services.routes import POLYLINE_SQL
 
@@ -125,7 +125,7 @@ def _live_stop(row, day: Day, update: TripUpdate | None, now: int) -> TripStopLi
     )
 
 
-async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, vehicle: MapVehicle | None = None) -> TripLive:
+async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, vehicle: Vehicle | None = None) -> TripLive:
     """`vehicle`: the vehicle the trip was opened from; otherwise the one realtime says runs the trip, if live."""
     day = await _day(ctx, feed_id, service_date)
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}

@@ -32,7 +32,7 @@ async def search_stops(
     """ZTP stop groups (where the metropolitan card is valid) by name; Polish letters and case don't matter
     ("rondo mog" finds "Rondo Mogilskie"). Other feeds' stops are on the map and in departures, but not searched.
 
-    Each result has its stops with directions (`towards` = the next stop group trips go to, with lines)."""
+    Each result has its stops with directions (`towards` = the next stop group trips go to, with routes)."""
     s = ctx.settings
     cache_control = public(s.cache_ttl_static)
     return await cached(request, ctx, s.cache_ttl_static, cache_control, lambda: stops.search(ctx, q, limit))
@@ -52,7 +52,7 @@ async def departure_board(
 
     Without `time`: the next departures (delayed ones stay until they leave). With it: the departures from then on,
     where those that have left show as `departed`. Page forward by passing the last departure's `time` (departures
-    in the same second can repeat: tell them apart by `trip_key` and `stop_sequence`). `feeds` and `routes` (line
+    in the same second can repeat: tell them apart by `trip_key` and `stop_sequence`). `feeds` and `routes` (route
     names) narrow the board and its alerts. Canceled trips and skipped stops stay with their status.
     """
     return await cached(

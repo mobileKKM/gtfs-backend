@@ -13,8 +13,7 @@ class Agency(BaseModel):
 
 class Route(BaseModel):
     key: str  # `{feed_id}:{route_id}`: /routes/{key}/shapes, /alerts?route={key}
-    feed_id: str
-    route_id: str
+    route_id: str  # the feed's, as alert entities name it
     short_name: str | None = None
     long_name: str | None = None
     route_type: int | None = None
@@ -22,12 +21,12 @@ class Route(BaseModel):
     agency: Agency | None = None
 
 
-class Line(BaseModel):
-    """A route as lists show it: number and mode. Colors are up to the client."""
+class RouteRef(BaseModel):
+    """A route as lists show it: name and mode; the rest at /routes/{key}/shapes. Colors are up to the client. Feeds
+    split some lines into several routes (km_mld has two `A18`), so names can repeat."""
 
     key: str  # `{feed_id}:{route_id}`, as Route.key
-    feed_id: str
-    name: str  # short name, or route_id when there is none
+    name: str  # short name, or route_id when there is none: what `?routes=` filters match
     mode: str
 
 

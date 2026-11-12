@@ -61,7 +61,7 @@ def _feeds(feeds: Annotated[list[str] | None, Query(description="feed ids, e.g. 
     return split_csv(feeds)
 
 
-def _routes(routes: Annotated[list[str] | None, Query(description="line names, e.g. 52,4")] = None) -> set[str]:
+def _routes(routes: Annotated[list[str] | None, Query(description="route names, e.g. 52,4")] = None) -> set[str]:
     return split_csv(routes)
 
 

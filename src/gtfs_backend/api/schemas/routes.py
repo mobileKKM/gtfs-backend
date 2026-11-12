@@ -8,7 +8,6 @@ from gtfs_backend.api.schemas.common import Route
 
 
 class RouteShape(BaseModel):
-    shape_id: str
     direction_id: int | None = None
     headsign: str | None = None
     trips: int

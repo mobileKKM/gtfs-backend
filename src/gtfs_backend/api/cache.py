@@ -35,7 +35,7 @@ _query_names: dict[int, frozenset[str]] = {}  # id(route) -> its declared query 
 
 
 def public(max_age: int) -> str:
-    """Stops, lines, route shapes and alerts (max-age from settings)."""
+    """Stops, routes, route shapes and alerts (max-age from settings)."""
     return f"public, max-age={max_age}"
 
 

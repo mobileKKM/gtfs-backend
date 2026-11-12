@@ -6,7 +6,7 @@ they leave (and GRACE_S after).
 
 A board starts at `time` (epoch). Without it, it starts now and leaves out departures that have left; with it, rows
 from that time on include departed ones as `departed`, with the last time realtime knew. Clients page by passing
-the last departure's time. `feeds` and `routes` (line names) narrow the board, and its alerts with it.
+the last departure's time. `feeds` and `routes` (route names) narrow the board, and its alerts with it.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from gtfs_backend.api.data.catalog import Catalog, Day, RouteInfo
 from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.data.sql import union_per_version
 from gtfs_backend.api.errors import InvalidInput
-from gtfs_backend.api.schemas import Departure, DepartureBoard, DepartureStatus, Line
+from gtfs_backend.api.schemas import Departure, DepartureBoard, DepartureStatus, RouteRef
 from gtfs_backend.api.services import alerts, stops
 
 LOOKBACK_S = 60 * 60  # delayed departures stay this long past their time
@@ -179,34 +179,34 @@ async def _page(
     start: int,
     live: bool,
     feeds: set[str],
-    routes: set[str],
+    route_names: set[str],
     now: int,
     limit: int,
-) -> tuple[list[Row], dict[tuple[str, str], Line]]:
-    """Rows of one page with their lines, widening the window until it is full."""
+) -> tuple[list[Row], dict[tuple[str, str], RouteRef]]:
+    """Rows of one page with their routes, widening the window until it is full."""
     page: list[Row] = []
-    lines: dict[tuple[str, str], Line] = {}
+    refs: dict[tuple[str, str], RouteRef] = {}
     for span in WINDOWS_S:
         lo, hi = (start - GRACE_S if live else start), start + span
         days = [d for d in await ctx.catalog.days_between(lo, hi) if not feeds or d.feed_id in feeds]
         found = await scheduled(conn, days, pids, lo, hi)
-        lines = await ctx.catalog.lines({(f.feed_version_id, f.route_id) for f in found})
-        if routes:
-            found = [f for f in found if (line := lines.get((f.feed_version_id, f.route_id))) and line.name in routes]
+        refs = await ctx.catalog.route_refs({(f.feed_version_id, f.route_id) for f in found})
+        if route_names:
+            found = [f for f in found if (ref := refs.get((f.feed_version_id, f.route_id))) and ref.name in route_names]
         updates = await realtime.trip_updates(ctx.redis, [s.trip_key for s in found])
         rows = [Row(f, overlay(f, updates.get(f.trip_key), now)) for f in found]
         page = select(rows, now, limit, lo, hi, live)
         if len(page) >= limit:
             break
-    return page, lines
+    return page, refs
 
 
-def _departure(row: Row, line: Line | None, stop) -> Departure:
+def _departure(row: Row, route: RouteRef | None, stop) -> Departure:
     s, live = row.s, row.live
     return Departure(
         trip_key=s.trip_key,
         stop_sequence=s.stop_sequence,
-        line=line,
+        route=route,
         headsign=s.headsign,
         stop=stops.stop_ref(stop),
         scheduled=s.scheduled_departure,
@@ -221,15 +221,17 @@ def _departure(row: Row, line: Line | None, stop) -> Departure:
 
 
 async def _served(conn: AsyncConnection, catalog: Catalog, pids: list[str]) -> list[RouteInfo]:
-    """The routes departing from these stops today, by feed and line name."""
+    """The routes departing from these stops in today's timetables (on any day), by feed and name."""
     served = await stops.served_routes(conn, catalog, pids)
     infos = await catalog.routes({fv for fv, _ in served})
-    return sorted((infos[k] for k in served if k in infos), key=lambda i: (i.feed_id, i.line().name, i.route_id))
+    return sorted((infos[k] for k in served if k in infos), key=lambda i: (i.feed_id, i.ref().name, i.route_id))
 
 
-async def _alerts(ctx: Context, pids: list[str], page: list[Row], served: list[RouteInfo], feeds: set[str], routes: set[str]):
-    """Alerts for the stop and every line departing from it today (within the filters), not only the ones on this page."""
-    shown = [i for i in served if (not feeds or i.feed_id in feeds) and (not routes or i.line().name in routes)]
+async def _alerts(
+    ctx: Context, pids: list[str], page: list[Row], served: list[RouteInfo], feeds: set[str], route_names: set[str]
+):
+    """Alerts for the stop and every route departing from it today (within the filters), not only the ones on this page."""
+    shown = [i for i in served if (not feeds or i.feed_id in feeds) and (not route_names or i.ref().name in route_names)]
     scope = alerts.Scope(
         routes={(i.feed_id, i.route_id): i.route_type for i in shown},
         public_stop_ids=set(pids),
@@ -241,10 +243,10 @@ async def _alerts(ctx: Context, pids: list[str], page: list[Row], served: list[R
     return await alerts.in_scope(ctx, scope)
 
 
-async def board(ctx: Context, key: str, time: int | None, feeds: set[str], routes: set[str], limit: int) -> DepartureBoard:
+async def board(ctx: Context, key: str, time: int | None, feeds: set[str], route_names: set[str], limit: int) -> DepartureBoard:
     """A page of departures from a stop group (all its stops) or one stop, from `time` (default now) on,
-    with realtime and the alerts that apply. `lines` are all the lines that depart from the stop today, whatever
-    the filters, so clients know what they can filter by.
+    with realtime and the alerts that apply. `routes` are all the routes that depart from the stop in today's
+    timetables (on any day), whatever the filters, so clients know what they can filter by.
     """
     if unknown := feeds - set(ctx.feed_ids):
         raise InvalidInput(f"unknown feed: {', '.join(sorted(unknown))}")
@@ -252,12 +254,12 @@ async def board(ctx: Context, key: str, time: int | None, feeds: set[str], route
     async with ctx.pool.connection() as conn:
         stop = await stops.get(conn, key)
         pids = await stops.public_stop_ids(conn, stop)
-        page, lines = await _page(ctx, conn, pids, now if time is None else time, time is None, feeds, routes, now, limit)
+        page, refs = await _page(ctx, conn, pids, now if time is None else time, time is None, feeds, route_names, now, limit)
 
         by_id = await stops.stops_by_id(conn, {r.s.public_stop_id for r in page})
-        out = [_departure(r, lines.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.public_stop_id]) for r in page]
+        out = [_departure(r, refs.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.public_stop_id]) for r in page]
         served = await _served(conn, ctx.catalog, pids)
-    board_alerts = await _alerts(ctx, pids, page, served, feeds, routes)
+    board_alerts = await _alerts(ctx, pids, page, served, feeds, route_names)
 
     timestamp = realtime.newest(r.live.timestamp for r in page)
-    return DepartureBoard(stop=stop, timestamp=timestamp, lines=[i.line() for i in served], departures=out, alerts=board_alerts)
+    return DepartureBoard(stop=stop, timestamp=timestamp, routes=[i.ref() for i in served], departures=out, alerts=board_alerts)

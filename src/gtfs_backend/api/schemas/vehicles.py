@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from gtfs_backend.api.schemas.common import Line
+from gtfs_backend.api.schemas.common import RouteRef
 
 
-class MapVehicle(BaseModel):
+class Vehicle(BaseModel):
     key: str  # `{feed_id}:{vehicle_id}`, stable across polls: /vehicles/{key}/trip
     label: str | None = None
     lat: float
     lon: float
     bearing: float | None = None
-    line: Line | None = None  # its mode is the vehicle's
+    route: RouteRef | None = None  # its mode is the vehicle's
     headsign: str | None = None
     delay_s: int | None = None
     trip_key: str  # /trips/{trip_key}
@@ -22,4 +22,4 @@ class MapVehicle(BaseModel):
 
 class VehicleList(BaseModel):
     timestamp: int | None  # of the newest position shown; None: no vehicles
-    vehicles: list[MapVehicle]
+    vehicles: list[Vehicle]

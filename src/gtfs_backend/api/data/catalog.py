@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from psycopg_pool import AsyncConnectionPool
 
-from gtfs_backend.api.schemas import Line, Route
+from gtfs_backend.api.schemas import Route, RouteRef
 from gtfs_backend.feeds import FeedsFile
 from gtfs_backend.keys import route_key
 from gtfs_backend.modes import MODE_SQL
@@ -54,7 +54,6 @@ class RouteInfo:
     def model(self) -> Route:
         return Route(
             key=self.key,
-            feed_id=self.feed_id,
             route_id=self.route_id,
             short_name=self.short_name,
             long_name=self.long_name,
@@ -63,10 +62,9 @@ class RouteInfo:
             agency=self.agency,
         )
 
-    def line(self) -> Line:
-        return Line(
+    def ref(self) -> RouteRef:
+        return RouteRef(
             key=self.key,
-            feed_id=self.feed_id,
             name=self.short_name or self.route_id,
             mode=self.mode,
         )
@@ -238,8 +236,8 @@ class Catalog:
         routes = await self.routes({fv for fv, _ in keys})
         return {k: routes[k].model() for k in keys if k in routes}
 
-    async def lines(self, keys) -> dict[tuple[str, str], Line]:
-        """(feed_version_id, route_id) -> compact line, for the keys that exist."""
+    async def route_refs(self, keys) -> dict[tuple[str, str], RouteRef]:
+        """(feed_version_id, route_id) -> compact route, for the keys that exist."""
         keys = set(keys)
         routes = await self.routes({fv for fv, _ in keys})
-        return {k: routes[k].line() for k in keys if k in routes}
+        return {k: routes[k].ref() for k in keys if k in routes}

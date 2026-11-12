@@ -13,7 +13,7 @@ router = APIRouter(prefix=PREFIX, tags=["routes"])
 
 @router.get("/routes/{route_key:path}/shapes", response_model=RouteShapes)
 async def route_shapes(request: Request, ctx: Ctx, route_key: str, date: DateQuery):
-    """Every shape a route (a line's `key`, `{feed_id}:{route_id}`) runs on a service day (default today), most used
+    """Every shape a route (its `key`, `{feed_id}:{route_id}`) runs on a service day (default today), most used
     first per direction."""
     s = ctx.settings
     cache_control = public(s.cache_ttl_static)

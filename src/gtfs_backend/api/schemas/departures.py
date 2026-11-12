@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from gtfs_backend.api.schemas.alerts import AlertRef
-from gtfs_backend.api.schemas.common import Line, StopRef
+from gtfs_backend.api.schemas.common import RouteRef, StopRef
 from gtfs_backend.api.schemas.stops import Stop
 
 DepartureStatus = Literal["scheduled", "live", "departed", "canceled", "skipped"]
@@ -16,7 +16,7 @@ DepartureStatus = Literal["scheduled", "live", "departed", "canceled", "skipped"
 class Departure(BaseModel):
     trip_key: str  # `{feed_id}:{YYYYMMDD}:{trip_id}`: /trips/{trip_key}
     stop_sequence: int
-    line: Line | None = None
+    route: RouteRef | None = None
     headsign: str | None = None
     stop: StopRef
     scheduled: int
@@ -33,5 +33,5 @@ class DepartureBoard(BaseModel):
     stop: Stop
     timestamp: int | None  # of the newest realtime prediction shown; None: no departure has realtime
     departures: list[Departure]
-    lines: list[Line]  # routes departing from the stop today, whatever the filters; names can repeat
+    routes: list[RouteRef]  # departing from the stop in today's timetables (any day), whatever the filters; names can repeat
     alerts: list[AlertRef]

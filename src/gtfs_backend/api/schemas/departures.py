@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from gtfs_backend.api.schemas.alerts import Alert
+from gtfs_backend.api.schemas.alerts import AlertRef
 from gtfs_backend.api.schemas.common import Line, PlatformRef
 from gtfs_backend.api.schemas.stops import Stop
 
@@ -15,9 +15,6 @@ DepartureStatus = Literal["scheduled", "live", "departed", "canceled", "skipped"
 
 class Departure(BaseModel):
     trip_key: str  # `{feed_id}:{YYYYMMDD}:{trip_id}`: /trips/{trip_key}
-    feed_id: str
-    trip_id: str
-    service_date: str
     stop_sequence: int
     line: Line | None = None
     headsign: str | None = None
@@ -27,15 +24,14 @@ class Departure(BaseModel):
     time: int  # estimated if known, else scheduled
     delay_s: int | None = None
     status: DepartureStatus
-    realtime: bool
-    vehicle_id: str | None = None  # set: the trip view can follow a vehicle
+    vehicle_key: str | None = None  # set: /vehicles/{vehicle_key}/trip follows the vehicle
     on_demand: bool = False  # request stop: signal the driver / call ahead to board (GTFS pickup type 2, 3)
     wheelchair_accessible: int | None = None
 
 
 class DepartureBoard(BaseModel):
     stop: Stop
-    timestamp: int
+    timestamp: int | None  # of the newest realtime prediction shown; None: no departure has realtime
     departures: list[Departure]
     lines: list[Line]  # routes departing from the stop today, whatever the filters; names can repeat
-    alerts: list[Alert]
+    alerts: list[AlertRef]

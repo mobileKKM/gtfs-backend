@@ -37,11 +37,28 @@ class Direction(BaseModel):
     headsigns: list[str]  # most frequent first, at most 3
 
 
-class PlatformInfo(Stop):
+class PlatformInfo(BaseModel):
+    """A platform inside its group (search): no `kind` or `group_id`, the group says."""
+
+    id: str
+    key: str
+    name: str
+    lat: float | None = None
+    lon: float | None = None
+    modes: list[str] = Field(default_factory=list)
+    platform: str | None = None
     directions: list[Direction] = Field(default_factory=list)  # most served first
 
 
-class StopGroupInfo(Stop):
+class StopGroupInfo(BaseModel):
+    """A logical stop with its platforms (search)."""
+
+    id: str
+    key: str
+    name: str
+    lat: float | None = None
+    lon: float | None = None
+    modes: list[str] = Field(default_factory=list)
     platforms: list[PlatformInfo] = Field(default_factory=list)  # active ones
 
 

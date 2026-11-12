@@ -10,6 +10,7 @@ from gtfs_backend.api.schemas import Line, MapVehicle, VehicleList
 from gtfs_backend.keys import vehicle_key, version_id
 
 MAX_BBOX_KM = 50
+COORD_DIGITS = 5  # ~1 m
 
 
 def _model(raw: dict, lines: dict[tuple[str, str], Line]) -> MapVehicle:
@@ -17,13 +18,10 @@ def _model(raw: dict, lines: dict[tuple[str, str], Line]) -> MapVehicle:
     line = lines.get((version_id(raw["feed_id"], trip["version"]), trip["route_id"]))
     return MapVehicle(
         key=vehicle_key(raw["feed_id"], raw["vehicle_id"]),
-        feed_id=raw["feed_id"],
-        vehicle_id=raw["vehicle_id"],
         label=raw.get("label"),
-        lat=raw["lat"],
-        lon=raw["lon"],
+        lat=round(raw["lat"], COORD_DIGITS),
+        lon=round(raw["lon"], COORD_DIGITS),
         bearing=raw.get("bearing"),
-        mode=line.mode if line else None,
         line=line,
         headsign=trip.get("headsign"),
         delay_s=raw.get("delay_s"),
@@ -54,7 +52,7 @@ async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[st
         v
         for v in await by_ids(ctx, sorted(ids))
         if bbox.contains(v.lat, v.lon)
-        and (not modes or v.mode in modes)
+        and (not modes or (v.line is not None and v.line.mode in modes))
         and (not route_names or (v.line is not None and v.line.name in route_names))
     ]
-    return VehicleList(timestamp=ctx.now(), vehicles=out)
+    return VehicleList(timestamp=realtime.newest(v.timestamp for v in out), vehicles=out)

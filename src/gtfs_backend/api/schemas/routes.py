@@ -19,5 +19,4 @@ class RouteShape(BaseModel):
 class RouteShapes(BaseModel):
     route: Route
     service_date: str
-    feed_version_id: str
     shapes: list[RouteShape]

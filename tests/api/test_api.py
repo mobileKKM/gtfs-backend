@@ -117,6 +117,11 @@ def platform_id(sql, code: str) -> str:
     return sql("SELECT id FROM core.stop_platform WHERE current_code = %s", code)[0][0]
 
 
+def feed_of(item: dict) -> str:
+    """The feed of a vehicle or departure: the first part of its trip key."""
+    return item["trip_key"].split(":", 1)[0]
+
+
 # ------------------------------------------------------------------------------------------------- vehicles
 
 RONDO_BBOX = "19.95,50.06,19.97,50.07"
@@ -130,10 +135,14 @@ async def test_vehicles_in_bbox(api):
     vehicles = body["vehicles"]
     assert len(vehicles) > 300
     assert all(19.8 <= v["lon"] <= 20.2 and 49.95 <= v["lat"] <= 50.15 for v in vehicles)
-    assert {v["feed_id"] for v in vehicles} == {"kmk_a", "kmk_m", "kmk_t"}
-    tram = next(v for v in vehicles if v["feed_id"] == "kmk_t")
-    assert tram["mode"] == "tram" and tram["line"]["name"] and tram["key"] == f"kmk_t:{tram['vehicle_id']}"
-    assert tram["trip_key"].startswith("kmk_t:20261025:") and tram["line"]["key"] == f"kmk_t:{tram['line']['route_id']}"
+    assert {feed_of(v) for v in vehicles} == {"kmk_a", "kmk_m", "kmk_t"}
+    tram = next(v for v in vehicles if feed_of(v) == "kmk_t")
+    assert tram["line"]["mode"] == "tram" and tram["line"]["name"] and tram["key"].startswith("kmk_t:")
+    assert tram["trip_key"].startswith("kmk_t:20261025:") and tram["line"]["key"].startswith("kmk_t:")
+    assert tram["line"]["feed_id"] == "kmk_t" and "route_id" not in tram["line"]
+    # only what the map needs: no ids the key already carries, coordinates to ~1 m
+    assert not {"feed_id", "vehicle_id", "mode"} & set(tram)
+    assert all(round(v["lat"], 5) == v["lat"] and round(v["lon"], 5) == v["lon"] for v in vehicles)
     # live data: clients poll on their own schedule and always revalidate (304 via the ETag)
     assert "next_update" not in body and r.headers["cache-control"] == "no-cache"
     again = await api.get(f"/vehicles?bbox={CITY_BBOX}", headers={"If-None-Match": r.headers["etag"]})
@@ -143,7 +152,7 @@ async def test_vehicles_in_bbox(api):
     assert 0 < len(small) < len(vehicles)
 
     trams = (await api.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"]
-    assert trams and all(v["mode"] == "tram" for v in trams)
+    assert trams and all(v["line"]["mode"] == "tram" for v in trams)
     line = tram["line"]["name"]
     on_line = (await api.get(f"/vehicles?bbox={CITY_BBOX}&routes={line}")).json()["vehicles"]
     assert on_line and all(v["line"]["name"] == line for v in on_line)
@@ -197,8 +206,10 @@ async def test_stop_search(api, sql):
     assert {"tram", "bus"} <= {line["mode"] for p in rondo["platforms"] for d in p["directions"] for line in d["lines"]}
     served = [p for p in rondo["platforms"] if p["directions"]]
     assert len(served) >= 4
+    assert "kind" not in rondo and not any({"kind", "group_id"} & set(p) for p in rondo["platforms"])
+    own = {p[0] for p in sql("SELECT id FROM core.stop_platform WHERE stop_group_id = %s", rondo["id"])}
+    assert {p["id"] for p in rondo["platforms"]} <= own
     for p in served:
-        assert p["group_id"] == rondo["id"]
         for d in p["directions"]:
             assert d["towards"] != "Rondo Mogilskie" and d["lines"] and len(d["headsigns"]) <= 3
     # the hint is the next stop a trip from that platform reaches
@@ -218,6 +229,9 @@ async def test_stop_search(api, sql):
         platform_id(sql, "802-01"),
     )
     assert p1["directions"][0]["towards"] == nxt
+
+    assert len((await api.get("/stops/search?q=rondo")).json()["results"]) == 10  # typeahead default
+    assert len((await api.get("/stops/search?q=rondo&limit=15")).json()["results"]) == 15
 
     results = (await api.get("/stops/search?q=WZGORZA krzeslaw")).json()["results"]
     assert results[0]["name"] == "Wzgórza Krzesławickie"
@@ -286,35 +300,39 @@ async def test_departure_board_merges_feeds_with_realtime(api, sql):
     assert r.status_code == 200
     board = r.json()
     deps = board["departures"]
-    assert board["stop"]["id"] == gid and board["timestamp"] == NOW and "next_update" not in board
+    assert board["stop"]["id"] == gid and "next_update" not in board
     assert r.headers["cache-control"] == "no-cache"
     assert len(deps) == 60
     assert [d["time"] for d in deps] == sorted(d["time"] for d in deps)
     assert all(d["time"] >= NOW - 30 and d["status"] != "departed" for d in deps)
-    assert {d["feed_id"] for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
+    assert {feed_of(d) for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
+    assert not {"feed_id", "trip_id", "service_date", "realtime", "vehicle_id"} & {k for d in deps for k in d}
     own = {p[0] for p in sql("SELECT id FROM core.stop_platform WHERE stop_group_id = %s", gid)}
     assert all(d["platform"]["id"] in own for d in deps)
     assert all(d["line"]["name"] for d in deps)
 
-    live = [d for d in deps if d["realtime"]]
-    assert len(live) > len(deps) / 2 and all(d["status"] == "live" for d in live)
-    assert all(d["status"] == "scheduled" for d in deps if not d["realtime"])
+    live = [d for d in deps if d["status"] == "live"]
+    assert len(live) > len(deps) / 2 and all(d["estimated"] is not None or d["delay_s"] is not None for d in live)
+    assert all(d["status"] == "scheduled" and d["estimated"] is None for d in deps if d["status"] != "live")
+    assert any((d["vehicle_key"] or "").startswith(feed_of(d) + ":") for d in live)
     for d in live:
         if d["estimated"] is not None:
             assert d["time"] == d["estimated"]
             assert d["delay_s"] == d["estimated"] - d["scheduled"]
     # trams count from midnight on the clock-change day: with that their delays are minutes, not an hour
-    tram_delays = [d["delay_s"] for d in live if d["feed_id"] == "kmk_t"]
+    tram_delays = [d["delay_s"] for d in live if feed_of(d) == "kmk_t"]
     assert tram_delays and sum(abs(x) < 900 for x in tram_delays) >= 0.9 * len(tram_delays)
     # delayed departures that were scheduled before now are still on the board
     assert any(d["scheduled"] < NOW for d in live)
+    # the board's time is its data's: the newest prediction shown, from before the request
+    assert board["timestamp"] is not None and board["timestamp"] <= NOW
 
     # the timetable time comes from the right day base (midnight for trams)
-    tram = next(d for d in deps if d["feed_id"] == "kmk_t")
+    tram = next(d for d in deps if feed_of(d) == "kmk_t")
     (secs,) = sql(
         "SELECT extract(epoch FROM departure_time)::int FROM gtfs.stop_times "
         "WHERE feed_version_id = 'kmk_t_v1' AND trip_id = %s AND stop_sequence = %s",
-        tram["trip_id"],
+        tram["trip_key"].split(":", 2)[2],
         tram["stop_sequence"],
     )[0]
     assert tram["scheduled"] == 1792879200 + secs  # 2026-10-25 00:00 CEST
@@ -343,7 +361,7 @@ async def test_departure_board_pages_by_time(api, sql):
     assert all(d["time"] >= NOW - 3600 for d in past)
     assert any(d["status"] == "departed" for d in past)
     # vehicles that passed keep the last time realtime had
-    assert any(d["status"] == "departed" and d["realtime"] and d["estimated"] for d in past)
+    assert any(d["status"] == "departed" and d["estimated"] for d in past)
 
     assert (await api.get(f"{url}?time=garbage")).status_code == 422
     assert (await api.get(f"{url}?time=-1")).status_code == 422
@@ -352,12 +370,12 @@ async def test_departure_board_pages_by_time(api, sql):
 async def test_departure_board_filters(api, sql):
     url = f"/stops/{group_id(sql, '802')}/departures"
     deps = (await api.get(f"{url}?limit=100")).json()["departures"]
-    assert {d["feed_id"] for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
+    assert {feed_of(d) for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
 
     only = (await api.get(f"{url}?limit=20&feeds=kmk_t")).json()["departures"]
-    assert len(only) == 20 and {d["feed_id"] for d in only} == {"kmk_t"}
+    assert len(only) == 20 and {feed_of(d) for d in only} == {"kmk_t"}
     both = (await api.get(f"{url}?limit=100&feeds=kmk_t,kmk_a")).json()["departures"]
-    assert {d["feed_id"] for d in both} == {"kmk_t", "kmk_a"}
+    assert {feed_of(d) for d in both} == {"kmk_t", "kmk_a"}
     assert both == (await api.get(f"{url}?limit=100&feeds=kmk_t&feeds=kmk_a")).json()["departures"]
     assert (await api.get(f"{url}?feeds=nope")).status_code == 422
 
@@ -365,12 +383,12 @@ async def test_departure_board_filters(api, sql):
     assert {"kmk_a", "kmk_m", "kmk_t"} <= {ln["feed_id"] for ln in board["lines"]}  # not narrowed by the filters
     assert len({ln["key"] for ln in board["lines"]}) == len(board["lines"])  # routes, each once (names may repeat)
     assert {d["line"]["key"] for d in deps} <= {ln["key"] for ln in board["lines"]}
-    name = next(d["line"]["name"] for d in deps if d["feed_id"] == "kmk_t")
+    name = next(d["line"]["name"] for d in deps if feed_of(d) == "kmk_t")
     on_line = (await api.get(f"{url}?limit=20&routes={name}")).json()["departures"]
     assert on_line and all(d["line"]["name"] == name for d in on_line)
     assert (await api.get(f"{url}?routes=no-such-line")).json()["departures"] == []
     narrow = (await api.get(f"{url}?limit=20&feeds=kmk_a&routes={name}")).json()["departures"]
-    assert all(d["feed_id"] == "kmk_a" and d["line"]["name"] == name for d in narrow)
+    assert all(feed_of(d) == "kmk_a" and d["line"]["name"] == name for d in narrow)
     # filters are part of the cached response
     assert (await api.get(f"{url}?limit=20&feeds=kmk_t")).json()["departures"] == only
 
@@ -385,12 +403,36 @@ async def test_departure_board_platform_and_other_days(api, sql):
     time, dates = NOW - 36 * 3600, set()
     for _ in range(40):
         page = (await api.get(f"{url}?limit=100&time={time}")).json()["departures"]
-        dates |= {d["service_date"] for d in page if d["feed_id"] == "kmk_a"}
+        dates |= {d["trip_key"].split(":")[1] for d in page if feed_of(d) == "kmk_a"}
         if "20261024" in dates or not page:
             break
         time = max(page[-1]["time"], time + 1)
     assert "20261024" in dates
     assert (await api.get("/stops/zzzzz/departures")).status_code == 404
+
+
+async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
+    """Responses carry the time of their data, not of the request: a later poll of unchanged data is a 304."""
+    clock = [NOW]
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: clock[0])
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        vehicles = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()
+        assert vehicles["timestamp"] == max(v["timestamp"] for v in vehicles["vehicles"] if v["timestamp"] is not None)
+        v = vehicles["vehicles"][0]
+        urls = [
+            f"/vehicles?bbox={CITY_BBOX}",
+            f"/stops/{group_id(sql, '802')}/departures",
+            f"/trips/{v['trip_key']}/live",
+            f"/vehicles/{v['key']}/trip",
+        ]
+        first = {u: await c.get(u) for u in urls}
+        clock[0] = NOW + 1
+        for u in urls:
+            again = await c.get(u, headers={"If-None-Match": first[u].headers["etag"]})
+            assert again.status_code == 304, u
+        # nothing realtime shown: no timestamp
+        assert (await c.get("/vehicles?bbox=19.0,49.0,19.01,49.01")).json() == {"timestamp": None, "vehicles": []}
 
 
 async def test_departure_board_etag(api, sql):
@@ -425,27 +467,34 @@ def decode_polyline(s: str) -> list[tuple[float, float]]:
     return coords
 
 
-async def test_trip_view_of_a_live_vehicle(api):
+async def test_trip_of_a_live_vehicle(api):
     vehicles = (await api.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"]
     v = next(v for v in vehicles if v["delay_s"] is not None)
     r = await api.get(f"/vehicles/{v['key']}/trip")
     assert r.status_code == 200
-    trip = r.json()
-    assert trip["key"] == v["trip_key"] and trip["status"] == "live" and "next_update" not in trip
+    live = r.json()
+    assert live["key"] == v["trip_key"] and live["status"] == "live" and "next_update" not in live
     assert r.headers["cache-control"] == "no-cache"
-    assert trip["vehicle"] == v
+    assert live["vehicle"] == v
+    # passed stops come first, then the ones with predictions; current_index is the first not passed
+    passed = [s["passed"] for s in live["stops"]]
+    assert passed == sorted(passed, reverse=True)
+    assert live["current_index"] == passed.index(False)
+    assert any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"] if not s["passed"])
+    # the same live state by trip key
+    by_key = await api.get(f"/trips/{v['trip_key']}/live")
+    assert by_key.json() == live and by_key.headers["cache-control"] == "no-cache"
+
+    # the trip itself: what doesn't change while it runs, cacheable, with stops in the order of the live ones
+    r = await api.get(f"/trips/{v['trip_key']}")
+    assert r.headers["cache-control"].startswith("public, max-age=")
+    trip = r.json()
+    assert trip["key"] == live["key"] and not {"vehicle", "status", "alerts", "current_index"} & set(trip)
     assert trip["route"]["short_name"] == v["line"]["name"] and trip["headsign"] == v["headsign"]
     stops = trip["stops"]
     seqs = [s["stop_sequence"] for s in stops]
-    assert seqs == sorted(seqs) and all(s["platform"] and s["name"] for s in stops)
-    # passed stops come first, then the ones with predictions; current_index is the first not passed
-    passed = [s["passed"] for s in stops]
-    assert passed == sorted(passed, reverse=True)
-    assert trip["current_index"] == passed.index(False)
-    assert any(s["estimated_arrival"] or s["estimated_departure"] for s in stops if not s["passed"])
-
-    # the same view by trip key
-    assert (await api.get(f"/trips/{v['trip_key']}")).json() == trip
+    assert seqs == sorted(seqs) == [s["stop_sequence"] for s in live["stops"]]
+    assert all(s["platform"]["name"] and s["group_key"] and "estimated_arrival" not in s for s in stops)
 
     shape = trip["shape"]
     assert shape["source"] == "shape"
@@ -456,12 +505,12 @@ async def test_trip_view_of_a_live_vehicle(api):
     assert abs(points[0][0] - stops[0]["lat"]) < 0.003 and abs(points[0][1] - stops[0]["lon"]) < 0.003
 
     route = (await api.get(f"/routes/{trip['route']['key']}/shapes?date={trip['service_date']}")).json()
-    assert shape["polyline"] in {s["polyline"] for s in route["shapes"]}
+    assert shape["polyline"] in {s["polyline"] for s in route["shapes"]} and "feed_version_id" not in route
     assert (await api.get("/vehicles/kmk_t:nope/trip")).status_code == 404
     assert (await api.get("/vehicles/nope/trip")).status_code == 422
 
 
-async def test_trip_view_without_realtime_or_shape(api, sql, loaded):
+async def test_trip_without_realtime_or_shape(api, sql, loaded):
     # a tram trip of the day without realtime: no vehicle, nothing live
     candidates = sql(
         "SELECT t.trip_id FROM gtfs.trips t JOIN core.service_date sd ON sd.feed_version_id = t.feed_version_id "
@@ -470,9 +519,14 @@ async def test_trip_view_without_realtime_or_shape(api, sql, loaded):
     r = redis.Redis.from_url(TEST_REDIS_URL)
     trip_id = next(t for (t,) in candidates if not r.exists(f"rt:trip:kmk_t:20261025:{t}"))
     r.close()
-    trip = (await api.get(f"/trips/kmk_t:20261025:{trip_id}")).json()
-    assert trip["status"] == "scheduled" and trip["vehicle"] is None
-    assert not any(s["estimated_arrival"] or s["estimated_departure"] for s in trip["stops"])
+    key = f"kmk_t:20261025:{trip_id}"
+    live = (await api.get(f"/trips/{key}/live")).json()
+    assert live["status"] == "scheduled" and live["vehicle"] is None
+    assert not any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"])
+    # without realtime a stop is passed once its time is over
+    trip = (await api.get(f"/trips/{key}")).json()
+    for s, ls in zip(trip["stops"], live["stops"], strict=True):
+        assert ls["passed"] == ((s.get("scheduled_departure") or s["scheduled_arrival"]) < NOW)
     assert trip["shape"]["source"] == "shape" and not any(s["on_demand"] for s in trip["stops"])
 
     # without a shape it is drawn through the stops
@@ -483,7 +537,7 @@ async def test_trip_view_without_realtime_or_shape(api, sql, loaded):
         conn.execute("UPDATE gtfs.trips SET shape_id = NULL WHERE feed_version_id = 'kmk_t_v1' AND trip_id = %s", (trip_id,))
         conn.commit()
         try:
-            bare = (await api.get(f"/trips/kmk_t:20261025:{trip_id}")).json()
+            bare = (await api.get(f"/trips/{key}")).json()
         finally:
             conn.execute(
                 "UPDATE gtfs.trips SET shape_id = %s WHERE feed_version_id = 'kmk_t_v1' AND trip_id = %s", (shape_id, trip_id)
@@ -499,6 +553,8 @@ async def test_trip_and_route_errors(api):
     assert (await api.get("/trips/kmk_t:20261025:nope")).status_code == 404
     assert (await api.get("/trips/kmk_t:20300101:nope")).status_code == 404
     assert (await api.get("/trips/nope:20261025:x")).status_code == 404
+    assert (await api.get("/trips/kmk_t:20261025:nope/live")).status_code == 404
+    assert (await api.get("/trips/kmk_t/live")).status_code == 422
     for bad in ("kmk_t:2026-10-25:x", "kmk_t:25102026:x", "kmk_t:20261025", "kmk_t"):
         assert (await api.get(f"/trips/{bad}")).status_code == 422, bad
     assert (await api.get("/routes/kmk_t:nope/shapes")).status_code == 404
@@ -523,8 +579,9 @@ async def test_errors_have_one_shape(api):
 async def alerts_in_redis(api, sql):
     """Alerts as the worker stores them (the snapshot had none)."""
     deps = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()["departures"]
-    tram = next(d for d in deps if d["feed_id"] == "kmk_t")
-    tram["route_id"] = tram["line"]["route_id"]
+    tram = next(d for d in deps if feed_of(d) == "kmk_t")
+    tram["route_id"] = tram["line"]["key"].split(":", 1)[1]
+    tram["trip_id"] = tram["trip_key"].split(":", 2)[2]
     pid = tram["platform"]["id"]  # a platform the tram stops at
     (code,) = sql("SELECT current_code FROM core.stop_platform WHERE id = %s", pid)[0]
     far = platform_id(sql, "125-01")
@@ -594,11 +651,22 @@ async def test_alert_filters(api, sql, alerts_in_redis):
 
 async def test_alerts_on_board_and_trip(api, sql, alerts_in_redis):
     board = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()
-    assert {a["id"] for a in board["alerts"]} == {"route", "stop", "trip", "feed"}
+    assert {a["key"] for a in board["alerts"]} == {"kmk_t:route", "kmk_t:stop", "kmk_t:trip", "kmk_t:feed"}
+    # boards and trips carry what a banner needs; the rest is at /alerts/{key}
+    ref = next(a for a in board["alerts"] if a["key"] == "kmk_t:stop")
+    assert ref == {
+        "key": "kmk_t:stop",
+        "cause": "CONSTRUCTION",
+        "effect": "DETOUR",
+        "header": "Header stop",
+        "active_periods": [{"start": NOW - 3600, "end": None}],
+    }
+    assert (await api.get(f"/alerts/{ref['key']}")).json()["description"].startswith("Opis")
     tram = alerts_in_redis["tram"]
-    trip = (await api.get(f"/trips/{tram['trip_key']}")).json()
-    assert {"route", "stop", "trip", "feed"} <= {a["id"] for a in trip["alerts"]}
-    assert "other_route" not in {a["id"] for a in trip["alerts"]}
+    trip = (await api.get(f"/trips/{tram['trip_key']}/live")).json()
+    assert {"kmk_t:route", "kmk_t:stop", "kmk_t:trip", "kmk_t:feed"} <= {a["key"] for a in trip["alerts"]}
+    assert "kmk_t:other_route" not in {a["key"] for a in trip["alerts"]}
+    assert "alerts" not in (await api.get(f"/trips/{tram['trip_key']}")).json()
 
 
 # ------------------------------------------------------------------------------------------------- health
@@ -626,6 +694,7 @@ async def test_openapi_lists_every_endpoint(api):
         "/api/v1/stops/search",
         "/api/v1/stops/{key}/departures",
         "/api/v1/trips/{trip_key}",
+        "/api/v1/trips/{trip_key}/live",
         "/api/v1/routes/{route_key}/shapes",
         "/api/v1/alerts",
         "/api/v1/alerts/{alert_key}",
@@ -757,9 +826,10 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
     await r.set("rt:alerts:kmk_t", json.dumps(raws))
     try:
         board = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()
-        assert {a["id"] for a in board["alerts"]} == current
-        tram = next(d for d in board["departures"] if d["feed_id"] == "kmk_t")
-        assert {a["id"] for a in (await api.get(f"/trips/{tram['trip_key']}")).json()["alerts"]} == current
+        keys = {f"kmk_t:{a}" for a in current}
+        assert {a["key"] for a in board["alerts"]} == keys
+        tram = next(d for d in board["departures"] if feed_of(d) == "kmk_t")
+        assert {a["key"] for a in (await api.get(f"/trips/{tram['trip_key']}/live")).json()["alerts"]} == keys
         # /alerts passes everything on unless asked
         assert len((await api.get("/alerts")).json()["alerts"]) == len(raws)
         assert {a["id"] for a in (await api.get("/alerts?active=true")).json()["alerts"]} == current

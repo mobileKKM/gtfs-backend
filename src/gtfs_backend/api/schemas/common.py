@@ -27,7 +27,6 @@ class Line(BaseModel):
 
     key: str  # `{feed_id}:{route_id}`, as Route.key
     feed_id: str
-    route_id: str
     name: str  # short name, or route_id when there is none
     mode: str
 

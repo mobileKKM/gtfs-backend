@@ -145,22 +145,26 @@ dates `YYYYMMDD`.
 |---|---|---|
 | stop | `rondo-mogilskie01-qphdu` (or the bare id) | `/stops/{key}/departures` |
 | vehicle | `{feed_id}:{vehicle_id}` | `/vehicles/{key}/trip` |
-| trip | `{feed_id}:{YYYYMMDD}:{trip_id}` (`trip_key`) | `/trips/{key}` |
+| trip | `{feed_id}:{YYYYMMDD}:{trip_id}` (`trip_key`) | `/trips/{key}`, `/trips/{key}/live` |
 | route | `{feed_id}:{route_id}` | `/routes/{key}/shapes`, `/alerts?route={key}` |
 | alert | `{feed_id}:{id}` | `/alerts/{key}` |
 
-The source id comes last and is kept whole, so ids with `:` or `/` work.
+The source id comes last and is kept whole, so ids with `:` or `/` work. Responses carry no id a key already
+holds (no `feed_id`/`trip_id` next to `trip_key`). Every field of a schema is always present (`null` when unset).
+Polled responses (vehicles, boards, live trips) carry the `timestamp` of the newest realtime data they show, not
+of the request, so their ETag only changes with the data.
 
 | endpoint | what |
 |---|---|
-| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, line, headsign, delay, `trip_key` |
-| `GET /vehicles/{vehicle_key}/trip` | trip view of the vehicle's current trip (polling follows it onto the next) |
+| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, line (with its mode), headsign, delay, `trip_key` |
+| `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | platforms with `group_id`, or logical stops (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for stations (≤ 3000, `truncated`) |
-| `GET /stops/search?q=…` | logical stops by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with platforms and directions |
-| `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and line names; alerts included |
-| `GET /trips/{trip_key}` | shape polyline, every stop with scheduled/estimated times, live vehicle, alerts |
+| `GET /stops/search?q=…` | logical stops by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with platforms and directions; `limit` default 10 |
+| `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and line names; `vehicle_key` to follow; alerts as refs |
+| `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
+| `GET /trips/{trip_key}/live` | to poll: every stop's predictions and passed/skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
-| `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts as published |
+| `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts as published (boards and trips carry only `key`, `cause`, `effect`, `header`, `active_periods`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
 
 **Errors**: `{"error": {"code": "not_found" | "invalid_input" | "method_not_allowed" | …, "message": "…"}}`: 404
@@ -171,7 +175,7 @@ busy or a store is down, 500 `internal` without details.
 `REDIS_POOL_MAX_SIZE`) and its own catalog copy, reloaded on `static:updated`. `DB_POOL_MAX_SIZE` is the same for the
 worker and every API process: keep `(API_WORKERS + 1) × DB_POOL_MAX_SIZE` below Postgres' `max_connections` (100).
 
-**Response cache.** Boards and trips (`CACHE_TTL_LIVE`, 3 s), search and shapes (`CACHE_TTL_STATIC`, 300 s) and
+**Response cache.** Boards and live trips (`CACHE_TTL_LIVE`, 3 s), search, trips and shapes (`CACHE_TTL_STATIC`, 300 s) and
 alerts (`CACHE_TTL_ALERTS`, 15 s) are cached in Redis for all processes, so clients share bodies and ETags and
 polling gets 304s. Keys include the loaded versions; only declared query parameters count; errors aren't cached.
 `/vehicles` and `/stops` bbox queries aren't cached.

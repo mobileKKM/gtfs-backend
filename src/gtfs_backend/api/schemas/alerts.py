@@ -39,5 +39,15 @@ class Alert(BaseModel):
     stops: list[Stop] = Field(default_factory=list)
 
 
+class AlertRef(BaseModel):
+    """An alert as boards and trip views carry it: enough for a banner; the rest at /alerts/{key}."""
+
+    key: str  # `{feed_id}:{id}`: /alerts/{key}
+    cause: str | None = None
+    effect: str | None = None
+    header: str | None = None
+    active_periods: list[ActivePeriod] = Field(default_factory=list)
+
+
 class AlertList(BaseModel):
     alerts: list[Alert]

@@ -61,6 +61,7 @@ class Live:
     realtime: bool
     status: DepartureStatus
     vehicle_id: str | None
+    timestamp: int | None = None  # of the trip update
 
 
 @dataclass(frozen=True)
@@ -151,7 +152,9 @@ def overlay(s: Scheduled, raw: dict | None, now: int, grace: int = GRACE_S) -> L
         status = "departed"
     else:
         status = "live" if is_live else "scheduled"
-    return Live(estimated, delay, is_live, status, update.vehicle_id if update else None)
+    if update is None:
+        return Live(estimated, delay, is_live, status, None)
+    return Live(estimated, delay, is_live, status, update.vehicle_id, update.timestamp)
 
 
 def _upcoming(row: Row, now: int, grace: int) -> bool:
@@ -202,9 +205,6 @@ def _departure(row: Row, line: Line | None, platform) -> Departure:
     s, live = row.s, row.live
     return Departure(
         trip_key=s.trip_key,
-        feed_id=s.feed_id,
-        trip_id=s.trip_id,
-        service_date=keys.service_date_str(s.service_date),
         stop_sequence=s.stop_sequence,
         line=line,
         headsign=s.headsign,
@@ -214,8 +214,7 @@ def _departure(row: Row, line: Line | None, platform) -> Departure:
         time=row.time,
         delay_s=live.delay_s,
         status=live.status,
-        realtime=live.realtime,
-        vehicle_id=live.vehicle_id,
+        vehicle_key=keys.vehicle_key(s.feed_id, live.vehicle_id) if live.vehicle_id else None,
         on_demand=s.on_demand,
         wheelchair_accessible=s.wheelchair_accessible,
     )
@@ -228,27 +227,18 @@ async def _served(conn: AsyncConnection, catalog: Catalog, pids: list[str]) -> l
     return sorted((infos[k] for k in served if k in infos), key=lambda i: (i.feed_id, i.line().name, i.route_id))
 
 
-async def _alerts(
-    ctx: Context,
-    conn: AsyncConnection,
-    pids: list[str],
-    out: list[Departure],
-    served: list[RouteInfo],
-    feeds: set[str],
-    routes: set[str],
-):
+async def _alerts(ctx: Context, pids: list[str], page: list[Row], served: list[RouteInfo], feeds: set[str], routes: set[str]):
     """Alerts for the stop and every line departing from it today (within the filters), not only the ones on this page."""
     shown = [i for i in served if (not feeds or i.feed_id in feeds) and (not routes or i.line().name in routes)]
     scope = alerts.Scope(
         routes={(i.feed_id, i.route_id): i.route_type for i in shown},
         platforms=set(pids),
-        trips={(d.feed_id, d.trip_id) for d in out},
-        feeds={i.feed_id for i in shown} | {d.feed_id for d in out},
+        trips={(r.s.feed_id, r.s.trip_id) for r in page},
+        feeds={i.feed_id for i in shown} | {r.s.feed_id for r in page},
     )
-    for d in out:
-        if d.line:
-            scope.routes.setdefault((d.feed_id, d.line.route_id), None)
-    return await alerts.in_scope(ctx, conn, scope)
+    for r in page:
+        scope.routes.setdefault((r.s.feed_id, r.s.route_id), None)
+    return await alerts.in_scope(ctx, scope)
 
 
 async def board(ctx: Context, key: str, time: int | None, feeds: set[str], routes: set[str], limit: int) -> DepartureBoard:
@@ -267,6 +257,7 @@ async def board(ctx: Context, key: str, time: int | None, feeds: set[str], route
         platforms = await stops.platforms_by_id(conn, {r.s.stop_platform_id for r in page})
         out = [_departure(r, lines.get((r.s.feed_version_id, r.s.route_id)), platforms[r.s.stop_platform_id]) for r in page]
         served = await _served(conn, ctx.catalog, pids)
-        board_alerts = await _alerts(ctx, conn, pids, out, served, feeds, routes)
+    board_alerts = await _alerts(ctx, pids, page, served, feeds, routes)
 
-    return DepartureBoard(stop=stop, timestamp=now, lines=[i.line() for i in served], departures=out, alerts=board_alerts)
+    timestamp = realtime.newest(r.live.timestamp for r in page)
+    return DepartureBoard(stop=stop, timestamp=timestamp, lines=[i.line() for i in served], departures=out, alerts=board_alerts)

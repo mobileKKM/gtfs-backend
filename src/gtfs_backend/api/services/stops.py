@@ -24,6 +24,9 @@ from gtfs_backend.ids import parse_url_key
 
 MIN_DIRECTION_SHARE = 0.05  # rarer directions are short turns, depot runs etc.
 MAX_RESULTS = 3000  # platforms per map request
+# what search results take from a Stop: its kind and group are implied
+GROUP_INFO_FIELDS = set(StopGroupInfo.model_fields) - {"platforms"}
+PLATFORM_INFO_FIELDS = set(PlatformInfo.model_fields) - {"directions"}
 
 # An active platform with no modes has no trips in any current feed version (see refresh_stop_state): never returned.
 SERVED = "p.active AND cardinality(p.modes) > 0"
@@ -173,8 +176,10 @@ async def group_info(ctx: Context, conn: AsyncConnection, groups: list[Stop]) ->
     dirs = await directions(conn, ctx.catalog, platforms, MIN_DIRECTION_SHARE)
     return [
         StopGroupInfo(
-            **g.model_dump(),
-            platforms=[PlatformInfo(**p.model_dump(), directions=dirs.get(p.id, [])) for p in by_group[g.id]],
+            **g.model_dump(include=GROUP_INFO_FIELDS),
+            platforms=[
+                PlatformInfo(**p.model_dump(include=PLATFORM_INFO_FIELDS), directions=dirs.get(p.id, [])) for p in by_group[g.id]
+            ],
         )
         for g in groups
     ]

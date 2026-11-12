@@ -14,7 +14,7 @@ from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.errors import InvalidInput, NotFound
-from gtfs_backend.api.schemas import Alert, AlertList
+from gtfs_backend.api.schemas import Alert, AlertList, AlertRef
 from gtfs_backend.api.services import stops
 
 
@@ -101,10 +101,20 @@ async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> li
     ]
 
 
-async def in_scope(ctx: Context, conn: AsyncConnection, scope: Scope) -> list[Alert]:
-    """The current alerts (active now or soon) that apply to what is being looked at."""
+def ref(a: dict) -> AlertRef:
+    return AlertRef(
+        key=keys.alert_key(a["feed_id"], a["id"]),
+        cause=a.get("cause"),
+        effect=a.get("effect"),
+        header=a.get("header"),
+        active_periods=a.get("active_periods") or [],
+    )
+
+
+async def in_scope(ctx: Context, scope: Scope) -> list[AlertRef]:
+    """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them."""
     raws = current(ctx, await realtime.alerts_json(ctx.redis, ctx.feed_ids))
-    return await to_models(ctx, conn, [a for a in raws if matches(a, scope)])
+    return [ref(a) for a in raws if matches(a, scope)]
 
 
 # ------------------------------------------------------------------------------------------------- endpoints

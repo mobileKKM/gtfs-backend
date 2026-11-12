@@ -27,7 +27,7 @@ async def search_stops(
     request: Request,
     ctx: Ctx,
     q: Annotated[str, Query(min_length=1, max_length=100)],
-    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
 ):
     """Logical ZTP stops (where the metropolitan card is valid) by name; Polish letters and case don't matter
     ("rondo mog" finds "Rondo Mogilskie"). Other feeds' stops are on the map and in departures, but not searched.

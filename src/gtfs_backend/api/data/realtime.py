@@ -38,6 +38,12 @@ async def meta_json(redis: Redis, keys: list[tuple[str, str]]) -> dict[tuple[str
     return dict(zip(keys, values, strict=True))
 
 
+def newest(timestamps) -> int | None:
+    """The time of the newest realtime data shown, or None when nothing shown is realtime. Responses carry this,
+    not the time of the request, so a poll gets a 304 while the data hasn't changed."""
+    return max((t for t in timestamps if t is not None), default=None)
+
+
 # ------------------------------------------------------------------------------------------------- trip updates
 
 
@@ -60,6 +66,7 @@ class TripUpdate:
 
     def __init__(self, raw: dict):
         self.vehicle_id: str | None = raw.get("vehicle_id")
+        self.timestamp: int | None = raw.get("timestamp")  # when the feed measured it
         self.delay_s: int | None = raw.get("delay_s")
         self.canceled = raw.get("schedule_relationship") == "CANCELED"
         self._stops = {

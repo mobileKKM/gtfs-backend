@@ -9,14 +9,11 @@ from gtfs_backend.api.schemas.common import Line
 
 class MapVehicle(BaseModel):
     key: str  # `{feed_id}:{vehicle_id}`, stable across polls: /vehicles/{key}/trip
-    feed_id: str
-    vehicle_id: str
     label: str | None = None
     lat: float
     lon: float
     bearing: float | None = None
-    mode: str | None = None
-    line: Line | None = None
+    line: Line | None = None  # its mode is the vehicle's
     headsign: str | None = None
     delay_s: int | None = None
     trip_key: str  # /trips/{trip_key}
@@ -24,5 +21,5 @@ class MapVehicle(BaseModel):
 
 
 class VehicleList(BaseModel):
-    timestamp: int
+    timestamp: int | None  # of the newest position shown; None: no vehicles
     vehicles: list[MapVehicle]

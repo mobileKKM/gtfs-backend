@@ -67,7 +67,6 @@ class RouteInfo:
         return Line(
             key=self.key,
             feed_id=self.feed_id,
-            route_id=self.route_id,
             name=self.short_name or self.route_id,
             mode=self.mode,
         )

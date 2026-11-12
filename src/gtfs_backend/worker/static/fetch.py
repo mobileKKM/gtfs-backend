@@ -24,7 +24,7 @@ PREVIOUSLY_FAILED = "previously_failed"  # ImportResult.status of a zip that is 
 
 
 def import_order(feeds: FeedsFile) -> list[FeedConfig]:
-    """Feeds whose stops others share (e.g. ZTP for MLD) first, so attaching finds their platforms."""
+    """Feeds whose stops others share (e.g. ZTP for MLD) first, so attaching finds their stops."""
     shared = {ns for f in feeds.enabled for ns in f.share_stops_with}
     return sorted(feeds.enabled, key=lambda f: (f.namespace not in shared, bool(f.share_stops_with), f.feed_id))
 
@@ -33,6 +33,7 @@ def run_import_job(
     feed_id: str,
     namespace: str,
     share_with: list[str],
+    stop_code_pattern: str | None,
     zip_path: str,
     meta: dict,
     database_url: str,
@@ -45,7 +46,7 @@ def run_import_job(
 
     setup_logging(log_level)
     with connect(database_url) as conn:
-        result = import_zip(conn, feed_id, Path(zip_path), SourceMeta(**meta), namespace, share_with)
+        result = import_zip(conn, feed_id, Path(zip_path), SourceMeta(**meta), namespace, share_with, stop_code_pattern)
     return asdict(result)
 
 
@@ -131,6 +132,7 @@ async def check_static(
             feed.feed_id,
             feed.namespace,
             feed.share_stops_with,
+            feed.stop_code_pattern,
             str(stored),
             asdict(meta),
             settings.database_url,

@@ -1,4 +1,4 @@
-"""Comparing stop names across feeds (abbreviations, typos, a 'Kraków' prefix, platform numbers)."""
+"""Comparing stop names across feeds (abbreviations, typos, a 'Kraków' prefix, pole numbers)."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ ABBREVIATIONS = {
 
 
 def name_tokens(name: str) -> tuple[set[str], str | None]:
-    """Tokens of the slugged name without a leading 'krakow' and without a trailing platform number."""
+    """Tokens of the slugged name without a leading 'krakow' and without a trailing pole number."""
     tokens = slugify(name).split("-")
     number = tokens[-1] if len(tokens) > 1 and tokens[-1].isdigit() and len(tokens[-1]) <= 2 else None
     if number:

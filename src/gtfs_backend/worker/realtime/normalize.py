@@ -189,8 +189,8 @@ def _row(ref: TripRef, index: TripIndex, st: StopTime, pred_arr: int | None, pre
         delay = pred_arr - sched_arr
     return {
         "stop_sequence": st.sequence,
-        "stop_id": st.stop_id,
-        "stop_platform_id": index.platform(ref.info.version, st.stop_id),
+        "feed_stop_id": st.stop_id,
+        "stop_id": index.linked_stop(ref.info.version, st.stop_id),
         "scheduled_arrival": sched_arr,
         "scheduled_departure": sched_dep,
         "predicted_arrival": pred_arr,
@@ -315,8 +315,8 @@ def build_vehicle(
         "timestamp": int(vp.timestamp) or None,
         "current_status": pb.VehiclePosition.VehicleStopStatus.Name(vp.current_status) if vp.HasField("current_status") else None,
         "current_stop_sequence": vp.current_stop_sequence if vp.HasField("current_stop_sequence") else None,
-        "stop_id": vp.stop_id or None,
-        "stop_platform_id": index.platform(ref.info.version, vp.stop_id),
+        "feed_stop_id": vp.stop_id or None,
+        "stop_id": index.linked_stop(ref.info.version, vp.stop_id),
         "trip": trip_fields(feed_id, ref),
         "delay_s": delay,
         "occupancy": pb.VehiclePosition.OccupancyStatus.Name(vp.occupancy_status) if vp.HasField("occupancy_status") else None,
@@ -347,8 +347,8 @@ def build_alert(feed_id: str, entity_id: str, alert, index: TripIndex) -> dict:
                 "route_id": ie.route_id or None,
                 "route_type": ie.route_type if ie.HasField("route_type") else None,
                 "trip_id": ie.trip.trip_id or None,
-                "stop_id": ie.stop_id or None,
-                "stop_platform_id": index.platform(today.version, ie.stop_id) if today and ie.stop_id else None,
+                "feed_stop_id": ie.stop_id or None,
+                "stop_id": index.linked_stop(today.version, ie.stop_id) if today and ie.stop_id else None,
             }
         )
     return {

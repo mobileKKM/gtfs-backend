@@ -1,4 +1,4 @@
-"""Attaching a feed's stops to another namespace's platforms and groups (pure; apply.py does the DB work)."""
+"""Attaching a feed's stops to another namespace's stops and stop groups (pure; apply.py does the DB work)."""
 
 from __future__ import annotations
 
@@ -7,17 +7,17 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from gtfs_backend.worker.static.stops.geometry import along_track_m, angle_diff, distance_m
-from gtfs_backend.worker.static.stops.model import Group, NewStop, Platform
+from gtfs_backend.worker.static.stops.model import Group, NewStop, Stop
 from gtfs_backend.worker.static.stops.names import names_match
 from gtfs_backend.worker.static.stops.osm import OsmPole
 
 OSM_LINK_M = 60.0  # the nearest OSM bus pole this close names the stop's pole by its ref (MLD coordinates are often off)
 OSM_SNAP_M = 10.0  # a stop or pole this close to an OSM pole is that OSM pole
 OSM_SAME_POLE_M = (
-    25.0  # OSM poles further apart than this are different poles (a platform and its stop position are within ~20 m)
+    25.0  # OSM poles further apart than this are different poles (an OSM platform and its stop_position are within ~20 m)
 )
 OSM_OWN_M = 20.0  # an OSM pole of a code ZTP doesn't have claims a stop as its own pole only this close (GPS can be off)
-OSM_PLATFORM_M = 25.0  # an OSM pole this close to a shared platform is that platform's
+OSM_ON_STOP_M = 25.0  # an OSM pole this close to a shared stop is that stop's
 BAY_REF = re.compile(r"\d+-\d+-\d+")  # OSM 'GGG-PP-NN': a bay of a bus station
 OSM_REF_MAX_M = 100.0  # the pole a ref names must be this close to the OSM pole, or the ref is a typo
 SAME_POLE_M = 8.0  # this close it is the same pole, whatever the names say
@@ -32,7 +32,7 @@ MAX_DIRECTION_DEG = 90.0  # travel directions further apart than this: the other
 
 @dataclass
 class SharedPlan:
-    links: dict[str, str] = field(default_factory=dict)  # stop_id -> shared platform id
+    links: dict[str, str] = field(default_factory=dict)  # stop_id -> shared stop id
     group_for_key: dict[str, str] = field(default_factory=dict)  # group key -> shared group id
     methods: Counter = field(default_factory=Counter)
     warnings: list[str] = field(default_factory=list)
@@ -40,61 +40,61 @@ class SharedPlan:
 
 def plan_shared(
     stops: list[NewStop],
-    shared: list[Platform],
+    shared: list[Stop],
     shared_groups: list[Group],
     stop_bearing: dict[str, float] | None = None,
-    platform_bearing: dict[str, float] | None = None,
-    platform_modes: dict[str, set[str]] | None = None,
+    shared_bearing: dict[str, float] | None = None,
+    shared_modes: dict[str, set[str]] | None = None,
     feed_modes: set[str] | None = None,
     stop_next: dict[str, set[str]] | None = None,
-    platform_next: dict[str, set[str]] | None = None,
+    shared_next: dict[str, set[str]] | None = None,
     osm: list[OsmPole] | None = None,
 ) -> SharedPlan:
-    """Attach stops to the platforms/groups of a shared namespace (MLD buses use ZTP's poles in Kraków).
+    """Attach stops to the stops/groups of a shared namespace (MLD buses use ZTP's poles in Kraków).
 
     0. OpenStreetMap: the nearest OSM bus pole within 60 m, when it has a ref that says which pole it is. A ZTP code
-       ('889-03') or a bay ('271-01-06') that a shared platform is on links the stop to that platform, however far
-       the coordinates are apart. A ZTP code no shared platform has (OSM 802-07: an MLD pole ZTP doesn't publish),
-       a bay no shared platform is on (Czyżyny Dworzec 06) or the operator's own code (Wieliczka Centrum 200) keeps
+       ('889-03') or a bay ('271-01-06') that a shared stop is on links the stop to that stop, however far
+       the coordinates are apart. A ZTP code no shared stop has (OSM 802-07: an MLD pole ZTP doesn't publish),
+       a bay no shared stop is on (Czyżyny Dworzec 06) or the operator's own code (Wieliczka Centrum 200) keeps
        the stop's own pole: it is none of ZTP's poles, so no rule below may attach it to one. Only the operator's own
        code names the pole at any distance; the other two need the OSM pole within 20 m. Without such a pole
        (no OSM data, no ref, a ref of another scheme, the pole's side of the road is the other direction) the rules
        below decide.
-    1. Same pole: a shared platform within 8 m that the shared feeds serve with the feed's mode. Equally close
+    1. Same pole: a shared stop within 8 m that the shared feeds serve with the feed's mode. Equally close
        candidates are decided by direction, then by the lowest code.
     2. Logical stop: the group most of a station's attached poles belong to; otherwise a shared group with
        the same name within 300 m (of its nearest pole), or a similar name within 150 m.
-    3. Pole within the logical stop: the nearest platform of that group within 60 m that is served in the
+    3. Pole within the logical stop: the nearest stop of that group within 60 m that is served in the
        same direction (within 90°) by the same modes (bus). Beyond 30 m the pole must also lie within 40 m along
        the line (sideways is just inexact coordinates, but a pole further up the road is the next stop: MLD 3470
        vs ZTP Czyżyny Dworzec 01, 47 m ahead) and lead to the same next logical stop as the new stop. A pole is also
        out when OSM has the stop and the pole each on an OSM pole of their own, more than 25 m apart (Czernichów Rynek).
-       Stops with no such pole keep their own one: a bus stop next to tram-only platforms, or a side of the
+       Stops with no such pole keep their own one: a bus stop next to tram-only stops, or a side of the
        road the shared operator doesn't serve.
     Stops whose names clearly differ and that are not on the same pole (Kraków MDA) stay separate stops.
     """
     stop_bearing = stop_bearing or {}
     stop_next = stop_next or {}
-    platform_next = platform_next or {}
-    platform_bearing = platform_bearing or {}
-    platform_modes = platform_modes or {}
+    shared_next = shared_next or {}
+    shared_bearing = shared_bearing or {}
+    shared_modes = shared_modes or {}
     plan = SharedPlan()
 
-    def direction(s: NewStop, p: Platform) -> float | None:
-        sb, pb = stop_bearing.get(s.stop_id), platform_bearing.get(p.id)
+    def direction(s: NewStop, p: Stop) -> float | None:
+        sb, pb = stop_bearing.get(s.stop_id), shared_bearing.get(p.id)
         return None if sb is None or pb is None else angle_diff(sb, pb)
 
-    def same_mode(p: Platform) -> bool:
-        modes = platform_modes.get(p.id)
+    def same_mode(p: Stop) -> bool:
+        modes = shared_modes.get(p.id)
         return not feed_modes or not modes or bool(modes & feed_modes)
 
-    cells: dict[tuple[int, int], list[Platform]] = defaultdict(list)
+    cells: dict[tuple[int, int], list[Stop]] = defaultdict(list)
     for p in shared:
         if p.lat is not None and p.active:
             cells[(int(p.lat * 1000), int(p.lon * 1000))].append(p)  # ~110 m x 70 m cells
 
-    def same_pole(s: NewStop) -> list[tuple[float, Platform]]:
-        """Platforms of a mode the shared feeds serve within 8 m of the stop, nearest first."""
+    def same_pole(s: NewStop) -> list[tuple[float, Stop]]:
+        """Shared stops of a mode the shared feeds serve within 8 m of the stop, nearest first."""
         cx, cy = int(s.lat * 1000), int(s.lon * 1000)
         out = [
             (d, p)
@@ -105,7 +105,7 @@ def plan_shared(
         ]
         return sorted(out, key=lambda c: c[0])
 
-    def pick(s: NewStop, cands: list[tuple[float, Platform]]) -> Platform:
+    def pick(s: NewStop, cands: list[tuple[float, Stop]]) -> Stop:
         """Nearest candidate; equally close ones are decided by direction of travel, else the lowest code.
 
         Two codes on one spot (e.g. at a turn-around) are one pole, so an undecided tie is still that pole.
@@ -135,13 +135,13 @@ def plan_shared(
         ]
         return sorted(found, key=lambda c: c[0])
 
-    # a bay of a bus station ('271-01-06') is a pole of its own; a shared platform is on a bay when that OSM pole is
+    # a bay of a bus station ('271-01-06') is a pole of its own; a shared stop is on a bay when that OSM pole is
     # within 25 m of it
-    by_bay: dict[str, Platform] = {}
+    by_bay: dict[str, Stop] = {}
     if osm:
         for p in shared:
             if p.active and p.lat is not None:
-                for _, o in osm_near(p.lat, p.lon, OSM_PLATFORM_M):
+                for _, o in osm_near(p.lat, p.lon, OSM_ON_STOP_M):
                     if o.ref and BAY_REF.fullmatch(o.ref):
                         by_bay.setdefault(o.ref, p)
                         break
@@ -154,13 +154,13 @@ def plan_shared(
             snapped[key] = near[0][1] if near else None
         return snapped[key]
 
-    def osm_apart(s: NewStop, p: Platform) -> bool:
-        """OSM has the stop and the platform each on a pole of its own, and those poles are not the same one."""
+    def osm_apart(s: NewStop, p: Stop) -> bool:
+        """OSM has the feed's stop and the shared stop each on a pole of its own, and those poles are not the same one."""
         a, b = osm_pole_of(f"s{s.stop_id}", s.lat, s.lon), osm_pole_of(p.id, p.lat, p.lon)
         return a is not None and b is not None and distance_m(a.lat, a.lon, b.lat, b.lon) > OSM_SAME_POLE_M
 
-    def osm_says(s: NewStop, o: OsmPole) -> tuple[Platform | None] | None:
-        """(platform,) when this OSM pole is a shared platform, (None,) when it is none of them, None: no say."""
+    def osm_says(s: NewStop, o: OsmPole) -> tuple[Stop | None] | None:
+        """(stop,) when this OSM pole is a shared stop, (None,) when it is none of them, None: no say."""
         if not o.ref:
             return None
         if o.code:
@@ -175,8 +175,8 @@ def plan_shared(
             return None  # the ref is wrong or the pole moved
         return (p,)
 
-    def from_osm(s: NewStop) -> tuple[Platform | None] | None:
-        """(platform,) when OSM says which shared pole the stop is, (None,) when it says none of them; None: no say."""
+    def from_osm(s: NewStop) -> tuple[Stop | None] | None:
+        """(stop,) when OSM says which shared pole the stop is, (None,) when it says none of them; None: no say."""
         poles = []
         for d, o in osm_near(s.lat, s.lon, OSM_LINK_M):
             said = osm_says(s, o)
@@ -206,12 +206,12 @@ def plan_shared(
             continue
         unresolved.append(s)
 
-    by_group: dict[str, list[Platform]] = defaultdict(list)
+    by_group: dict[str, list[Stop]] = defaultdict(list)
     for p in shared:
         if p.active and p.lat is not None:
             by_group[p.group_id].append(p)
 
-    # 2. logical stop per station / code prefix / name
+    # 2. logical stop per station / name
     group_of = {p.id: p.group_id for p in shared}
     members: dict[str, list[NewStop]] = defaultdict(list)
     for s in stops:
@@ -259,7 +259,7 @@ def plan_shared(
                 continue
             if d > CONFIRMED_POLE_M and (
                 abs(along_track_m(s.lat, s.lon, stop_bearing[s.stop_id], p.lat, p.lon)) > ALONG_TRACK_M
-                or not next_groups(s) & platform_next.get(p.id, set())
+                or not next_groups(s) & shared_next.get(p.id, set())
             ):
                 continue
             if diff <= MAX_DIRECTION_DEG:

@@ -1,6 +1,6 @@
 import pytest
 
-from gtfs_backend.ids import ID_RE, new_public_id, parse_url_key, platform_slug, slugify, url_key
+from gtfs_backend.ids import ID_RE, new_public_id, parse_url_key, slugify, stop_slug, url_key
 
 
 @pytest.mark.parametrize(
@@ -19,10 +19,10 @@ def test_slugify(name, slug):
     assert slugify(name) == slug
 
 
-def test_platform_slug_appends_number_without_separator():
-    assert platform_slug("Dworzec Główny Zachód", "09") == "dworzec-glowny-zachod09"
-    assert platform_slug("Rondo Mogilskie", "01") == "rondo-mogilskie01"
-    assert platform_slug("KRAKÓW GŁÓWNY", None) == "krakow-glowny"
+def test_stop_slug_appends_platform_code_without_separator():
+    assert stop_slug("Dworzec Główny Zachód", "09") == "dworzec-glowny-zachod09"
+    assert stop_slug("Rondo Mogilskie", "01") == "rondo-mogilskie01"
+    assert stop_slug("KRAKÓW GŁÓWNY", None) == "krakow-glowny"
 
 
 def test_url_key_roundtrip_and_outdated_slug():

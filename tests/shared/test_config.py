@@ -30,6 +30,9 @@ def test_repo_feeds_yml_is_valid():
     mld = feeds.get("km_mld")
     assert mld.realtime_poll_interval is None and mld.realtime_max_age is None
     assert feeds.searchable_namespaces == ["ztp"]
+    # ZTP names stations in its codes (`802-01`), the KM feeds have GTFS stations
+    assert {feeds.get(f).stop_code_pattern for f in ("kmk_a", "kmk_m", "kmk_t")} == {"(?P<station>.+)-(?P<platform_code>[^-]+)"}
+    assert feeds.get("km_kolej").stop_code_pattern is None and mld.stop_code_pattern is None
 
 
 def test_search_namespaces_default_to_all(tmp_path):
@@ -57,6 +60,13 @@ def test_namespace_defaults_to_feed_id(tmp_path):
         "feeds:\n  - feed_id: a\n    static: https://x.test/a.zip\n    realtime_max_age: 0\n",
         "search_namespaces: [nope]\nfeeds:\n  - feed_id: a\n    static: https://x.test/a.zip\n",
         "search_namespaces: []\nfeeds:\n  - feed_id: a\n    static: https://x.test/a.zip\n",
+        "feeds:\n  - feed_id: a\n    stop_code_pattern: '(?P<station>.+'\n    static: https://x.test/a.zip\n",  # no regex
+        "feeds:\n  - feed_id: a\n    stop_code_pattern: '(.+)-(.+)'\n    static: https://x.test/a.zip\n",  # no named groups
+        "feeds:\n  - feed_id: a\n    stop_code_pattern: '(?P<group>.+)-(?P<platform_code>.+)'\n    static: https://x.test/a.zip\n",
+        (  # feeds of one namespace share their codes, so they read them the same way
+            "feeds:\n  - feed_id: a\n    stop_namespace: z\n    stop_code_pattern: '(?P<station>.+)-.+'\n"
+            "    static: https://x.test/a.zip\n  - feed_id: b\n    stop_namespace: z\n    static: https://x.test/b.zip\n"
+        ),
     ],
 )
 def test_invalid_feeds_are_rejected(tmp_path, text):

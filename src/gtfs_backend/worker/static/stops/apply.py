@@ -1,4 +1,4 @@
-"""Matching a new version's stops and writing the result: groups, platforms, stop links."""
+"""Matching a new version's stops and writing the result: stop groups, stops, stop links."""
 
 from __future__ import annotations
 
@@ -6,21 +6,21 @@ from collections import Counter, defaultdict
 
 import psycopg
 
-from gtfs_backend.ids import new_public_id, platform_slug, slugify
+from gtfs_backend.ids import new_public_id, slugify, stop_slug
 from gtfs_backend.logs import log
 from gtfs_backend.modes import MODE_SQL
 from gtfs_backend.worker.settings import get_worker_settings
-from gtfs_backend.worker.static.stops.model import Group, NewStop, Platform, platform_number
+from gtfs_backend.worker.static.stops.model import Group, NewStop, Stop, normalize_stop
 from gtfs_backend.worker.static.stops.osm import load_osm_poles
 from gtfs_backend.worker.static.stops.plan import plan_matches
 from gtfs_backend.worker.static.stops.queries import (
     current_versions,
+    feed_stop_bearings,
+    feed_stop_next_stops,
     namespace_versions,
-    platform_bearings,
-    platform_next_groups,
     served_modes,
     stop_bearings,
-    stop_next_stops,
+    stop_next_groups,
 )
 from gtfs_backend.worker.static.stops.shared import SharedPlan, plan_shared
 from gtfs_backend.worker.static.stops.state import refresh_stop_state
@@ -41,11 +41,13 @@ def apply_matches(
     feed_version_id: str,
     namespace: str | None = None,
     share_with: list[str] | None = None,
+    stop_code_pattern: str | None = None,
 ) -> dict:
-    """Match the stops of `feed_version_id`, write stop_link and refresh platforms/groups. Returns stats.
+    """Match the stops of `feed_version_id`, write stop_link and refresh stops/groups. Returns stats.
 
-    Stops first try to attach to platforms of the `share_with` namespaces (never modified by this feed);
-    the rest are matched within the feed's own stop-code namespace.
+    Stops are first put into GTFS shape (normalize_stop, with the feed's `stop_code_pattern`). They then try to
+    attach to stops of the `share_with` namespaces (never modified by this feed); the rest are matched within the
+    feed's own stop-code namespace.
     """
     namespace = namespace or feed_id
     cur = conn.cursor()
@@ -63,18 +65,18 @@ def apply_matches(
         """,
         {"v": feed_version_id},
     )
-    all_stops = [NewStop(*r) for r in cur.fetchall()]
+    all_stops = [normalize_stop(*r, stop_code_pattern=stop_code_pattern) for r in cur.fetchall()]
 
     shared_plan = SharedPlan()
     if share_with:
         cur.execute(
             """
-            SELECT id, stop_group_id, current_code, name, platform, ST_Y(geom), ST_X(geom), active
-            FROM core.stop_platform WHERE code_namespace = ANY(%s) AND active
+            SELECT id, stop_group_id, current_code, name, platform_code, ST_Y(geom), ST_X(geom), active
+            FROM core.stop WHERE code_namespace = ANY(%s) AND active
             """,
             (share_with,),
         )
-        shared = [Platform(*r) for r in cur.fetchall()]
+        shared = [Stop(*r) for r in cur.fetchall()]
         cur.execute(
             "SELECT id, current_code, name, ST_Y(geom), ST_X(geom) FROM core.stop_group "
             "WHERE code_namespace = ANY(%s) AND active",
@@ -83,20 +85,20 @@ def apply_matches(
         shared_groups = [Group(*r) for r in cur.fetchall()]
         cur.execute(f"SELECT DISTINCT {MODE_SQL} FROM gtfs.routes WHERE feed_version_id = %s", (feed_version_id,))
         feed_modes = {r[0] for r in cur.fetchall()}
-        stop_bearing = {sid: b for (_, sid), b in stop_bearings(cur, [feed_version_id]).items()}
+        stop_bearing = {sid: b for (_, sid), b in feed_stop_bearings(cur, [feed_version_id]).items()}
         shared_versions = namespace_versions(cur, share_with)
-        platform_modes = served_modes(cur, shared_versions)  # the shared feeds' own service, not our links
-        platform_bearing = platform_bearings(cur, shared_versions)
+        shared_modes = served_modes(cur, shared_versions)  # the shared feeds' own service, not our links
+        shared_bearing = stop_bearings(cur, shared_versions)
         shared_plan = plan_shared(
             all_stops,
             shared,
             shared_groups,
             stop_bearing,
-            platform_bearing,
-            platform_modes,
+            shared_bearing,
+            shared_modes,
             feed_modes,
-            stop_next_stops(cur, feed_version_id),
-            platform_next_groups(cur, shared_versions),
+            feed_stop_next_stops(cur, feed_version_id),
+            stop_next_groups(cur, shared_versions),
             load_osm_poles(get_worker_settings().osm_stops_file),
         )
         for w in shared_plan.warnings:
@@ -109,20 +111,20 @@ def apply_matches(
     others = [v for v in current_versions(cur, feed_id, feed_version_id) if v != feed_version_id]
     cur.execute(
         """
-        SELECT p.id, p.stop_group_id, p.current_code, p.name, p.platform, ST_Y(p.geom), ST_X(p.geom), p.active,
-               EXISTS (SELECT 1 FROM core.stop_link l WHERE l.stop_platform_id = p.id AND l.feed_version_id = ANY(%s))
-        FROM core.stop_platform p
+        SELECT p.id, p.stop_group_id, p.current_code, p.name, p.platform_code, ST_Y(p.geom), ST_X(p.geom), p.active,
+               EXISTS (SELECT 1 FROM core.stop_link l WHERE l.stop_id = p.id AND l.feed_version_id = ANY(%s))
+        FROM core.stop p
         WHERE p.code_namespace = %s
         """,
         (others, namespace),
     )
-    platforms = [Platform(*r) for r in cur.fetchall()]
+    existing = [Stop(*r) for r in cur.fetchall()]
     cur.execute(
         "SELECT id, current_code, name, ST_Y(geom), ST_X(geom) FROM core.stop_group WHERE code_namespace = %s", (namespace,)
     )
     groups = [Group(*r) for r in cur.fetchall()]
 
-    plan = plan_matches(stops, platforms, groups)
+    plan = plan_matches(stops, existing, groups)
     for w in plan.warnings:
         log.warning("stop_match", feed=feed_id, msg=w)
     for e in plan.errors:
@@ -132,9 +134,9 @@ def apply_matches(
     taken = {r[0] for r in cur.fetchall()}
     reps: dict[str, NewStop] = {}
     for s in sorted(stops, key=lambda x: x.stop_id):
-        reps.setdefault(s.platform_key, s)
+        reps.setdefault(s.pole_key, s)
 
-    # groups first (platforms reference them)
+    # groups first (stops reference them)
     group_id_for_key: dict[str, str] = {}
     by_gkey: dict[str, list[NewStop]] = defaultdict(list)
     for s in reps.values():
@@ -159,56 +161,55 @@ def apply_matches(
             )
         group_id_for_key[gkey] = gid
 
-    # platforms: deactivate displaced holders of a code first (the active-code index is unique)
-    new_platform_ids: dict[str, str] = {}
+    # stops: deactivate displaced holders of a code first (the active-code index is unique)
+    new_stop_ids: dict[str, str] = {}
     for key, s in reps.items():
-        pid = plan.platform_for_key.get(key)
-        number = platform_number(s)
+        pid = plan.stop_for_key.get(key)
         gid = group_id_for_key[s.group_key]
         if s.code:
             cur.execute(
                 """
-                UPDATE core.stop_platform SET active = false
+                UPDATE core.stop SET active = false
                 WHERE code_namespace = %s AND current_code = %s AND active AND id IS DISTINCT FROM %s
                 """,
                 (namespace, s.code, pid),
             )
         if pid is None:
-            pid = _allocate_id(cur, "stop_platform", taken)
+            pid = _allocate_id(cur, "stop", taken)
             cur.execute(
                 """
-                INSERT INTO core.stop_platform (id, stop_group_id, slug, code_namespace, current_code, name, platform, geom)
+                INSERT INTO core.stop (id, stop_group_id, slug, code_namespace, current_code, name, platform_code, geom)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
                 """,
-                (pid, gid, platform_slug(s.name, number), namespace, s.code, s.name, number, s.lon, s.lat),
+                (pid, gid, stop_slug(s.name, s.platform_code), namespace, s.code, s.name, s.platform_code, s.lon, s.lat),
             )
         else:
             cur.execute(
                 """
-                UPDATE core.stop_platform
-                SET stop_group_id = %s, slug = %s, current_code = %s, name = %s, platform = %s,
+                UPDATE core.stop
+                SET stop_group_id = %s, slug = %s, current_code = %s, name = %s, platform_code = %s,
                     geom = ST_SetSRID(ST_MakePoint(%s, %s), 4326), active = true
                 WHERE id = %s
                 """,
-                (gid, platform_slug(s.name, number), s.code, s.name, number, s.lon, s.lat, pid),
+                (gid, stop_slug(s.name, s.platform_code), s.code, s.name, s.platform_code, s.lon, s.lat, pid),
             )
-        new_platform_ids[key] = pid
+        new_stop_ids[key] = pid
 
-    with cur.copy("COPY core.stop_link (feed_version_id, stop_id, stop_platform_id) FROM STDIN") as cp:
+    with cur.copy("COPY core.stop_link (feed_version_id, feed_stop_id, stop_id) FROM STDIN") as cp:
         for s in stops:
-            cp.write_row((feed_version_id, s.stop_id, new_platform_ids[s.platform_key]))
+            cp.write_row((feed_version_id, s.stop_id, new_stop_ids[s.pole_key]))
         for stop_id, pid in shared_links.items():
             cp.write_row((feed_version_id, stop_id, pid))
 
     # the rows written above are uncommitted, so autovacuum can't have analyzed them; refresh_stop_state and the
-    # platform directions query join them with millions of stop_times and would be planned blind
-    cur.execute("ANALYZE core.stop_link, core.stop_platform")
+    # stop directions query join them with millions of stop_times and would be planned blind
+    cur.execute("ANALYZE core.stop_link, core.stop")
     refresh_stop_state(conn, current_versions(cur, feed_id, feed_version_id))
     methods = Counter(plan.method_for_key.values())
     for k, n in shared_plan.methods.items():
         methods[f"shared_{k}"] = n
     return {
-        "platforms": len(reps),
+        "stops": len(reps),
         "methods": dict(methods),
         "warnings": plan.warnings + shared_plan.warnings,
         "errors": plan.errors,

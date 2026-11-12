@@ -7,14 +7,13 @@ from typing import Literal
 from pydantic import BaseModel
 
 from gtfs_backend.api.schemas.alerts import AlertRef
-from gtfs_backend.api.schemas.common import PlatformRef, Route
+from gtfs_backend.api.schemas.common import Route, StopRef
 from gtfs_backend.api.schemas.vehicles import MapVehicle
 
 
 class TripStop(BaseModel):
     stop_sequence: int
-    platform: PlatformRef | None = None  # None: the feed's stop isn't matched to a platform
-    group_key: str | None = None  # stop key of the group
+    stop: StopRef | None = None  # None: the feed's stop isn't matched to one of ours
     lat: float | None = None
     lon: float | None = None
     scheduled_arrival: int | None = None

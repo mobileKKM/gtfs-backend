@@ -15,13 +15,12 @@ def vehicle(vid, lon=19.96, lat=50.066):
 
 
 def trip(key, *stops, version=1):
-    """stops: (stop_sequence, stop_platform_id, predicted_departure)"""
+    """stops: (stop_sequence, stop_id, predicted_departure)"""
     return {
         "key": key,
         "version": version,
         "stops": [
-            {"stop_sequence": q, "stop_platform_id": pid, "predicted_departure": t, "predicted_arrival": None}
-            for q, pid, t in stops
+            {"stop_sequence": q, "stop_id": pid, "predicted_departure": t, "predicted_arrival": None} for q, pid, t in stops
         ],
     }
 
@@ -63,7 +62,7 @@ async def test_trips_mirror_the_latest_update(redis_url):
     await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:a:20261025", (2, "pb", 3))]))
     assert sorted(await r.keys("rt:trip:*")) == ["rt:trip:kmk_a:a:20261025", "rt:trip:kmk_t:a:20261025"]
     stops = json.loads(await r.get("rt:trip:kmk_t:a:20261025"))["stops"]
-    assert [(s["stop_platform_id"], s["passed"], s["predicted_departure"]) for s in stops] == [
+    assert [(s["stop_id"], s["passed"], s["predicted_departure"]) for s in stops] == [
         ("pa", True, 1),
         ("pb", False, 3),
     ]

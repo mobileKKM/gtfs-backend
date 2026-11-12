@@ -55,7 +55,7 @@ def make_index():
     idx.stop_times[(2, "block_1_trip_9_service_4")] = [StopTime(1, "A", hms(6), hms(6)), StopTime(2, "C", hms(6, 40), hms(6, 40))]
     for v in (1, 2):
         for s in "ABC":
-            idx.stop_platform[(v, s)] = f"plat{s.lower()}"
+            idx.stop_links[(v, s)] = f"stop{s.lower()}"
     return idx
 
 
@@ -139,7 +139,7 @@ async def test_tram_style_absolute_times_give_computed_delays_and_unmatched_are_
 
     assert [t["delay_s"] for t in res.trips] == [120]
     assert [s["stop_sequence"] for s in res.trips[0]["stops"]] == [3, 4]
-    assert res.trips[0]["stops"][0]["stop_platform_id"] == "plata"
+    assert res.trips[0]["stops"][0]["stop_id"] == "stopa"
     assert res.trips[0]["service_date"] == "2026-10-22" and res.trips[0]["version"] == 1
     assert res.trips[0]["key"] == f"kmk_t:20261022:{res.trips[0]['trip_id']}"  # feed-prefixed, no version
 
@@ -175,11 +175,11 @@ def test_loop_stop_listed_first_picks_the_visit_closest_in_time():
 
 
 def rt_trip(version, *stops):
-    """stops: (stop_sequence, stop_id, predicted_departure)"""
+    """stops: (stop_sequence, feed_stop_id, predicted_departure)"""
     return {
         "key": "kmk_a:x:20261025",
         "version": version,
-        "stops": [{"stop_sequence": q, "stop_id": sid, "predicted_departure": t} for q, sid, t in stops],
+        "stops": [{"stop_sequence": q, "feed_stop_id": sid, "predicted_departure": t} for q, sid, t in stops],
     }
 
 
@@ -212,7 +212,7 @@ def test_empty_update_keeps_all_rows_as_passed():
 def test_loop_trip_keeps_both_visits_of_a_stop():
     prev = merge_passed(None, rt_trip(1, (1, "a", 100), (2, "b", 200), (3, "a", 300)))
     merged = merge_passed(prev, rt_trip(1, (3, "a", 305)))
-    assert [(r["stop_sequence"], r["stop_id"], r["passed"]) for r in merged["stops"]] == [
+    assert [(r["stop_sequence"], r["feed_stop_id"], r["passed"]) for r in merged["stops"]] == [
         (1, "a", True),
         (2, "b", True),
         (3, "a", False),

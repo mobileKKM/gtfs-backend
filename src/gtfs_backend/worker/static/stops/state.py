@@ -12,11 +12,11 @@ def refresh_stop_state(conn: psycopg.Connection, current_versions: list[str]) ->
     cur = conn.cursor()
     cur.execute(
         """
-        WITH linked AS (SELECT DISTINCT stop_platform_id FROM core.stop_link WHERE feed_version_id = ANY(%s))
-        UPDATE core.stop_platform p
-        SET active = (l.stop_platform_id IS NOT NULL),
-            last_seen = CASE WHEN l.stop_platform_id IS NOT NULL THEN now() ELSE p.last_seen END
-        FROM core.stop_platform p2 LEFT JOIN linked l ON l.stop_platform_id = p2.id
+        WITH linked AS (SELECT DISTINCT stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s))
+        UPDATE core.stop p
+        SET active = (l.stop_id IS NOT NULL),
+            last_seen = CASE WHEN l.stop_id IS NOT NULL THEN now() ELSE p.last_seen END
+        FROM core.stop p2 LEFT JOIN linked l ON l.stop_id = p2.id
         WHERE p.id = p2.id
         """,
         (current_versions,),
@@ -29,14 +29,14 @@ def refresh_stop_state(conn: psycopg.Connection, current_versions: list[str]) ->
             JOIN gtfs.trips t ON t.feed_version_id = st.feed_version_id AND t.trip_id = st.trip_id
             WHERE st.feed_version_id = ANY(%s)
         ), modes AS (
-            SELECT l.stop_platform_id, array_agg(DISTINCT {MODE_SQL} ORDER BY {MODE_SQL}) AS modes
+            SELECT l.stop_id, array_agg(DISTINCT {MODE_SQL} ORDER BY {MODE_SQL}) AS modes
             FROM served s
             JOIN gtfs.routes r ON r.feed_version_id = s.feed_version_id AND r.route_id = s.route_id
-            JOIN core.stop_link l ON l.feed_version_id = s.feed_version_id AND l.stop_id = s.stop_id
-            GROUP BY l.stop_platform_id
+            JOIN core.stop_link l ON l.feed_version_id = s.feed_version_id AND l.feed_stop_id = s.stop_id
+            GROUP BY l.stop_id
         )
-        UPDATE core.stop_platform p SET modes = coalesce(m.modes, '{{}}')
-        FROM core.stop_platform p2 LEFT JOIN modes m ON m.stop_platform_id = p2.id
+        UPDATE core.stop p SET modes = coalesce(m.modes, '{{}}')
+        FROM core.stop p2 LEFT JOIN modes m ON m.stop_id = p2.id
         WHERE p.id = p2.id AND p.active
         """,
         (current_versions,),
@@ -52,7 +52,7 @@ def refresh_stop_state(conn: psycopg.Connection, current_versions: list[str]) ->
                    coalesce(bool_or(p.active), false) AS any_active,
                    ST_Centroid(ST_Collect(p.geom) FILTER (WHERE p.active)) AS active_centroid,
                    ST_Centroid(ST_Collect(p.geom)) AS centroid
-            FROM core.stop_group g2 LEFT JOIN core.stop_platform p ON p.stop_group_id = g2.id
+            FROM core.stop_group g2 LEFT JOIN core.stop p ON p.stop_group_id = g2.id
             GROUP BY g2.id
         ) s
         WHERE g.id = s.id

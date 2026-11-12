@@ -1,4 +1,4 @@
-"""Reads the matchers need: travel directions through stops and platforms, and current feed versions."""
+"""Reads the matchers need: travel directions through feed stops and our stops, and current feed versions."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ import psycopg
 from gtfs_backend.modes import MODE_SQL
 
 
-def stop_bearings(cur: psycopg.Cursor, versions: list[str], stop_ids: list[str] | None = None) -> dict[tuple[str, str], float]:
-    """Direction of travel (degrees from north) through each stop: previous stop -> next stop, averaged over trips."""
+def feed_stop_bearings(cur: psycopg.Cursor, versions: list[str], ids: list[str] | None = None) -> dict[tuple[str, str], float]:
+    """Direction of travel (degrees from north) through each feed stop: previous stop -> next stop, averaged over
+    trips. Keyed by (feed_version_id, stop_id); `ids` limits it to those feed stops."""
     if not versions:
         return {}
     cur.execute(
@@ -34,19 +35,17 @@ def stop_bearings(cur: psycopg.Cursor, versions: list[str], stop_ids: list[str] 
         SELECT v, stop_id, degrees(atan2(sum(dx / sqrt(dx*dx + dy*dy)), sum(dy / sqrt(dx*dx + dy*dy))))
         FROM vec GROUP BY v, stop_id
         """,
-        {"v": versions, "ids": stop_ids},
+        {"v": versions, "ids": ids},
     )
     return {(v, sid): (b + 360) % 360 for v, sid, b in cur.fetchall() if b is not None}
 
 
-def platform_bearings(cur: psycopg.Cursor, versions: list[str]) -> dict[str, float]:
-    """Direction of travel per platform, from all its stops in the given versions."""
+def stop_bearings(cur: psycopg.Cursor, versions: list[str]) -> dict[str, float]:
+    """Direction of travel per stop of ours, from all its linked feed stops in the given versions."""
     if not versions:
         return {}
-    by_stop = stop_bearings(cur, versions)
-    cur.execute(
-        "SELECT feed_version_id, stop_id, stop_platform_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (versions,)
-    )
+    by_stop = feed_stop_bearings(cur, versions)
+    cur.execute("SELECT feed_version_id, feed_stop_id, stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (versions,))
     vectors: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
     for v, sid, pid in cur.fetchall():
         b = by_stop.get((v, sid))
@@ -57,16 +56,16 @@ def platform_bearings(cur: psycopg.Cursor, versions: list[str]) -> dict[str, flo
 
 
 def served_modes(cur: psycopg.Cursor, versions: list[str]) -> dict[str, set[str]]:
-    """Modes the given versions' own trips serve at each platform.
+    """Modes the given versions' own trips serve at each stop of ours.
 
-    Not core.stop_platform.modes: that counts every feed linked to the platform, so a bus feed wrongly linked to a
+    Not core.stop.modes: that counts every feed linked to the stop, so a bus feed wrongly linked to a
     tram pole would make the pole look like a bus pole.
     """
     if not versions:
         return {}
     cur.execute(
         f"""
-        SELECT l.stop_platform_id, array_agg(DISTINCT {MODE_SQL})
+        SELECT l.stop_id, array_agg(DISTINCT {MODE_SQL})
         FROM (
             SELECT DISTINCT st.feed_version_id, st.stop_id, t.route_id
             FROM gtfs.stop_times st
@@ -74,15 +73,15 @@ def served_modes(cur: psycopg.Cursor, versions: list[str]) -> dict[str, set[str]
             WHERE st.feed_version_id = ANY(%s)
         ) s
         JOIN gtfs.routes r ON r.feed_version_id = s.feed_version_id AND r.route_id = s.route_id
-        JOIN core.stop_link l ON l.feed_version_id = s.feed_version_id AND l.stop_id = s.stop_id
-        GROUP BY l.stop_platform_id
+        JOIN core.stop_link l ON l.feed_version_id = s.feed_version_id AND l.feed_stop_id = s.stop_id
+        GROUP BY l.stop_id
         """,
         (versions,),
     )
     return {pid: set(modes) for pid, modes in cur.fetchall()}
 
 
-def stop_next_stops(cur: psycopg.Cursor, version: str) -> dict[str, set[str]]:
+def feed_stop_next_stops(cur: psycopg.Cursor, version: str) -> dict[str, set[str]]:
     """Stops a version's trips go to right after each stop (not after the trip's last stop)."""
     cur.execute(
         """
@@ -99,12 +98,12 @@ def stop_next_stops(cur: psycopg.Cursor, version: str) -> dict[str, set[str]]:
     return out
 
 
-def platform_next_groups(cur: psycopg.Cursor, versions: list[str]) -> dict[str, set[str]]:
-    """Groups the trips of the given versions go to right after each platform."""
+def stop_next_groups(cur: psycopg.Cursor, versions: list[str]) -> dict[str, set[str]]:
+    """Groups the trips of the given versions go to right after each stop of ours."""
     if not versions:
         return {}
     cur.execute(
-        "SELECT DISTINCT stop_platform_id, next_group_id FROM core.platform_direction WHERE feed_version_id = ANY(%s)",
+        "SELECT DISTINCT stop_id, next_group_id FROM core.stop_direction WHERE feed_version_id = ANY(%s)",
         (versions,),
     )
     out: dict[str, set[str]] = defaultdict(set)

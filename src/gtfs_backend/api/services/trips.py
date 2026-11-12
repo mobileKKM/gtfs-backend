@@ -13,7 +13,7 @@ from gtfs_backend.api.data.catalog import Day
 from gtfs_backend.api.data.geo import bbox_of, encode_polyline
 from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.errors import NotFound
-from gtfs_backend.api.schemas import MapVehicle, PlatformRef, TripLive, TripShape, TripStop, TripStopLive, TripView
+from gtfs_backend.api.schemas import MapVehicle, StopRef, TripLive, TripShape, TripStop, TripStopLive, TripView
 from gtfs_backend.api.services import alerts, vehicles
 from gtfs_backend.api.services.routes import POLYLINE_SQL
 
@@ -30,20 +30,19 @@ SHAPE_SQL = f"SELECT {POLYLINE_SQL} FROM core.shape_line s WHERE s.feed_version_
 STOPS_SQL = """
     SELECT st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
            st.pickup_type, st.drop_off_type,
-           p.id, p.url_key, p.name, p.platform, ST_Y(p.geom), ST_X(p.geom), g.url_key
+           p.id, p.url_key, p.name, p.stop_group_id, p.platform_code, ST_Y(p.geom), ST_X(p.geom)
     FROM gtfs.stop_times st
-    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
-    LEFT JOIN core.stop_platform p ON p.id = l.stop_platform_id
-    LEFT JOIN core.stop_group g ON g.id = p.stop_group_id
+    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.feed_stop_id = st.stop_id
+    LEFT JOIN core.stop p ON p.id = l.stop_id
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
     ORDER BY st.stop_sequence
 """
-# the live state needs only what decides `passed` without realtime, and the platforms alerts can name
+# the live state needs only what decides `passed` without realtime, and the stops alerts can name
 STOPS_LIVE_SQL = """
     SELECT st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
-           l.stop_platform_id
+           l.stop_id
     FROM gtfs.stop_times st
-    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
+    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.feed_stop_id = st.stop_id
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
     ORDER BY st.stop_sequence
 """
@@ -65,11 +64,10 @@ async def _trip(conn, params: dict) -> tuple:
 
 
 def _stop(row, day: Day) -> TripStop:
-    seq, arr, dep, pickup, drop_off, pid, pkey, pname, pnum, lat, lon, gkey = row
+    seq, arr, dep, pickup, drop_off, pid, pkey, pname, gid, pcode, lat, lon = row
     return TripStop(
         stop_sequence=seq,
-        platform=PlatformRef(id=pid, key=pkey, name=pname, platform=pnum) if pid else None,
-        group_key=gkey,
+        stop=StopRef(id=pid, key=pkey, name=pname, group_id=gid, platform_code=pcode) if pid else None,
         lat=lat,
         lon=lon,
         scheduled_arrival=day.base + arr if arr is not None else None,
@@ -148,7 +146,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     scope = alerts.Scope(
         routes={(feed_id, route_id): info.route_type if info else None},
         trips={(feed_id, trip_id)},
-        platforms={pid for *_, pid in rows if pid},
+        stop_ids={pid for *_, pid in rows if pid},
         feeds={feed_id},
     )
     if update is not None and update.canceled:

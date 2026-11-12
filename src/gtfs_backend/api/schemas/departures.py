@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from gtfs_backend.api.schemas.alerts import AlertRef
-from gtfs_backend.api.schemas.common import Line, PlatformRef
+from gtfs_backend.api.schemas.common import Line, StopRef
 from gtfs_backend.api.schemas.stops import Stop
 
 DepartureStatus = Literal["scheduled", "live", "departed", "canceled", "skipped"]
@@ -18,7 +18,7 @@ class Departure(BaseModel):
     stop_sequence: int
     line: Line | None = None
     headsign: str | None = None
-    platform: PlatformRef
+    stop: StopRef
     scheduled: int
     estimated: int | None = None  # realtime prediction (for departed ones the last known)
     time: int  # estimated if known, else scheduled

@@ -6,7 +6,7 @@ from datetime import date, timedelta
 
 import psycopg
 import pytest
-from conftest import do_import, meta
+from conftest import ZTP_STOP_CODES, do_import, meta
 from test_static_import import tiny_feed
 
 from gtfs_backend.worker.static import versions
@@ -57,7 +57,7 @@ def test_import_succeeds_when_its_retirement_is_blocked(db, database_url, tmp_pa
     # a long read of the old version: doesn't stop the import, but keeps its partition from being dropped
     with psycopg.connect(database_url) as reader:
         reader.execute("SELECT count(*) FROM gtfs.stop_times__kmk_t__v1").fetchone()
-        result = import_zip(db, "kmk_t", new, meta(new), "ztp")
+        result = import_zip(db, "kmk_t", new, meta(new), "ztp", stop_code_pattern=ZTP_STOP_CODES)
         assert (result.status, result.retired) == ("ready", [])
         assert db.execute(STATUS).fetchone()[0] == "ready"
         reader.rollback()

@@ -4,7 +4,10 @@
 # realtime_max_age: how long the last data stays live while the files don't change (default REALTIME_MAX_AGE).
 #
 # stop_namespace: feeds with the same namespace share stop codes. ZTP's three feeds use one numbering
-# (`802-01` is the same platform in all of them); other feeds keep their codes to themselves.
+# (`802-01` is the same stop in all of them); other feeds keep their codes to themselves.
+# stop_code_pattern: for feeds without GTFS stations whose stop codes name them: a regex the whole stop_code
+# matches, with the named groups `station` and/or `platform_code`. ZTP's `802-01` is platform 01 of station 802.
+# GTFS parent_station and platform_code, where a stop has them, win. Feeds of one namespace declare the same.
 # realtime kinds: vehicle_positions, trip_updates, service_alerts, or `combined` for one file with all.
 
 # Stop search only finds stops of these namespaces (default: all): ZTP's, where the metropolitan card is valid.
@@ -13,6 +16,7 @@ search_namespaces: [ztp]
 feeds:
   - feed_id: kmk_a # MPK buses
     stop_namespace: ztp
+    stop_code_pattern: '(?P<station>.+)-(?P<platform_code>[^-]+)'
     realtime_poll_interval: 5 # ZTP updates every ~5 s and answers 304 via ETag in between
     static: https://gtfs.ztp.krakow.pl/GTFS_KRK_A.zip
     realtime:
@@ -22,6 +26,7 @@ feeds:
 
   - feed_id: kmk_m # Mobilis buses
     stop_namespace: ztp
+    stop_code_pattern: '(?P<station>.+)-(?P<platform_code>[^-]+)'
     realtime_poll_interval: 5 # ZTP updates every ~5 s and answers 304 via ETag in between
     static: https://gtfs.ztp.krakow.pl/GTFS_KRK_M.zip
     realtime:
@@ -31,6 +36,7 @@ feeds:
 
   - feed_id: kmk_t # Trams
     stop_namespace: ztp
+    stop_code_pattern: '(?P<station>.+)-(?P<platform_code>[^-]+)'
     realtime_poll_interval: 5 # ZTP updates every ~5 s and answers 304 via ETag in between
     # The tram system counts times from local midnight, not noon - 12h (seen on the 2026-10-25 clock change).
     day_start: midnight

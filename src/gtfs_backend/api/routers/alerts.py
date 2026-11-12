@@ -19,7 +19,7 @@ async def list_alerts(
     ctx: Ctx,
     feed: Annotated[str | None, Query(description="only this feed's alerts")] = None,
     route: Annotated[str | None, Query(description="route key (`{feed_id}:{route_id}`, a line's `key`)")] = None,
-    stop: Annotated[str | None, Query(description="stop key or id (a logical stop covers its platforms)")] = None,
+    stop: Annotated[str | None, Query(description="stop key or id (a stop group covers its stops)")] = None,
     active: Annotated[bool, Query(description="only alerts active now or starting within a day")] = False,
 ):
     """Service alerts as the feeds publish them (texts, active periods and entities unchanged). Boards and trip views

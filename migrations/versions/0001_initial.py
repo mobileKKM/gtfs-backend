@@ -84,10 +84,12 @@ CREATE TABLE core.service_day_version (
 CREATE INDEX service_day_version_version_idx ON core.service_day_version (feed_version_id);
 
 -- Stop codes are only comparable within a namespace (feeds.yml `stop_namespace`, default: the feed_id).
--- Public stop IDs (5 lowercase letters), unique across stop groups and stop platforms.
+-- Public stop IDs (5 lowercase letters), unique across stop groups and stops.
+-- A stop is one physical pole (GTFS location_type 0), merged across feeds; a stop group is our logical stop,
+-- seeded by the feeds' stations (or what a feed's stop_code_pattern names as one).
 CREATE TABLE core.public_id (
     id text PRIMARY KEY CHECK (id ~ '^[a-z]{5}$'),
-    kind text NOT NULL CHECK (kind IN ('stop_group', 'stop_platform'))
+    kind text NOT NULL CHECK (kind IN ('stop_group', 'stop'))
 );
 
 CREATE TABLE core.stop_group (
@@ -110,14 +112,14 @@ CREATE INDEX stop_group_geom_idx ON core.stop_group USING gist (geom);
 
 CREATE INDEX stop_group_code_idx ON core.stop_group (code_namespace, current_code);
 
-CREATE TABLE core.stop_platform (
+CREATE TABLE core.stop (
     id text PRIMARY KEY REFERENCES core.public_id (id),
     stop_group_id text NOT NULL REFERENCES core.stop_group (id),
     slug text NOT NULL,
     code_namespace text NOT NULL,
     current_code text,
     name text NOT NULL,
-    platform text,
+    platform_code text,
     geom geometry(Point, 4326),
     modes text[] NOT NULL DEFAULT '{}',
     active boolean NOT NULL DEFAULT true,
@@ -126,21 +128,22 @@ CREATE TABLE core.stop_platform (
     url_key text GENERATED ALWAYS AS (slug || '-' || id) STORED
 );
 
-CREATE UNIQUE INDEX stop_platform_active_code_uidx ON core.stop_platform (code_namespace, current_code)
+CREATE UNIQUE INDEX stop_active_code_uidx ON core.stop (code_namespace, current_code)
     WHERE active AND current_code IS NOT NULL;
 
-CREATE INDEX stop_platform_group_idx ON core.stop_platform (stop_group_id);
+CREATE INDEX stop_stop_group_idx ON core.stop (stop_group_id);
 
-CREATE INDEX stop_platform_geom_idx ON core.stop_platform USING gist (geom);
+CREATE INDEX stop_geom_idx ON core.stop USING gist (geom);
 
+-- A feed's stop (`feed_stop_id`: its GTFS stop_id) is one of our stops (`stop_id`).
 CREATE TABLE core.stop_link (
     feed_version_id text NOT NULL REFERENCES core.feed_version (id) ON DELETE CASCADE,
-    stop_id text NOT NULL,
-    stop_platform_id text NOT NULL REFERENCES core.stop_platform (id),
-    PRIMARY KEY (feed_version_id, stop_id)
+    feed_stop_id text NOT NULL,
+    stop_id text NOT NULL REFERENCES core.stop (id),
+    PRIMARY KEY (feed_version_id, feed_stop_id)
 );
 
-CREATE INDEX stop_link_platform_idx ON core.stop_link (stop_platform_id);
+CREATE INDEX stop_link_stop_idx ON core.stop_link (stop_id);
 
 CREATE TABLE core.shape_line (
     feed_version_id text NOT NULL REFERENCES core.feed_version (id) ON DELETE CASCADE,
@@ -151,16 +154,16 @@ CREATE TABLE core.shape_line (
 
 CREATE INDEX shape_line_geom_idx ON core.shape_line USING gist (geom);
 
--- Where trips go from a platform: the next stop group on the trip, per route and headsign, with trip counts.
+-- Where trips go from a stop: the next stop group on the trip, per route and headsign, with trip counts.
 -- Built at import (static/derive.py) for the stop search's "towards ..." hints.
-CREATE TABLE core.platform_direction (
+CREATE TABLE core.stop_direction (
     feed_version_id text NOT NULL REFERENCES core.feed_version (id) ON DELETE CASCADE,
-    stop_platform_id text NOT NULL REFERENCES core.stop_platform (id),
+    stop_id text NOT NULL REFERENCES core.stop (id),
     next_group_id text NOT NULL REFERENCES core.stop_group (id),
     route_id text NOT NULL,
     headsign text NOT NULL,
     trips integer NOT NULL,
-    PRIMARY KEY (feed_version_id, stop_platform_id, next_group_id, route_id, headsign)
+    PRIMARY KEY (feed_version_id, stop_id, next_group_id, route_id, headsign)
 );
 """
 

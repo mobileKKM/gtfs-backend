@@ -11,9 +11,11 @@ where it did.
 
 | Term | Meaning |
 |---|---|
-| **Platform** (`core.stop_platform`) | One physical pole or bay, e.g. "Rondo Mogilskie 02". |
-| **Group** (`core.stop_group`) | A logical stop: all the poles of "Rondo Mogilskie". |
-| **Link** (`core.stop_link`) | Says which platform a feed's stop is. |
+| **Stop** (`core.stop`) | One physical pole or bay, e.g. "Rondo Mogilskie 02": a GTFS stop (`location_type=0`), merged across feeds. |
+| **Stop group** (`core.stop_group`) | Our logical stop: all the poles of "Rondo Mogilskie". |
+| **Station** | A feed's own grouping: a GTFS `location_type=1` stop, or what its `stop_code_pattern` names. Seeds a stop group. |
+| **platform_code** | The GTFS field, e.g. `02`; from the feed, or from its `stop_code_pattern`. |
+| **Link** (`core.stop_link`) | Says which of our stops (`stop_id`) a feed's stop (`feed_stop_id`, its GTFS `stop_id`) is. |
 | **Namespace** | Feeds that number their stops the same way. ZTP's three feeds share one (`802-01` is the same pole in all). |
 | **Shared namespace** | A feed that mostly uses another namespace's poles (`share_stops_with: [ztp]`): MLD feeder buses in Kraków. |
 
@@ -22,11 +24,23 @@ Our ids are 5 random letters that never derive from a code or a name, so renames
 without the database (and are unit-tested in `tests/worker/test_stops_match.py`), `apply.py` reads the inputs and writes the
 links.
 
+## A feed's stops in GTFS shape
+
+Before matching, every stop of the feed gets a station and a `platform_code` (`normalize_stop` in `model.py`):
+
+- its own GTFS `parent_station` and `platform_code` where it has them (Koleje Małopolskie's trains and MLD have stations);
+- otherwise what the feed's `stop_code_pattern` (feeds.yml) reads from its `stop_code`. ZTP has no stations and names them
+  in its codes: `(?P<station>.+)-(?P<platform_code>[^-]+)` reads `802-01` as platform 01 of station 802;
+- otherwise no station: stops are grouped by name.
+
+A new feed that follows GTFS needs nothing; one that encodes its stations in codes needs one pattern. Without a pattern a
+code is never split, so another operator's dashes can't be mistaken for ZTP's numbering.
+
 ## Two kinds of matching
 
-**Within a namespace** (`plan.py`). A new version of a ZTP feed matches its stops to the existing platforms by code, then by
-name plus platform number nearby, then by location. When it can't tell, it creates a new id rather than guess. Koleje
-Małopolskie stops are grouped by their parent station.
+**Within a namespace** (`plan.py`). A new version of a ZTP feed matches its stops to the existing stops by code, then by
+name plus `platform_code` nearby, then by location. When it can't tell, it creates a new id rather than guess. Stops of
+one station form one stop group.
 
 **Onto another namespace's poles** (`shared.py`). This is the hard case: MLD's own stop list has no numbering in common with
 ZTP's, and its coordinates are often 10–60 m off, so a stop has to be recognised as a ZTP pole, or as a pole of its own that
@@ -42,7 +56,7 @@ ZTP doesn't publish. The rest of this page is about that. The shared namespace i
             └─ 2. which logical stop is it? ──→ 3. which pole of that stop? ──→ link, or "own pole"
 ```
 
-The first step that has something to say wins. A stop that nothing links stays an **own pole**: a platform of the importing
+The first step that has something to say wins. A stop that nothing links stays an **own pole**: a stop of the importing
 feed's namespace, still placed in the right group.
 
 ### 0. OpenStreetMap
@@ -98,8 +112,8 @@ this step. If no pole qualifies, the stop keeps its own pole.
 | Input | Where from |
 |---|---|
 | Direction of travel | previous stop → next stop, averaged over trips (`queries.py`) |
-| Modes a pole serves | the shared feeds' own trips only (`served_modes`), **not** `core.stop_platform.modes`, which counts every linked feed: a wrongly linked bus stop would turn a tram pole into a "bus pole" |
-| Next stops | `stop_times` of the new version and `core.platform_direction` of the shared feeds |
+| Modes a pole serves | the shared feeds' own trips only (`served_modes`), **not** `core.stop.modes`, which counts every linked feed: a wrongly linked bus stop would turn a tram pole into a "bus pole" |
+| Next stops | `stop_times` of the new version and `core.stop_direction` of the shared feeds |
 | OSM poles | `data/osm/stops.json` (`OSM_STOPS_FILE`) |
 
 The worker keeps the OSM file up to date itself. On start it downloads the [Geofabrik](https://download.geofabrik.de/europe/poland/malopolskie.html)

@@ -48,11 +48,11 @@ def _modes(modes: Annotated[list[str] | None, Query(description="e.g. tram,bus")
     return split_csv(modes)
 
 
-StopKind = Literal["platform", "group"]
+StopKind = Literal["stop", "group"]
 
 
 def _stop_kind(
-    kind: Annotated[StopKind, Query(description="`platform` (default) or `group`: one logical stop per marker")] = "platform",
+    kind: Annotated[StopKind, Query(description="`stop` (default) or `group`: one stop group per marker")] = "stop",
 ) -> StopKind:
     return kind
 

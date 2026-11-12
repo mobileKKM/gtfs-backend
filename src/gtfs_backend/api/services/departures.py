@@ -42,7 +42,7 @@ class Scheduled:
     service_date: date
     trip_id: str
     stop_sequence: int
-    stop_platform_id: str
+    stop_id: str
     scheduled_departure: int  # epoch
     headsign: str | None
     route_id: str
@@ -82,25 +82,25 @@ class Row:
 
 
 async def scheduled(
-    conn: AsyncConnection, days: list[Day], platforms: list[str], start: int, end: int, lookback: int = LOOKBACK_S
+    conn: AsyncConnection, days: list[Day], stop_ids: list[str], start: int, end: int, lookback: int = LOOKBACK_S
 ) -> list[Scheduled]:
-    """Timetabled departures at `platforms` between start - lookback and end (epochs).
+    """Timetabled departures at our `stop_ids` between start - lookback and end (epochs).
 
     Skips stops without pickup and the trip's last stop (arrivals only).
     """
     days = [d for d in days if end - d.base >= 0 and start - lookback - d.base <= MAX_GTFS_TIME_S]
-    if not days or not platforms:
+    if not days or not stop_ids:
         return []
     sql, params = union_per_version(
         """
-        SELECT {i}, st.trip_id, st.stop_sequence, l.stop_platform_id,
+        SELECT {i}, st.trip_id, st.stop_sequence, l.stop_id,
                extract(epoch FROM st.departure_time)::int, coalesce(st.stop_headsign, t.trip_headsign),
                t.route_id, t.wheelchair_accessible, coalesce(st.pickup_type, 0) IN (2, 3)
         FROM core.stop_link l
-        JOIN gtfs.stop_times st ON st.feed_version_id = %(fv{i})s AND st.stop_id = l.stop_id
+        JOIN gtfs.stop_times st ON st.feed_version_id = %(fv{i})s AND st.stop_id = l.feed_stop_id
              AND st.departure_time BETWEEN %(lo{i})s * interval '1 second' AND %(hi{i})s * interval '1 second'
         JOIN gtfs.trips t ON t.feed_version_id = %(fv{i})s AND t.trip_id = st.trip_id
-        WHERE l.feed_version_id = %(fv{i})s AND l.stop_platform_id = ANY(%(platforms)s)
+        WHERE l.feed_version_id = %(fv{i})s AND l.stop_id = ANY(%(stop_ids)s)
           AND coalesce(st.pickup_type, 0) <> 1
           AND EXISTS (SELECT 1 FROM core.service_date sd
                       WHERE sd.feed_version_id = %(fv{i})s AND sd.date = %(date{i})s AND sd.service_id = t.service_id)
@@ -108,7 +108,7 @@ async def scheduled(
                       WHERE n.feed_version_id = %(fv{i})s AND n.trip_id = st.trip_id AND n.stop_sequence > st.stop_sequence)
         """,
         [{"fv": d.feed_version_id, "date": d.date, "lo": start - lookback - d.base, "hi": end - d.base} for d in days],
-        {"platforms": platforms},
+        {"stop_ids": stop_ids},
     )
     cur = await conn.execute(sql, params)
     out = []
@@ -201,14 +201,14 @@ async def _page(
     return page, lines
 
 
-def _departure(row: Row, line: Line | None, platform) -> Departure:
+def _departure(row: Row, line: Line | None, stop) -> Departure:
     s, live = row.s, row.live
     return Departure(
         trip_key=s.trip_key,
         stop_sequence=s.stop_sequence,
         line=line,
         headsign=s.headsign,
-        platform=stops.platform_ref(platform),
+        stop=stops.stop_ref(stop),
         scheduled=s.scheduled_departure,
         estimated=live.estimated,
         time=row.time,
@@ -221,7 +221,7 @@ def _departure(row: Row, line: Line | None, platform) -> Departure:
 
 
 async def _served(conn: AsyncConnection, catalog: Catalog, pids: list[str]) -> list[RouteInfo]:
-    """The routes departing from these platforms today, by feed and line name."""
+    """The routes departing from these stops today, by feed and line name."""
     served = await stops.served_routes(conn, catalog, pids)
     infos = await catalog.routes({fv for fv, _ in served})
     return sorted((infos[k] for k in served if k in infos), key=lambda i: (i.feed_id, i.line().name, i.route_id))
@@ -232,7 +232,7 @@ async def _alerts(ctx: Context, pids: list[str], page: list[Row], served: list[R
     shown = [i for i in served if (not feeds or i.feed_id in feeds) and (not routes or i.line().name in routes)]
     scope = alerts.Scope(
         routes={(i.feed_id, i.route_id): i.route_type for i in shown},
-        platforms=set(pids),
+        stop_ids=set(pids),
         trips={(r.s.feed_id, r.s.trip_id) for r in page},
         feeds={i.feed_id for i in shown} | {r.s.feed_id for r in page},
     )
@@ -242,7 +242,7 @@ async def _alerts(ctx: Context, pids: list[str], page: list[Row], served: list[R
 
 
 async def board(ctx: Context, key: str, time: int | None, feeds: set[str], routes: set[str], limit: int) -> DepartureBoard:
-    """A page of departures from a logical stop (all its platforms) or one platform, from `time` (default now) on,
+    """A page of departures from a stop group (all its stops) or one stop, from `time` (default now) on,
     with realtime and the alerts that apply. `lines` are all the lines that depart from the stop today, whatever
     the filters, so clients know what they can filter by.
     """
@@ -251,11 +251,11 @@ async def board(ctx: Context, key: str, time: int | None, feeds: set[str], route
     now = ctx.now()
     async with ctx.pool.connection() as conn:
         stop = await stops.get(conn, key)
-        pids = await stops.platform_ids(conn, stop)
+        pids = await stops.stop_ids(conn, stop)
         page, lines = await _page(ctx, conn, pids, now if time is None else time, time is None, feeds, routes, now, limit)
 
-        platforms = await stops.platforms_by_id(conn, {r.s.stop_platform_id for r in page})
-        out = [_departure(r, lines.get((r.s.feed_version_id, r.s.route_id)), platforms[r.s.stop_platform_id]) for r in page]
+        by_id = await stops.stops_by_id(conn, {r.s.stop_id for r in page})
+        out = [_departure(r, lines.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.stop_id]) for r in page]
         served = await _served(conn, ctx.catalog, pids)
     board_alerts = await _alerts(ctx, pids, page, served, feeds, routes)
 

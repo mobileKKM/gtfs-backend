@@ -14,12 +14,13 @@ class ActivePeriod(BaseModel):
 
 
 class InformedEntity(BaseModel):
+    """As the feed gives it: `stop_id` is the feed's; the stops it names are the alert's `stops`."""
+
     agency_id: str | None = None
     route_id: str | None = None
     route_type: int | None = None
     trip_id: str | None = None
     stop_id: str | None = None
-    stop_platform_id: str | None = None
 
 
 class Alert(BaseModel):

@@ -59,6 +59,7 @@ def _import_file(settings: WorkerSettings, feed: FeedConfig, path: Path) -> int:
             SourceMeta(sha, archive_path=str(stored)),
             feed.namespace,
             feed.share_stops_with,
+            feed.stop_code_pattern,
         )
     return _report(feed.feed_id, result)
 

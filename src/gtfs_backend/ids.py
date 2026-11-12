@@ -1,4 +1,4 @@
-"""Public stop IDs and URL slugs (name, platform number and a 5-letter id: `dworzec-glowny-zachod09-xqoww`)."""
+"""Public stop IDs and URL slugs (name, platform_code and a 5-letter id: `dworzec-glowny-zachod09-xqoww`)."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ def slugify(text: str) -> str:
     return s or "stop"
 
 
-def platform_slug(name: str, platform: str | None) -> str:
-    """Group slug + platform number without separator: `rondo-mogilskie01`."""
-    suffix = re.sub(r"[^a-z0-9]", "", slugify(platform)) if platform else ""
+def stop_slug(name: str, platform_code: str | None) -> str:
+    """Name slug + platform_code without separator: `rondo-mogilskie01`."""
+    suffix = re.sub(r"[^a-z0-9]", "", slugify(platform_code)) if platform_code else ""
     return slugify(name) + suffix
 
 

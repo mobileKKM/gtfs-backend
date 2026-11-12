@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from pathlib import Path
 
@@ -36,6 +37,9 @@ class RealtimeUrls(BaseModel):
         return out
 
 
+STOP_CODE_GROUPS = {"station", "platform_code"}
+
+
 class FeedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -47,6 +51,10 @@ class FeedConfig(BaseModel):
     stop_namespace: str | None = Field(default=None, pattern=r"^[a-z0-9_]+$", max_length=40)
     # Namespaces whose physical stops this feed also uses (attached by location + name, see worker/static/stops).
     share_stops_with: list[str] = Field(default_factory=list)
+    # For feeds that put their stations into stop codes instead of GTFS stations: a regex the whole stop_code
+    # matches, naming the station (`station`) and the platform_code (`platform_code`). ZTP's `802-01` is stop 01
+    # of station 802. A stop's own parent_station and platform_code win over it.
+    stop_code_pattern: str | None = None
     static: HttpUrl
     realtime: RealtimeUrls = Field(default_factory=RealtimeUrls)
     # What the realtime feed counts GTFS times from. GTFS says noon minus 12h; some systems use local
@@ -60,6 +68,19 @@ class FeedConfig(BaseModel):
     # live while the file doesn't change (default REALTIME_MAX_AGE). Slow feeds need a longer max age.
     realtime_poll_interval: float | None = Field(default=None, gt=0)
     realtime_max_age: int | None = Field(default=None, ge=1)
+
+    @field_validator("stop_code_pattern")
+    @classmethod
+    def _pattern_groups(cls, pattern: str | None) -> str | None:
+        if pattern is None:
+            return None
+        try:
+            groups = set(re.compile(pattern).groupindex)
+        except re.error as exc:
+            raise ValueError(f"stop_code_pattern: {exc}") from exc
+        if not groups or groups - STOP_CODE_GROUPS:
+            raise ValueError(f"stop_code_pattern: named groups must be among {sorted(STOP_CODE_GROUPS)}")
+        return pattern
 
     @property
     def static_url(self) -> str:
@@ -92,6 +113,14 @@ class FeedsFile(BaseModel):
         unknown = set(self.search_namespaces or ()) - {f.namespace for f in self.feeds}
         if unknown:
             raise ValueError(f"search_namespaces: unknown namespace(s) {sorted(unknown)}")
+        return self
+
+    @model_validator(mode="after")
+    def _one_pattern_per_namespace(self) -> FeedsFile:
+        patterns: dict[str, str | None] = {}
+        for feed in self.feeds:
+            if patterns.setdefault(feed.namespace, feed.stop_code_pattern) != feed.stop_code_pattern:
+                raise ValueError(f"stop_code_pattern: feeds of namespace {feed.namespace} must declare the same one")
         return self
 
     @property

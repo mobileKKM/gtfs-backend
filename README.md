@@ -78,12 +78,17 @@ Static imports are CPU-heavy and run in a separate process.
   (rows dropped, zip kept in `ARCHIVE_DIR`) once it serves nothing from yesterday on. A failed import never
   replaces anything. Dropping partitions needs an exclusive lock, so retirement never runs during a worker import
   and gives up after 2 s of waiting (it is retried). A crashed import process is replaced.
-- **Stops** (`core.stop_group` logical, `core.stop_platform` physical, `core.stop_link` feed stop to platform) have
+- **Stops** (`core.stop_group` logical, `core.stop` physical poles, `core.stop_link` feed stop to our stop) have
   our own stable 5-letter ids and URL keys like `rondo-mogilskie01-qphdu`; only the part after the last dash counts.
-  - ZTP's feeds share stop codes (`stop_namespace: ztp`): `802-01` is the same platform in all, `802` the stop.
-  - Imports match stops by code, then name + platform number nearby, then location; ambiguous cases get a new id
+  GTFS words keep their GTFS meaning: a *station* is a feed's `location_type=1` stop and `platform_code` is the
+  GTFS field. Stop groups are ours. In our tables and payloads `stop_id` is our stop (as `stop_group_id` is our
+  group) and `feed_stop_id` the feed's; `gtfs.*` and alert `informed_entities` keep the feed's own `stop_id`.
+  - A feed's stations seed the stop groups. ZTP has none and names them in its stop codes instead, which
+    `stop_code_pattern` in feeds.yml reads: `802-01` is `platform_code` 01 of station 802. A feed that follows GTFS
+    needs no pattern; a stop's own `parent_station` and `platform_code` always win.
+  - ZTP's feeds share stop codes (`stop_namespace: ztp`): `802-01` is the same stop in all of them.
+  - Imports match stops by code, then name + `platform_code` nearby, then location; ambiguous cases get a new id
     instead of a guess.
-  - Koleje Małopolskie stops are grouped by parent station.
   - MLD buses mostly use ZTP's poles (`share_stops_with: [ztp]`). OpenStreetMap is the source of truth for whether an
     MLD stop is a pole of its own: a pole with the stop's own code, or a code or bay ZTP doesn't have, keeps it
     separate; a ZTP code links it to that pole. Without such a pole nearby, position, direction, modes and next
@@ -100,7 +105,7 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | key | content |
 |---|---|
 | `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
-| `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, platform (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
+| `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with `passed: true`; removed when the trip leaves the feed |
 | `rt:alerts:{feed_id}` | service alerts |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
@@ -158,8 +163,8 @@ of the request, so their ETag only changes with the data.
 |---|---|
 | `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, line (with its mode), headsign, delay, `trip_key` |
 | `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
-| `GET /stops?bbox=…[&kind=group][&modes=…]` | platforms with `group_id`, or logical stops (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for stations (≤ 3000, `truncated`) |
-| `GET /stops/search?q=…` | logical stops by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with platforms and directions; `limit` default 10 |
+| `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_id` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
+| `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
 | `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and line names; `vehicle_key` to follow; alerts as refs |
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and passed/skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
@@ -186,8 +191,8 @@ in logs).
 
 Notes:
 
-- **Directions**: each platform lists where its trips go next (`towards`: the next stop group), with lines and
-  headsigns, most served first; under 5 % of trips are left out. Precomputed per version (`core.platform_direction`).
+- **Directions**: each stop lists where its trips go next (`towards`: the next stop group), with lines and
+  headsigns, most served first; under 5 % of trips are left out. Precomputed per version (`core.stop_direction`).
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
   delayed departures stay. Predictions are used only for the same version. `status`: `scheduled`, `live`,

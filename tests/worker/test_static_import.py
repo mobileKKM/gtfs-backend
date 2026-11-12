@@ -4,7 +4,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import FIXTURES, do_import, make_zip, meta, read_zip_csv
+from conftest import FIXTURES, ZTP_STOP_CODES, do_import, make_zip, meta, read_zip_csv
 
 from gtfs_backend.worker.static import integrity
 from gtfs_backend.worker.static.load import import_zip
@@ -67,25 +67,23 @@ def test_latest_version_is_picked_by_number_not_by_id_text(db):
     assert current_versions(db.cursor(), "kmk_a", "kmk_a_v1") == ["kmk_t_v10", "kmk_a_v1"]
 
 
-def test_shared_codes_link_to_one_platform_and_ids_survive_reimport(db, tmp_path):
+def test_shared_codes_link_to_one_stop_and_ids_survive_reimport(db, tmp_path):
     do_import(db, "kmk_t", STATIC / "GTFS_KRK_T.zip")
     do_import(db, "kmk_a", STATIC / "GTFS_KRK_A.zip")
     rows = db.execute(
         """
         SELECT p.current_code, p.modes, array_agg(fv.feed_id ORDER BY fv.feed_id)
-        FROM core.stop_platform p
-        JOIN core.stop_link l ON l.stop_platform_id = p.id
+        FROM core.stop p
+        JOIN core.stop_link l ON l.stop_id = p.id
         JOIN core.feed_version fv ON fv.id = l.feed_version_id
         WHERE p.current_code LIKE '802-%' GROUP BY p.current_code, p.modes ORDER BY 1
         """
     ).fetchall()
     shared = {code: (modes, feeds) for code, modes, feeds in rows}
     assert shared["802-01"] == (["bus", "tram"], ["kmk_a", "kmk_t"])
-    groups = db.execute(
-        "SELECT count(DISTINCT stop_group_id) FROM core.stop_platform WHERE current_code LIKE '802-%'"
-    ).fetchone()[0]
+    groups = db.execute("SELECT count(DISTINCT stop_group_id) FROM core.stop WHERE current_code LIKE '802-%'").fetchone()[0]
     assert groups == 1
-    before = dict(db.execute("SELECT current_code, id FROM core.stop_platform").fetchall())
+    before = dict(db.execute("SELECT current_code, id FROM core.stop").fetchall())
 
     # a new tram version (different bytes, same stops, one renamed) keeps every ID
     src = STATIC / "GTFS_KRK_T.zip"
@@ -99,9 +97,9 @@ def test_shared_codes_link_to_one_platform_and_ids_survive_reimport(db, tmp_path
                 data = data.replace(b"Rondo Mogilskie", b"Rondo Mogilskie Nowe")
             zout.writestr(item, data)
     assert do_import(db, "kmk_t", changed).version == 2
-    after = dict(db.execute("SELECT current_code, id FROM core.stop_platform").fetchall())
+    after = dict(db.execute("SELECT current_code, id FROM core.stop").fetchall())
     assert after == before
-    name, slug = db.execute("SELECT name, slug FROM core.stop_platform WHERE current_code = '802-05'").fetchone()
+    name, slug = db.execute("SELECT name, slug FROM core.stop WHERE current_code = '802-05'").fetchone()
     assert (name, slug) == ("Rondo Mogilskie Nowe", "rondo-mogilskie-nowe05")
 
 
@@ -128,7 +126,7 @@ def tiny_feed(path: Path, start: str, dates: list[str], night_trip: bool) -> Pat
     )
 
 
-def test_platform_directions_name_the_next_other_stop(db, tmp_path):
+def test_stop_directions_name_the_next_other_group(db, tmp_path):
     # X: Alfa 01 -> Alfa 02 -> Beta -> Gamma; Y: Gamma -> Beta (no pickup) -> Alfa 01; Z like X but to Gamma only
     path = make_zip(
         tmp_path / "dirs.zip",
@@ -148,14 +146,14 @@ def test_platform_directions_name_the_next_other_stop(db, tmp_path):
     v = do_import(db, "kmk_t", path).feed_version_id
     rows = db.execute(
         """
-        SELECT p.current_code, g.current_code, d.route_id, d.headsign, d.trips FROM core.platform_direction d
-        JOIN core.stop_platform p ON p.id = d.stop_platform_id JOIN core.stop_group g ON g.id = d.next_group_id
+        SELECT p.current_code, g.current_code, d.route_id, d.headsign, d.trips FROM core.stop_direction d
+        JOIN core.stop p ON p.id = d.stop_id JOIN core.stop_group g ON g.id = d.next_group_id
         WHERE d.feed_version_id = %s ORDER BY 1, 2, 3
         """,
         (v,),
     ).fetchall()
     assert rows == [
-        ("910-01", "911", "R1", "Gamma", 1),  # not "towards Alfa": the next platform is in the same group
+        ("910-01", "911", "R1", "Gamma", 1),  # not "towards Alfa": the next stop is in the same group
         ("910-02", "911", "R1", "Gamma", 1),
         ("910-02", "912", "R2", "Gamma", 1),
         ("911-01", "912", "R1", "Gamma", 1),  # Y has no pickup at Beta
@@ -181,10 +179,10 @@ def test_overnight_update_keeps_old_version_for_previous_service_day(db, tmp_pat
 
     # both test stops are one group, so there are no directions: add one to see it go with the version
     db.execute(
-        "INSERT INTO core.platform_direction SELECT %s, id, stop_group_id, 'R1', '', 1 FROM core.stop_platform LIMIT 1",
+        "INSERT INTO core.stop_direction SELECT %s, id, stop_group_id, 'R1', '', 1 FROM core.stop LIMIT 1",
         (old.feed_version_id,),
     )
-    directions = "SELECT count(*) FROM core.platform_direction WHERE feed_version_id = %s"
+    directions = "SELECT count(*) FROM core.stop_direction WHERE feed_version_id = %s"
 
     # while day D is yesterday the old version still serves its night trips -> not retired
     assert retire_versions(db, "kmk_t", today=d + timedelta(days=1)) == []
@@ -215,7 +213,7 @@ def test_invalid_feed_fails_and_keeps_current_version(db, tmp_path):
             "calendar_dates.txt": "service_id,date,exception_type\nservice_4,20261024,1",
         },
     )
-    result = import_zip(db, "kmk_t", bad, meta(bad), "ztp")
+    result = import_zip(db, "kmk_t", bad, meta(bad), "ztp", stop_code_pattern=ZTP_STOP_CODES)
     assert result.status == "failed"
     assert "arrival_time" in result.error and "unknown stops" in result.error
     statuses = dict(db.execute("SELECT version, status FROM core.feed_version WHERE feed_id = 'kmk_t'").fetchall())
@@ -236,7 +234,7 @@ def test_integrity_check_catches_changed_values(db, tmp_path, monkeypatch):
         return out - 86400 if kind.name == "TIME" and out and out >= 86400 else out
 
     monkeypatch.setattr(integrity, "canonical_db", tamper)
-    result = import_zip(db, "kmk_t", path, meta(path), "ztp")
+    result = import_zip(db, "kmk_t", path, meta(path), "ztp", stop_code_pattern=ZTP_STOP_CODES)
     assert result.status == "failed"
     assert "IntegrityError" in result.error and "stop_times" in result.error
     assert db.execute("SELECT count(*) FROM core.feed_version WHERE status = 'ready'").fetchone()[0] == 0

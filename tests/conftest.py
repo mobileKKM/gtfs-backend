@@ -18,7 +18,7 @@ from alembic import command
 from alembic.config import Config
 from google.transit import gtfs_realtime_pb2 as pb
 
-from gtfs_backend.feeds import FeedConfig, FeedsFile
+from gtfs_backend.feeds import FeedConfig, FeedsFile, load_feeds
 from gtfs_backend.logs import setup_logging
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.realtime.store import TTLs
@@ -31,6 +31,9 @@ TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "postgresql://gtfs:gtfs@localh
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 
 setup_logging("WARNING")
+
+# ZTP names its stations in stop codes (`802-01`): the pattern feeds.yml declares for its feeds
+ZTP_STOP_CODES = load_feeds(ROOT / "feeds.yml").get("kmk_a").stop_code_pattern
 
 
 def _admin_url(url: str) -> str:
@@ -56,9 +59,10 @@ def database_url() -> str:
 
 FEEDS = FeedsFile(
     feeds=[
-        FeedConfig(feed_id="kmk_a", stop_namespace="ztp", static="https://example.invalid/A.zip"),
-        FeedConfig(feed_id="kmk_m", stop_namespace="ztp", static="https://example.invalid/M.zip"),
-        FeedConfig(feed_id="kmk_t", stop_namespace="ztp", static="https://example.invalid/T.zip"),
+        FeedConfig(feed_id=f, stop_namespace="ztp", stop_code_pattern=ZTP_STOP_CODES, static=f"https://example.invalid/{f}.zip")
+        for f in ("kmk_a", "kmk_m", "kmk_t")
+    ]
+    + [
         FeedConfig(feed_id="other", static="https://example.invalid/O.zip", share_stops_with=["ztp"]),
     ],
     search_namespaces=["ztp"],
@@ -79,8 +83,8 @@ def reset_db(database_url: str) -> None:
             for (part,) in parts:
                 conn.execute(f'DROP TABLE gtfs."{part}"')
         conn.execute(
-            "TRUNCATE core.platform_direction, core.stop_link, core.shape_line, core.service_day_version, core.service_date, "
-            "core.stop_platform, core.stop_group, core.public_id, core.feed_version, core.feed CASCADE"
+            "TRUNCATE core.stop_direction, core.stop_link, core.shape_line, core.service_day_version, core.service_date, "
+            "core.stop, core.stop_group, core.public_id, core.feed_version, core.feed CASCADE"
         )
 
 
@@ -129,7 +133,7 @@ def meta(path: Path) -> SourceMeta:
 
 
 def do_import(db, key: str, path: Path, namespace: str | None = "ztp", share=None):
-    result = import_zip(db, key, path, meta(path), namespace, share)
+    result = import_zip(db, key, path, meta(path), namespace, share, ZTP_STOP_CODES if namespace == "ztp" else None)
     assert result.status == "ready", result.error
     return result
 

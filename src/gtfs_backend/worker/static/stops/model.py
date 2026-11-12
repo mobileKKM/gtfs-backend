@@ -1,60 +1,83 @@
-"""A new feed version's stops, and our existing platforms and groups, as the matchers see them."""
+"""A new feed version's stops, and our existing stops and stop groups, as the matchers see them."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from functools import cache
 
 from gtfs_backend.ids import normalize_name
 
 
-def split_code(code: str | None) -> tuple[str | None, str | None]:
-    """'802-01' -> ('802', '01'). Codes without a dash have no group prefix."""
-    if not code:
-        return None, None
-    if "-" in code:
-        prefix, suffix = code.rsplit("-", 1)
-        return (prefix or None), (suffix or None)
-    return None, None
-
-
 @dataclass(frozen=True)
 class NewStop:
+    """A feed's stop (GTFS location_type 0) in GTFS shape: see normalize_stop."""
+
     stop_id: str
     code: str | None
     name: str
-    platform: str | None  # platform_code
+    platform_code: str | None
     lat: float
     lon: float
-    station_key: str | None = None  # 'station:{parent code or id}' when the stop has a parent_station
+    # 'station:{code or id}' of the GTFS parent_station, or the station the feed's stop_code_pattern names ('802')
+    station_key: str | None = None
     station_name: str | None = None
 
     @property
     def group_key(self) -> str:
-        """Parent station, else the code prefix ('802' for '802-01'), else the name. Scoped to the namespace."""
-        if self.station_key:
-            return self.station_key
-        prefix, _ = split_code(self.code)
-        if prefix:
-            return prefix
-        return f"name:{normalize_name(self.name)}"
+        """The station, else the name. Scoped to the namespace."""
+        return self.station_key or f"name:{normalize_name(self.name)}"
 
     @property
     def group_name(self) -> str:
         return self.station_name or self.name
 
     @property
-    def platform_key(self) -> str:
-        """Stops sharing a code are one platform; stops without a code are their own."""
+    def pole_key(self) -> str:
+        """Stops sharing a code are one pole; stops without a code are their own."""
         return f"code:{self.code}" if self.code else f"stop:{self.stop_id}"
 
 
+@cache
+def _compiled(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern)
+
+
+def normalize_stop(
+    stop_id: str,
+    code: str | None,
+    name: str,
+    platform_code: str | None,
+    lat: float,
+    lon: float,
+    station_key: str | None = None,
+    station_name: str | None = None,
+    *,
+    stop_code_pattern: str | None = None,
+) -> NewStop:
+    """A feed's stop in GTFS shape: its own parent_station and platform_code, else what the feed's
+    stop_code_pattern reads from its code (feeds.yml)."""
+    m = _compiled(stop_code_pattern).fullmatch(code) if stop_code_pattern and code else None
+    parts = m.groupdict() if m else {}
+    return NewStop(
+        stop_id,
+        code,
+        name,
+        platform_code or parts.get("platform_code"),
+        lat,
+        lon,
+        station_key or parts.get("station"),
+        station_name,
+    )
+
+
 @dataclass
-class Platform:
+class Stop:
     id: str
     group_id: str
     code: str | None
     name: str
-    platform: str | None
+    platform_code: str | None
     lat: float | None
     lon: float | None
     active: bool
@@ -68,9 +91,3 @@ class Group:
     name: str
     lat: float | None
     lon: float | None
-
-
-def platform_number(stop: NewStop) -> str | None:
-    if stop.platform:
-        return stop.platform.strip() or None
-    return split_code(stop.code)[1]

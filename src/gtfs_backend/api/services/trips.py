@@ -32,17 +32,17 @@ STOPS_SQL = """
            st.pickup_type, st.drop_off_type,
            p.id, p.url_key, p.name, p.stop_group_id, p.platform_code, ST_Y(p.geom), ST_X(p.geom)
     FROM gtfs.stop_times st
-    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.feed_stop_id = st.stop_id
-    LEFT JOIN core.stop p ON p.id = l.stop_id
+    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
+    LEFT JOIN core.stop p ON p.id = l.public_stop_id
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
     ORDER BY st.stop_sequence
 """
 # the live state needs only what decides `passed` without realtime, and the stops alerts can name
 STOPS_LIVE_SQL = """
     SELECT st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
-           l.stop_id
+           l.public_stop_id
     FROM gtfs.stop_times st
-    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.feed_stop_id = st.stop_id
+    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
     ORDER BY st.stop_sequence
 """
@@ -146,7 +146,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     scope = alerts.Scope(
         routes={(feed_id, route_id): info.route_type if info else None},
         trips={(feed_id, trip_id)},
-        stop_ids={pid for *_, pid in rows if pid},
+        public_stop_ids={pid for *_, pid in rows if pid},
         feeds={feed_id},
     )
     if update is not None and update.canceled:

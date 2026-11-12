@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from gtfs_backend.worker.static.stops.geometry import along_track_m, angle_diff, distance_m
-from gtfs_backend.worker.static.stops.model import Group, NewStop, Stop
+from gtfs_backend.worker.static.stops.model import Group, NewStop, PublicStop
 from gtfs_backend.worker.static.stops.names import names_match
 from gtfs_backend.worker.static.stops.osm import OsmPole
 
@@ -40,7 +40,7 @@ class SharedPlan:
 
 def plan_shared(
     stops: list[NewStop],
-    shared: list[Stop],
+    shared: list[PublicStop],
     shared_groups: list[Group],
     stop_bearing: dict[str, float] | None = None,
     shared_bearing: dict[str, float] | None = None,
@@ -80,20 +80,20 @@ def plan_shared(
     shared_modes = shared_modes or {}
     plan = SharedPlan()
 
-    def direction(s: NewStop, p: Stop) -> float | None:
+    def direction(s: NewStop, p: PublicStop) -> float | None:
         sb, pb = stop_bearing.get(s.stop_id), shared_bearing.get(p.id)
         return None if sb is None or pb is None else angle_diff(sb, pb)
 
-    def same_mode(p: Stop) -> bool:
+    def same_mode(p: PublicStop) -> bool:
         modes = shared_modes.get(p.id)
         return not feed_modes or not modes or bool(modes & feed_modes)
 
-    cells: dict[tuple[int, int], list[Stop]] = defaultdict(list)
+    cells: dict[tuple[int, int], list[PublicStop]] = defaultdict(list)
     for p in shared:
         if p.lat is not None and p.active:
             cells[(int(p.lat * 1000), int(p.lon * 1000))].append(p)  # ~110 m x 70 m cells
 
-    def same_pole(s: NewStop) -> list[tuple[float, Stop]]:
+    def same_pole(s: NewStop) -> list[tuple[float, PublicStop]]:
         """Shared stops of a mode the shared feeds serve within 8 m of the stop, nearest first."""
         cx, cy = int(s.lat * 1000), int(s.lon * 1000)
         out = [
@@ -105,7 +105,7 @@ def plan_shared(
         ]
         return sorted(out, key=lambda c: c[0])
 
-    def pick(s: NewStop, cands: list[tuple[float, Stop]]) -> Stop:
+    def pick(s: NewStop, cands: list[tuple[float, PublicStop]]) -> PublicStop:
         """Nearest candidate; equally close ones are decided by direction of travel, else the lowest code.
 
         Two codes on one spot (e.g. at a turn-around) are one pole, so an undecided tie is still that pole.
@@ -137,7 +137,7 @@ def plan_shared(
 
     # a bay of a bus station ('271-01-06') is a pole of its own; a shared stop is on a bay when that OSM pole is
     # within 25 m of it
-    by_bay: dict[str, Stop] = {}
+    by_bay: dict[str, PublicStop] = {}
     if osm:
         for p in shared:
             if p.active and p.lat is not None:
@@ -154,12 +154,12 @@ def plan_shared(
             snapped[key] = near[0][1] if near else None
         return snapped[key]
 
-    def osm_apart(s: NewStop, p: Stop) -> bool:
+    def osm_apart(s: NewStop, p: PublicStop) -> bool:
         """OSM has the feed's stop and the shared stop each on a pole of its own, and those poles are not the same one."""
         a, b = osm_pole_of(f"s{s.stop_id}", s.lat, s.lon), osm_pole_of(p.id, p.lat, p.lon)
         return a is not None and b is not None and distance_m(a.lat, a.lon, b.lat, b.lon) > OSM_SAME_POLE_M
 
-    def osm_says(s: NewStop, o: OsmPole) -> tuple[Stop | None] | None:
+    def osm_says(s: NewStop, o: OsmPole) -> tuple[PublicStop | None] | None:
         """(stop,) when this OSM pole is a shared stop, (None,) when it is none of them, None: no say."""
         if not o.ref:
             return None
@@ -175,7 +175,7 @@ def plan_shared(
             return None  # the ref is wrong or the pole moved
         return (p,)
 
-    def from_osm(s: NewStop) -> tuple[Stop | None] | None:
+    def from_osm(s: NewStop) -> tuple[PublicStop | None] | None:
         """(stop,) when OSM says which shared pole the stop is, (None,) when it says none of them; None: no say."""
         poles = []
         for d, o in osm_near(s.lat, s.lon, OSM_LINK_M):
@@ -206,7 +206,7 @@ def plan_shared(
             continue
         unresolved.append(s)
 
-    by_group: dict[str, list[Stop]] = defaultdict(list)
+    by_group: dict[str, list[PublicStop]] = defaultdict(list)
     for p in shared:
         if p.active and p.lat is not None:
             by_group[p.group_id].append(p)

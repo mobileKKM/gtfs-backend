@@ -135,15 +135,15 @@ CREATE INDEX stop_stop_group_idx ON core.stop (stop_group_id);
 
 CREATE INDEX stop_geom_idx ON core.stop USING gist (geom);
 
--- A feed's stop (`feed_stop_id`: its GTFS stop_id) is one of our stops (`stop_id`).
+-- A feed's stop (`stop_id`, as in the feed) is one of our stops (`public_stop_id`: its public 5-letter id).
 CREATE TABLE core.stop_link (
     feed_version_id text NOT NULL REFERENCES core.feed_version (id) ON DELETE CASCADE,
-    feed_stop_id text NOT NULL,
-    stop_id text NOT NULL REFERENCES core.stop (id),
-    PRIMARY KEY (feed_version_id, feed_stop_id)
+    stop_id text NOT NULL,
+    public_stop_id text NOT NULL REFERENCES core.stop (id),
+    PRIMARY KEY (feed_version_id, stop_id)
 );
 
-CREATE INDEX stop_link_stop_idx ON core.stop_link (stop_id);
+CREATE INDEX stop_link_public_stop_idx ON core.stop_link (public_stop_id);
 
 CREATE TABLE core.shape_line (
     feed_version_id text NOT NULL REFERENCES core.feed_version (id) ON DELETE CASCADE,
@@ -158,12 +158,12 @@ CREATE INDEX shape_line_geom_idx ON core.shape_line USING gist (geom);
 -- Built at import (static/derive.py) for the stop search's "towards ..." hints.
 CREATE TABLE core.stop_direction (
     feed_version_id text NOT NULL REFERENCES core.feed_version (id) ON DELETE CASCADE,
-    stop_id text NOT NULL REFERENCES core.stop (id),
+    public_stop_id text NOT NULL REFERENCES core.stop (id),
     next_group_id text NOT NULL REFERENCES core.stop_group (id),
     route_id text NOT NULL,
     headsign text NOT NULL,
     trips integer NOT NULL,
-    PRIMARY KEY (feed_version_id, stop_id, next_group_id, route_id, headsign)
+    PRIMARY KEY (feed_version_id, public_stop_id, next_group_id, route_id, headsign)
 );
 """
 

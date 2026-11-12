@@ -72,7 +72,7 @@ def normalize_stop(
 
 
 @dataclass
-class Stop:
+class PublicStop:
     id: str
     group_id: str
     code: str | None

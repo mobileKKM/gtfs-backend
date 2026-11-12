@@ -74,7 +74,7 @@ def test_shared_codes_link_to_one_stop_and_ids_survive_reimport(db, tmp_path):
         """
         SELECT p.current_code, p.modes, array_agg(fv.feed_id ORDER BY fv.feed_id)
         FROM core.stop p
-        JOIN core.stop_link l ON l.stop_id = p.id
+        JOIN core.stop_link l ON l.public_stop_id = p.id
         JOIN core.feed_version fv ON fv.id = l.feed_version_id
         WHERE p.current_code LIKE '802-%' GROUP BY p.current_code, p.modes ORDER BY 1
         """
@@ -147,7 +147,7 @@ def test_stop_directions_name_the_next_other_group(db, tmp_path):
     rows = db.execute(
         """
         SELECT p.current_code, g.current_code, d.route_id, d.headsign, d.trips FROM core.stop_direction d
-        JOIN core.stop p ON p.id = d.stop_id JOIN core.stop_group g ON g.id = d.next_group_id
+        JOIN core.stop p ON p.id = d.public_stop_id JOIN core.stop_group g ON g.id = d.next_group_id
         WHERE d.feed_version_id = %s ORDER BY 1, 2, 3
         """,
         (v,),

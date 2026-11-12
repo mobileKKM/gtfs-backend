@@ -217,14 +217,14 @@ async def test_stop_search(api, sql):
     ((nxt,),) = sql(
         """
         SELECT g.name FROM gtfs.stop_times st
-        JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.feed_stop_id = st.stop_id
+        JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
         JOIN gtfs.stop_times n ON n.feed_version_id = st.feed_version_id AND n.trip_id = st.trip_id
              AND n.stop_sequence = (SELECT min(stop_sequence) FROM gtfs.stop_times x
                                     WHERE x.feed_version_id = st.feed_version_id AND x.trip_id = st.trip_id
                                       AND x.stop_sequence > st.stop_sequence)
-        JOIN core.stop_link nl ON nl.feed_version_id = n.feed_version_id AND nl.feed_stop_id = n.stop_id
-        JOIN core.stop np ON np.id = nl.stop_id JOIN core.stop_group g ON g.id = np.stop_group_id
-        WHERE l.stop_id = %s GROUP BY g.name ORDER BY count(*) DESC LIMIT 1
+        JOIN core.stop_link nl ON nl.feed_version_id = n.feed_version_id AND nl.stop_id = n.stop_id
+        JOIN core.stop np ON np.id = nl.public_stop_id JOIN core.stop_group g ON g.id = np.stop_group_id
+        WHERE l.public_stop_id = %s GROUP BY g.name ORDER BY count(*) DESC LIMIT 1
         """,
         stop_by_code(sql, "802-01"),
     )
@@ -592,8 +592,8 @@ async def alerts_in_redis(api, sql):
             "route_id": None,
             "route_type": None,
             "trip_id": None,
-            "feed_stop_id": None,
             "stop_id": None,
+            "public_stop_id": None,
         }
         return {
             "feed_id": "kmk_t",
@@ -609,10 +609,10 @@ async def alerts_in_redis(api, sql):
 
     raws = [
         alert("route", route_id=tram["route_id"]),
-        alert("stop", feed_stop_id=code, stop_id=pid),
+        alert("stop", stop_id=code, public_stop_id=pid),
         alert("trip", trip_id=tram["trip_id"]),
         alert("feed", agency_id="agency_1"),
-        alert("route_elsewhere", route_id=tram["route_id"], feed_stop_id="125-01", stop_id=far),
+        alert("route_elsewhere", route_id=tram["route_id"], stop_id="125-01", public_stop_id=far),
         alert("other_route", route_id="route_does_not_exist"),
     ]
     r = Redis.from_url(TEST_REDIS_URL)
@@ -628,11 +628,8 @@ async def test_alerts_are_passed_through(api, alerts_in_redis):
     assert [a["id"] for a in out] == [a["id"] for a in raws]
     for got, raw in zip(out, raws, strict=True):
         assert {k: got[k] for k in raw if k != "informed_entities"} == {k: v for k, v in raw.items() if k != "informed_entities"}
-        # entities as GTFS-RT has them: `stop_id` is the feed's again, our stops are in `stops`
-        as_given = [
-            {k: v for k, v in ie.items() if k != "feed_stop_id"} | {"stop_id": ie["feed_stop_id"]}
-            for ie in raw["informed_entities"]
-        ]
+        # entities as GTFS-RT has them (`stop_id` is the feed's); our public_stop_id stays internal, the stops are in `stops`
+        as_given = [{k: v for k, v in ie.items() if k != "public_stop_id"} for ie in raw["informed_entities"]]
         assert got["informed_entities"] == as_given
         assert got["key"] == f"kmk_t:{raw['id']}"
     assert out[0]["routes"][0]["route_id"] == alerts_in_redis["tram"]["route_id"]

@@ -14,14 +14,14 @@ from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.errors import InvalidInput, NotFound
-from gtfs_backend.api.schemas import Alert, AlertList, AlertRef, InformedEntity
+from gtfs_backend.api.schemas import Alert, AlertList, AlertRef
 from gtfs_backend.api.services import stops
 
 
 @dataclass
 class Scope:
     routes: dict[tuple[str, str], int | None] | None = None  # (feed_id, route_id) -> route_type
-    stop_ids: set[str] | None = None  # ours
+    public_stop_ids: set[str] | None = None
     trips: set[tuple[str, str]] | None = None  # (feed_id, trip_id)
     feeds: set[str] | None = None  # feed-wide alerts (agency / no selector) of these feeds apply
 
@@ -36,8 +36,8 @@ def entity_matches(feed_id: str, ie: dict, scope: Scope) -> bool:
         if (feed_id, ie["trip_id"]) not in scope.trips:
             return False
         hit = True
-    if ie.get("feed_stop_id") is not None and scope.stop_ids is not None:
-        if ie.get("stop_id") not in scope.stop_ids:
+    if ie.get("stop_id") is not None and scope.public_stop_ids is not None:
+        if ie.get("public_stop_id") not in scope.public_stop_ids:
             return False
         hit = True
     if ie.get("route_type") is not None and scope.routes is not None:
@@ -46,7 +46,7 @@ def entity_matches(feed_id: str, ie: dict, scope: Scope) -> bool:
         hit = True
     if hit:
         return True
-    feed_wide = all(ie.get(k) is None for k in ("route_id", "trip_id", "feed_stop_id", "route_type"))
+    feed_wide = all(ie.get(k) is None for k in ("route_id", "trip_id", "stop_id", "route_type"))
     return feed_wide and scope.feeds is not None and feed_id in scope.feeds
 
 
@@ -85,21 +85,17 @@ async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> li
         version = ctx.catalog.today_version(a["feed_id"])
         return list(dict.fromkeys((version, ie["route_id"]) for ie in entities(a) if ie.get("route_id")))
 
-    def stop_ids(a: dict) -> list[str]:
-        return list(dict.fromkeys(ie["stop_id"] for ie in entities(a) if ie.get("stop_id")))
-
-    def as_given(ie: dict) -> InformedEntity:
-        """The entity as GTFS-RT has it: its `stop_id` is the feed's (stored as `feed_stop_id`, next to ours)."""
-        return InformedEntity(**{**ie, "stop_id": ie.get("feed_stop_id")})
+    def public_stop_ids(a: dict) -> list[str]:
+        return list(dict.fromkeys(ie["public_stop_id"] for ie in entities(a) if ie.get("public_stop_id")))
 
     routes = await ctx.catalog.route_models(k for a in raws for k in route_keys(a))
-    by_id = await stops.stops_by_id(conn, {p for a in raws for p in stop_ids(a)})
+    by_id = await stops.stops_by_id(conn, {p for a in raws for p in public_stop_ids(a)})
     return [
         Alert(
             key=keys.alert_key(a["feed_id"], a["id"]),
-            **{**a, "informed_entities": [as_given(ie) for ie in entities(a)]},
+            **a,
             routes=[routes[k] for k in route_keys(a) if k in routes],
-            stops=[by_id[p] for p in stop_ids(a) if p in by_id],
+            stops=[by_id[p] for p in public_stop_ids(a) if p in by_id],
         )
         for a in raws
     ]
@@ -147,7 +143,7 @@ async def search(ctx: Context, feed: str | None, route_key: str | None, stop_key
                 scope.routes = {(feed, route_id): info.route_type if info else None}
                 scope.feeds = {feed}
             if stop_key is not None:
-                scope.stop_ids = set(await stops.stop_ids(conn, await stops.get(conn, stop_key)))
+                scope.public_stop_ids = set(await stops.public_stop_ids(conn, await stops.get(conn, stop_key)))
             raws = [a for a in raws if matches(a, scope)]
         return AlertList(alerts=await to_models(ctx, conn, raws))
 

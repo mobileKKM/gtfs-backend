@@ -107,7 +107,7 @@ async def stops_by_id(conn: AsyncConnection, ids) -> dict[str, Stop]:
     return {r[1]: stop_from_row(r) for r in await cur.fetchall()}
 
 
-async def stop_ids(conn: AsyncConnection, stop: Stop) -> list[str]:
+async def public_stop_ids(conn: AsyncConnection, stop: Stop) -> list[str]:
     """The stops a stop or group covers: all of a group's (active or not, the timetables decide), or itself."""
     if stop.kind == "stop":
         return [stop.id]
@@ -132,9 +132,9 @@ async def _direction_rows(conn: AsyncConnection, catalog: Catalog, stops: list[s
         return []
     cur = await conn.execute(
         """
-        SELECT d.stop_id, d.next_group_id, g.name, d.feed_version_id, d.route_id, d.headsign, d.trips
+        SELECT d.public_stop_id, d.next_group_id, g.name, d.feed_version_id, d.route_id, d.headsign, d.trips
         FROM core.stop_direction d JOIN core.stop_group g ON g.id = d.next_group_id
-        WHERE d.feed_version_id = ANY(%s) AND d.stop_id = ANY(%s)
+        WHERE d.feed_version_id = ANY(%s) AND d.public_stop_id = ANY(%s)
         """,
         (versions, stops),
     )

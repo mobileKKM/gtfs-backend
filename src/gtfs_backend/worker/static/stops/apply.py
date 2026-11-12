@@ -10,17 +10,17 @@ from gtfs_backend.ids import new_public_id, slugify, stop_slug
 from gtfs_backend.logs import log
 from gtfs_backend.modes import MODE_SQL
 from gtfs_backend.worker.settings import get_worker_settings
-from gtfs_backend.worker.static.stops.model import Group, NewStop, Stop, normalize_stop
+from gtfs_backend.worker.static.stops.model import Group, NewStop, PublicStop, normalize_stop
 from gtfs_backend.worker.static.stops.osm import load_osm_poles
 from gtfs_backend.worker.static.stops.plan import plan_matches
 from gtfs_backend.worker.static.stops.queries import (
     current_versions,
-    feed_stop_bearings,
-    feed_stop_next_stops,
     namespace_versions,
+    public_stop_bearings,
+    public_stop_next_groups,
     served_modes,
     stop_bearings,
-    stop_next_groups,
+    stop_next_stops,
 )
 from gtfs_backend.worker.static.stops.shared import SharedPlan, plan_shared
 from gtfs_backend.worker.static.stops.state import refresh_stop_state
@@ -76,7 +76,7 @@ def apply_matches(
             """,
             (share_with,),
         )
-        shared = [Stop(*r) for r in cur.fetchall()]
+        shared = [PublicStop(*r) for r in cur.fetchall()]
         cur.execute(
             "SELECT id, current_code, name, ST_Y(geom), ST_X(geom) FROM core.stop_group "
             "WHERE code_namespace = ANY(%s) AND active",
@@ -85,10 +85,10 @@ def apply_matches(
         shared_groups = [Group(*r) for r in cur.fetchall()]
         cur.execute(f"SELECT DISTINCT {MODE_SQL} FROM gtfs.routes WHERE feed_version_id = %s", (feed_version_id,))
         feed_modes = {r[0] for r in cur.fetchall()}
-        stop_bearing = {sid: b for (_, sid), b in feed_stop_bearings(cur, [feed_version_id]).items()}
+        stop_bearing = {sid: b for (_, sid), b in stop_bearings(cur, [feed_version_id]).items()}
         shared_versions = namespace_versions(cur, share_with)
         shared_modes = served_modes(cur, shared_versions)  # the shared feeds' own service, not our links
-        shared_bearing = stop_bearings(cur, shared_versions)
+        shared_bearing = public_stop_bearings(cur, shared_versions)
         shared_plan = plan_shared(
             all_stops,
             shared,
@@ -97,8 +97,8 @@ def apply_matches(
             shared_bearing,
             shared_modes,
             feed_modes,
-            feed_stop_next_stops(cur, feed_version_id),
-            stop_next_groups(cur, shared_versions),
+            stop_next_stops(cur, feed_version_id),
+            public_stop_next_groups(cur, shared_versions),
             load_osm_poles(get_worker_settings().osm_stops_file),
         )
         for w in shared_plan.warnings:
@@ -112,13 +112,13 @@ def apply_matches(
     cur.execute(
         """
         SELECT p.id, p.stop_group_id, p.current_code, p.name, p.platform_code, ST_Y(p.geom), ST_X(p.geom), p.active,
-               EXISTS (SELECT 1 FROM core.stop_link l WHERE l.stop_id = p.id AND l.feed_version_id = ANY(%s))
+               EXISTS (SELECT 1 FROM core.stop_link l WHERE l.public_stop_id = p.id AND l.feed_version_id = ANY(%s))
         FROM core.stop p
         WHERE p.code_namespace = %s
         """,
         (others, namespace),
     )
-    existing = [Stop(*r) for r in cur.fetchall()]
+    existing = [PublicStop(*r) for r in cur.fetchall()]
     cur.execute(
         "SELECT id, current_code, name, ST_Y(geom), ST_X(geom) FROM core.stop_group WHERE code_namespace = %s", (namespace,)
     )
@@ -162,7 +162,7 @@ def apply_matches(
         group_id_for_key[gkey] = gid
 
     # stops: deactivate displaced holders of a code first (the active-code index is unique)
-    new_stop_ids: dict[str, str] = {}
+    new_public_ids: dict[str, str] = {}
     for key, s in reps.items():
         pid = plan.stop_for_key.get(key)
         gid = group_id_for_key[s.group_key]
@@ -193,11 +193,11 @@ def apply_matches(
                 """,
                 (gid, stop_slug(s.name, s.platform_code), s.code, s.name, s.platform_code, s.lon, s.lat, pid),
             )
-        new_stop_ids[key] = pid
+        new_public_ids[key] = pid
 
-    with cur.copy("COPY core.stop_link (feed_version_id, feed_stop_id, stop_id) FROM STDIN") as cp:
+    with cur.copy("COPY core.stop_link (feed_version_id, stop_id, public_stop_id) FROM STDIN") as cp:
         for s in stops:
-            cp.write_row((feed_version_id, s.stop_id, new_stop_ids[s.pole_key]))
+            cp.write_row((feed_version_id, s.stop_id, new_public_ids[s.pole_key]))
         for stop_id, pid in shared_links.items():
             cp.write_row((feed_version_id, stop_id, pid))
 

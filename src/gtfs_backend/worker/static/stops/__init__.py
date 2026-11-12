@@ -10,15 +10,15 @@ database, and are unit-tested; apply.py reads the inputs, writes the result and 
 """
 
 from gtfs_backend.worker.static.stops.apply import apply_matches
-from gtfs_backend.worker.static.stops.model import Group, NewStop, Stop, normalize_stop
+from gtfs_backend.worker.static.stops.model import Group, NewStop, PublicStop, normalize_stop
 from gtfs_backend.worker.static.stops.names import names_match
 from gtfs_backend.worker.static.stops.plan import plan_matches
 from gtfs_backend.worker.static.stops.shared import plan_shared
 
 __all__ = [
-    "Stop",
     "Group",
     "NewStop",
+    "PublicStop",
     "apply_matches",
     "names_match",
     "normalize_stop",

@@ -63,7 +63,7 @@ class TripIndex:
     trips: dict[tuple[int, str], TripInfo] = field(default_factory=dict)
     by_trip_id: dict[str, list[TripInfo]] = field(default_factory=lambda: defaultdict(list))
     by_base_id: dict[str, list[TripInfo]] = field(default_factory=lambda: defaultdict(list))  # trip id without `_service_N`
-    stop_links: dict[tuple[int, str], str] = field(default_factory=dict)  # (version, feed stop_id) -> our stop id
+    stop_links: dict[tuple[int, str], str] = field(default_factory=dict)  # (version, stop_id) -> public_stop_id
     stop_times: dict[tuple[int, str], list[StopTime]] = field(default_factory=dict)
     version_ids: dict[int, str] = field(default_factory=dict)  # version number -> core.feed_version.id
     loaded_for: date | None = None
@@ -76,7 +76,7 @@ class TripIndex:
     def day(self, d: date) -> ServiceDay | None:
         return next((x for x in self.days if x.date == d), None)
 
-    def linked_stop(self, version: int, stop_id: str | None) -> str | None:
+    def public_stop(self, version: int, stop_id: str | None) -> str | None:
         return self.stop_links.get((version, stop_id)) if stop_id else None
 
 
@@ -136,7 +136,7 @@ async def load_index(
                 index.add_trip(TripInfo(number[row[0]], *row[1:]))
 
         cur = await conn.execute(
-            "SELECT feed_version_id, feed_stop_id, stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (ids,)
+            "SELECT feed_version_id, stop_id, public_stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (ids,)
         )
         for fv_id, stop_id, pid in await cur.fetchall():
             index.stop_links[(number[fv_id], stop_id)] = pid

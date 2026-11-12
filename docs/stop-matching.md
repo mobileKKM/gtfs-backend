@@ -15,7 +15,7 @@ where it did.
 | **Stop group** (`core.stop_group`) | Our logical stop: all the poles of "Rondo Mogilskie". |
 | **Station** | A feed's own grouping: a GTFS `location_type=1` stop, or what its `stop_code_pattern` names. Seeds a stop group. |
 | **platform_code** | The GTFS field, e.g. `02`; from the feed, or from its `stop_code_pattern`. |
-| **Link** (`core.stop_link`) | Says which of our stops (`stop_id`) a feed's stop (`feed_stop_id`, its GTFS `stop_id`) is. |
+| **Link** (`core.stop_link`) | Says which of our stops (`public_stop_id`) a feed's stop (`stop_id`) is. |
 | **Namespace** | Feeds that number their stops the same way. ZTP's three feeds share one (`802-01` is the same pole in all). |
 | **Shared namespace** | A feed that mostly uses another namespace's poles (`share_stops_with: [ztp]`): MLD feeder buses in Kraków. |
 

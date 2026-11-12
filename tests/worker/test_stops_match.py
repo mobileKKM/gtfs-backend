@@ -4,7 +4,7 @@ from conftest import ZTP_STOP_CODES
 
 from gtfs_backend.worker.static.stops import (
     Group,
-    Stop,
+    PublicStop,
     names_match,
     normalize_stop,
     plan_matches,
@@ -22,7 +22,7 @@ def stop(stop_id, code, name="Rondo Mogilskie", dlat_m=0.0, platform_code=None, 
 
 
 def ours(pid, code, name="Rondo Mogilskie", dlat_m=0.0, group="grp01", platform_code=None, active=True, linked_elsewhere=False):
-    return Stop(
+    return PublicStop(
         pid,
         group,
         code,
@@ -280,7 +280,7 @@ def test_pole_further_up_the_line_is_the_next_stop_not_this_one():
     east = 1 / (111_320 * 0.6425)  # ~1 m in degrees longitude at this latitude
 
     def plan(dlon_m, dlat_m):
-        p1 = Stop("p1", "grp01", "802-01", "Rondo Mogilskie", "01", LAT + dlat_m * M, LON + dlon_m * east, True)
+        p1 = PublicStop("p1", "grp01", "802-01", "Rondo Mogilskie", "01", LAT + dlat_m * M, LON + dlon_m * east, True)
         return plan_shared(stops, [p1, q], [GROUP, g2], {"m": 90}, {"p1": 90}, modes, {"bus"}, {"m": {"n"}}, {"p1": {"g2"}})
 
     assert "m" not in plan(47, 0).links  # up the road: the next stop

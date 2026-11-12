@@ -64,20 +64,20 @@ def build_stop_directions(conn: psycopg.Connection, feed_version_id: str) -> int
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO core.stop_direction (feed_version_id, stop_id, next_group_id, route_id, headsign, trips)
+        INSERT INTO core.stop_direction (feed_version_id, public_stop_id, next_group_id, route_id, headsign, trips)
         SELECT %(v)s, pid, next_gid, route_id, headsign, count(*)
         FROM (
             SELECT pid, route_id, headsign,
                    CASE WHEN n1 <> gid THEN n1 WHEN n2 <> gid THEN n2 WHEN n3 <> gid THEN n3 END AS next_gid
             FROM (
-                SELECT l.stop_id AS pid, p.stop_group_id AS gid, t.route_id,
+                SELECT l.public_stop_id AS pid, p.stop_group_id AS gid, t.route_id,
                        coalesce(st.stop_headsign, t.trip_headsign, '') AS headsign, coalesce(st.pickup_type, 0) AS pickup,
                        lead(p.stop_group_id, 1) OVER w AS n1, lead(p.stop_group_id, 2) OVER w AS n2,
                        lead(p.stop_group_id, 3) OVER w AS n3
                 FROM gtfs.stop_times st
                 JOIN gtfs.trips t ON t.feed_version_id = %(v)s AND t.trip_id = st.trip_id
-                JOIN core.stop_link l ON l.feed_version_id = %(v)s AND l.feed_stop_id = st.stop_id
-                JOIN core.stop p ON p.id = l.stop_id
+                JOIN core.stop_link l ON l.feed_version_id = %(v)s AND l.stop_id = st.stop_id
+                JOIN core.stop p ON p.id = l.public_stop_id
                 WHERE st.feed_version_id = %(v)s
                 WINDOW w AS (PARTITION BY st.trip_id ORDER BY st.stop_sequence)
             ) s

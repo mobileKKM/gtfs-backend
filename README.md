@@ -81,8 +81,8 @@ Static imports are CPU-heavy and run in a separate process.
 - **Stops** (`core.stop_group` logical, `core.stop` physical poles, `core.stop_link` feed stop to our stop) have
   our own stable 5-letter ids and URL keys like `rondo-mogilskie01-qphdu`; only the part after the last dash counts.
   GTFS words keep their GTFS meaning: a *station* is a feed's `location_type=1` stop and `platform_code` is the
-  GTFS field. Stop groups are ours. In our tables and payloads `stop_id` is our stop (as `stop_group_id` is our
-  group) and `feed_stop_id` the feed's; `gtfs.*` and alert `informed_entities` keep the feed's own `stop_id`.
+  GTFS field. Stop groups are ours. `stop_id` is always a feed's GTFS id; our stop, wherever a column or payload
+  points at it, is `public_stop_id` (its public 5-letter id, the `id` the API shows).
   - A feed's stations seed the stop groups. ZTP has none and names them in its stop codes instead, which
     `stop_code_pattern` in feeds.yml reads: `802-01` is `platform_code` 01 of station 802. A feed that follows GTFS
     needs no pattern; a stop's own `parent_station` and `platform_code` always win.

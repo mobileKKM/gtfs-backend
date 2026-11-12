@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from gtfs_backend.ids import normalize_name
 from gtfs_backend.worker.static.stops.geometry import distance_m
-from gtfs_backend.worker.static.stops.model import Group, NewStop, Stop
+from gtfs_backend.worker.static.stops.model import Group, NewStop, PublicStop
 
 CODE_MATCH_M = 300.0  # same code: same stop (observed cross-feed spread for one code: up to 131 m)
 NAME_MATCH_M = 50.0  # same name + platform_code: same stop whose code changed
@@ -26,11 +26,11 @@ class MatchPlan:
     errors: list[str] = field(default_factory=list)
 
 
-def _near(p: Stop, s: NewStop, limit: float) -> bool:
+def _near(p: PublicStop, s: NewStop, limit: float) -> bool:
     return p.lat is not None and p.lon is not None and distance_m(p.lat, p.lon, s.lat, s.lon) <= limit
 
 
-def plan_matches(stops: list[NewStop], existing: list[Stop], groups: list[Group]) -> MatchPlan:
+def plan_matches(stops: list[NewStop], existing: list[PublicStop], groups: list[Group]) -> MatchPlan:
     plan = MatchPlan()
     # one representative stop per pole key (stops sharing a code are the same pole)
     reps: dict[str, NewStop] = {}
@@ -38,8 +38,8 @@ def plan_matches(stops: list[NewStop], existing: list[Stop], groups: list[Group]
         reps.setdefault(s.pole_key, s)
     batch_codes = {s.code for s in reps.values() if s.code}
 
-    by_code: dict[str, list[Stop]] = defaultdict(list)
-    by_name: dict[tuple[str, str | None], list[Stop]] = defaultdict(list)
+    by_code: dict[str, list[PublicStop]] = defaultdict(list)
+    by_name: dict[tuple[str, str | None], list[PublicStop]] = defaultdict(list)
     for p in existing:
         if p.code:
             by_code[p.code].append(p)
@@ -62,7 +62,7 @@ def plan_matches(stops: list[NewStop], existing: list[Stop], groups: list[Group]
                 plan.warnings.append(f"stop {s.stop_id}: code {s.code} exists but more than {CODE_MATCH_M:.0f} m away")
         unresolved.append((key, s))
 
-    def free(p: Stop) -> bool:
+    def free(p: PublicStop) -> bool:
         return p.id not in claimed and (p.code is None or p.code not in batch_codes)
 
     # b. same name + platform_code (nearby), c. same spot. Tentative until claims are unique.

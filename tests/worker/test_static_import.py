@@ -1,5 +1,6 @@
 """Static import against a real Postgres (skipped if not running)."""
 
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -167,6 +168,36 @@ def tiny_feed(path: Path, start: str, dates: list[str], night_trip: bool) -> Pat
             "calendar_dates.txt": "service_id,date,exception_type\n" + "\n".join(f"service_4,{d},1" for d in dates),
         },
     )
+
+
+
+async def test_trip_index_holds_only_trips_running_on_its_days(db, database_url, tmp_path):
+    """The realtime trip index loads yesterday/today/tomorrow; trips of services running on none of them can't match."""
+    from gtfs_backend.db import async_pool
+    from gtfs_backend.worker.realtime.trip_index import load_index
+
+    today, later = date.today().strftime("%Y%m%d"), (date.today() + timedelta(days=10)).strftime("%Y%m%d")
+    path = make_zip(
+        tmp_path / "two.zip",
+        {
+            "agency.txt": "agency_id,agency_name,agency_url,agency_timezone\nA,ZTP,http://ztp.test,Europe/Warsaw",
+            "stops.txt": "stop_id,stop_code,stop_name,stop_lat,stop_lon\nS1,900-01,X,50.0,19.9\nS2,900-02,X,50.001,19.9",
+            "routes.txt": "route_id,agency_id,route_short_name,route_type\nR1,A,1,900",
+            "trips.txt": "route_id,service_id,trip_id\nR1,now,T1\nR1,later,T2",
+            "stop_times.txt": "trip_id,arrival_time,departure_time,stop_id,stop_sequence\n"
+            "T1,06:00:00,06:00:00,S1,1\nT1,06:10:00,06:10:00,S2,2\nT2,06:00:00,06:00:00,S1,1\nT2,06:10:00,06:10:00,S2,2",
+            "calendar_dates.txt": f"service_id,date,exception_type\nnow,{today},1\nlater,{later},1",
+        },
+    )
+    do_import(db, "kmk_t", path)
+    db.commit()
+    pool = async_pool(database_url)
+    await pool.open()
+    try:
+        index = await load_index(pool, "kmk_t", time.time())
+    finally:
+        await pool.close()
+    assert [trip_id for _, trip_id in index.trips] == ["T1"]
 
 
 def test_stop_directions_name_the_next_other_group(db, tmp_path):

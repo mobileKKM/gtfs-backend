@@ -119,6 +119,8 @@ async def load_index(
             return index
         number = {fv_id: v for v, fv_id in index.version_ids.items()}
         ids = sorted(number)
+        # only trips that can match: their service runs on a loaded day of their version (24-38% of a ZTP version)
+        running = sorted({(index.version_ids[d.version], service) for d in index.days for service in d.services})
 
         cur = await conn.execute(
             """
@@ -131,9 +133,10 @@ async def load_index(
             JOIN gtfs.routes r ON r.feed_version_id = t.feed_version_id AND r.route_id = t.route_id
             JOIN gtfs.stop_times st ON st.feed_version_id = t.feed_version_id AND st.trip_id = t.trip_id
             WHERE t.feed_version_id = ANY(%s)
+              AND (t.feed_version_id, t.service_id) IN (SELECT * FROM unnest(%s::text[], %s::text[]))
             GROUP BY t.feed_version_id, t.trip_id, r.route_short_name, r.route_type
             """,
-            (ids,),
+            (ids, [fv for fv, _ in running], [service for _, service in running]),
         )
         rows = await cur.fetchall()
 

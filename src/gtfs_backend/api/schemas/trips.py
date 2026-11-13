@@ -44,13 +44,14 @@ class TripStopLive(BaseModel):
     estimated_arrival: int | None = None
     estimated_departure: int | None = None
     delay_s: int | None = None
-    passed: bool
     skipped: bool = False
 
 
 class TripLive(BaseModel):
     """A trip's realtime state. Match `stops` to the TripView's by `stop_sequence`: after a timetable import the cached
-    TripView can be of the previous version for a few minutes; a live stop without a match means fetch it again."""
+    TripView can be of the previous version for a few minutes; a live stop without a match means fetch it again.
+    Where the vehicle is on the trip is the vehicle's `stop_sequence` and `status` (GTFS-RT VehiclePosition), where the
+    feed reports them; `stops` only carry predictions: a stop without any has none (or its vehicle is past it)."""
 
     key: str  # `{feed_id}:{YYYYMMDD}:{trip_id}`: /trips/{key}
     status: Literal["scheduled", "live", "canceled"]
@@ -58,5 +59,4 @@ class TripLive(BaseModel):
     timestamp: int | None  # of the newest realtime data shown (trip update, vehicle position); None: none
     vehicle: Vehicle | None = None
     stops: list[TripStopLive]
-    current_index: int | None = None  # index in these `stops` of the next stop not yet passed
     alerts: list[AlertRef]

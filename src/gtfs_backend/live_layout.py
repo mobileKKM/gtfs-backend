@@ -6,7 +6,7 @@ rt:veh:geo                          GEO set of all feeds' vehicles (member = veh
 rt:veh:geo:{feed_id}                GEO set per feed, replaced atomically on every vehicle poll
 rt:veh:{vehicle_key}                vehicle JSON (TTL VEHICLE_TTL)
 rt:trip:{trip_key}                  trip update JSON with per-stop predictions, incl. stops the feed has
-                                    already dropped (`passed: true`, last known times); the JSON has the version.
+                                    already dropped (their last known times); the JSON has the version.
                                     Removed when the trip leaves the feed (TTL TRIP_TTL as a fallback)
 rt:alerts:{feed_id}                 alerts JSON (TTL ALERT_TTL)
 rt:unmatched:{feed_id}:{kind}       unmatched trip ids / vehicles for debugging (TTL UNMATCHED_TTL), never shown

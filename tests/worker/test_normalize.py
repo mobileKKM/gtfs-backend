@@ -11,7 +11,7 @@ from gtfs_backend.worker.realtime.normalize import (
     Result,
     build_alert,
     match_updates,
-    merge_passed,
+    merge_stops,
     process_message,
     resolve,
     resolve_instance,
@@ -193,38 +193,39 @@ def rt_trip(version, *stops):
 
 
 def seqs(trip):
-    return [(r["stop_sequence"], r["passed"]) for r in trip["stops"]]
+    return [r["stop_sequence"] for r in trip["stops"]]
 
 
-def test_passed_stops_are_kept_with_their_last_known_times():
-    first = merge_passed(None, rt_trip(1, (1, "a", 100), (2, "b", 200), (3, "c", 300)))
-    assert seqs(first) == [(1, False), (2, False), (3, False)]
-    second = merge_passed(first, rt_trip(1, (3, "c", 310), (4, "d", 410), (5, "e", 510)))
-    assert seqs(second) == [(1, True), (2, True), (3, False), (4, False), (5, False)]
+def test_dropped_stops_are_kept_with_their_last_known_times():
+    first = merge_stops(None, rt_trip(1, (1, "a", 100), (2, "b", 200), (3, "c", 300)))
+    assert seqs(first) == [1, 2, 3]
+    second = merge_stops(first, rt_trip(1, (3, "c", 310), (4, "d", 410), (5, "e", 510)))
+    assert seqs(second) == [1, 2, 3, 4, 5]
     assert [r["predicted_departure"] for r in second["stops"]] == [100, 200, 310, 410, 510]
-    # already passed rows stay on later polls
-    third = merge_passed(second, rt_trip(1, (5, "e", 520)))
-    assert seqs(third) == [(1, True), (2, True), (3, True), (4, True), (5, False)]
+    # dropped rows stay on later polls
+    third = merge_stops(second, rt_trip(1, (5, "e", 520)))
+    assert seqs(third) == [1, 2, 3, 4, 5]
     assert third["stops"][2]["predicted_departure"] == 310
+    assert not any("passed" in r for r in third["stops"])
 
 
-def test_version_change_drops_passed_stops():
-    prev = merge_passed(None, rt_trip(1, (1, "a", 100), (2, "b", 200)))
-    assert seqs(merge_passed(prev, rt_trip(2, (2, "b", 210)))) == [(2, False)]
+def test_version_change_drops_the_kept_stops():
+    prev = merge_stops(None, rt_trip(1, (1, "a", 100), (2, "b", 200)))
+    assert seqs(merge_stops(prev, rt_trip(2, (2, "b", 210)))) == [2]
 
 
-def test_empty_update_keeps_all_rows_as_passed():
-    prev = merge_passed(None, rt_trip(1, (1, "a", 100), (2, "b", 200)))
-    assert seqs(merge_passed(prev, rt_trip(1))) == [(1, True), (2, True)]
+def test_empty_update_keeps_all_rows():
+    prev = merge_stops(None, rt_trip(1, (1, "a", 100), (2, "b", 200)))
+    assert seqs(merge_stops(prev, rt_trip(1))) == [1, 2]
 
 
 def test_loop_trip_keeps_both_visits_of_a_stop():
-    prev = merge_passed(None, rt_trip(1, (1, "a", 100), (2, "b", 200), (3, "a", 300)))
-    merged = merge_passed(prev, rt_trip(1, (3, "a", 305)))
-    assert [(r["stop_sequence"], r["stop_id"], r["passed"]) for r in merged["stops"]] == [
-        (1, "a", True),
-        (2, "b", True),
-        (3, "a", False),
+    prev = merge_stops(None, rt_trip(1, (1, "a", 100), (2, "b", 200), (3, "a", 300)))
+    merged = merge_stops(prev, rt_trip(1, (3, "a", 305)))
+    assert [(r["stop_sequence"], r["stop_id"], r["predicted_departure"]) for r in merged["stops"]] == [
+        (1, "a", 100),
+        (2, "b", 200),
+        (3, "a", 305),
     ]
 
 

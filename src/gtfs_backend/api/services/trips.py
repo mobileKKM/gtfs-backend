@@ -38,10 +38,9 @@ STOPS_SQL = """
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
     ORDER BY st.stop_sequence
 """
-# the live state needs only what decides `passed` without realtime, and the stops alerts can name
+# the live state needs only the stop sequences, and the stops alerts can name
 STOPS_LIVE_SQL = """
-    SELECT st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
-           l.public_stop_id
+    SELECT st.stop_sequence, l.public_stop_id
     FROM gtfs.stop_times st
     LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
@@ -108,20 +107,14 @@ async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> 
     )
 
 
-def _live_stop(row, day: Day, update: TripUpdate | None, now: int) -> TripStopLive:
-    seq, arr, dep, _ = row
+def _live_stop(row, update: TripUpdate | None) -> TripStopLive:
+    seq, _ = row
     live = update.stop(seq) if update else None
-    if update is None:  # no realtime: passed once its time is over
-        last = dep if dep is not None else arr
-        passed = last is not None and day.base + last < now
-    else:
-        passed = update.passed(seq)
     return TripStopLive(
         stop_sequence=seq,
         estimated_arrival=live.predicted_arrival if live else None,
         estimated_departure=live.predicted_departure if live else None,
         delay_s=live.delay_s if live else None,
-        passed=passed,
         skipped=bool(live and live.skipped),
     )
 
@@ -136,8 +129,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
         rows = await (await conn.execute(STOPS_LIVE_SQL, params)).fetchall()
 
     update = TripUpdate.for_version((await realtime.trip_updates(ctx.redis, [key])).get(key), day.version)
-    now = ctx.now()
-    stops = [_live_stop(r, day, update, now) for r in rows]
+    stops = [_live_stop(r, update) for r in rows]
 
     if vehicle is None and update and update.vehicle_id:
         found = await vehicles.by_ids(ctx, [f"{feed_id}:{update.vehicle_id}"])
@@ -148,7 +140,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
         routes={(feed_id, route_id): info.route_type if info else None},
         directions={(feed_id, route_id, direction_id)} if direction_id is not None else set(),
         trips={key},
-        public_stop_ids={pid for *_, pid in rows if pid},
+        public_stop_ids={pid for _, pid in rows if pid},
         feeds={feed_id},
     )
     if update is not None and update.canceled:
@@ -164,7 +156,6 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
         timestamp=realtime.newest([update.timestamp if update else None, vehicle.timestamp if vehicle else None]),
         vehicle=vehicle,
         stops=stops,
-        current_index=next((i for i, s in enumerate(stops) if not s.passed), None),
         alerts=await alerts.in_scope(ctx, scope),
     )
 

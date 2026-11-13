@@ -53,7 +53,6 @@ class StopUpdate:
     predicted_departure: int | None
     delay_s: int | None
     skipped: bool
-    passed: bool
 
     @property
     def predicted(self) -> int | None:
@@ -75,11 +74,9 @@ class TripUpdate:
                 r.get("predicted_departure"),
                 r.get("delay_s"),
                 r.get("schedule_relationship") == "SKIPPED",
-                bool(r.get("passed")),
             )
             for r in raw.get("stops") or []
         }
-        self._first = min(self._stops, default=None)
 
     @classmethod
     def for_version(cls, raw: dict | None, version: int) -> TripUpdate | None:
@@ -88,13 +85,6 @@ class TripUpdate:
 
     def stop(self, sequence: int) -> StopUpdate | None:
         return self._stops.get(sequence)
-
-    def passed(self, sequence: int) -> bool:
-        """The feed drops passed stops; one before everything it (or we) still know about is passed too."""
-        row = self._stops.get(sequence)
-        if row is not None:
-            return row.passed
-        return self._first is not None and sequence < self._first
 
 
 async def trip_updates(redis: Redis, keys: list[str]) -> dict[str, dict]:

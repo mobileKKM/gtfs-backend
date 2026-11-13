@@ -485,11 +485,8 @@ async def test_trip_of_a_live_vehicle(api):
     assert live["key"] == v["trip_key"] and live["status"] == "live" and "next_update" not in live
     assert r.headers["cache-control"] == "no-cache"
     assert live["vehicle"] == v
-    # passed stops come first, then the ones with predictions; current_index is the first not passed
-    passed = [s["passed"] for s in live["stops"]]
-    assert passed == sorted(passed, reverse=True)
-    assert live["current_index"] == passed.index(False)
-    assert any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"] if not s["passed"])
+    assert any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"])
+    assert not {"current_index"} & set(live) and not any("passed" in s for s in live["stops"])
     # the same live state by trip key
     by_key = await api.get(f"/trips/{v['trip_key']}/live")
     assert by_key.json() == live and by_key.headers["cache-control"] == "no-cache"
@@ -498,7 +495,7 @@ async def test_trip_of_a_live_vehicle(api):
     r = await api.get(f"/trips/{v['trip_key']}")
     assert r.headers["cache-control"].startswith("public, max-age=")
     trip = r.json()
-    assert trip["key"] == live["key"] and not {"vehicle", "status", "alerts", "current_index"} & set(trip)
+    assert trip["key"] == live["key"] and not {"vehicle", "status", "alerts"} & set(trip)
     assert trip["route"]["name"] == v["route"]["name"] and trip["headsign"] == v["headsign"]
     stops = trip["stops"]
     seqs = [s["stop_sequence"] for s in stops]
@@ -532,10 +529,7 @@ async def test_trip_without_realtime_or_shape(api, sql, loaded):
     live = (await api.get(f"/trips/{key}/live")).json()
     assert live["status"] == "scheduled" and live["vehicle"] is None
     assert not any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"])
-    # without realtime a stop is passed once its time is over
     trip = (await api.get(f"/trips/{key}")).json()
-    for s, ls in zip(trip["stops"], live["stops"], strict=True):
-        assert ls["passed"] == ((s.get("scheduled_departure") or s["scheduled_arrival"]) < NOW)
     assert trip["shape"]["source"] == "shape" and not any(s["on_demand"] for s in trip["stops"])
 
     # without a shape it is drawn through the stops

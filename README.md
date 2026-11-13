@@ -106,7 +106,7 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 |---|---|
 | `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
 | `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
-| `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with `passed: true`; removed when the trip leaves the feed |
+| `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times; removed when the trip leaves the feed |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
@@ -163,13 +163,13 @@ of the request, so their ETag only changes with the data.
 
 | endpoint | what |
 |---|---|
-| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, route (`RouteRef`, with its mode), headsign, delay, `trip_key` |
+| `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, route (`RouteRef`, with its mode), headsign, delay, `trip_key`, and where the feed reports it `stop_sequence` + `status` (`stopped_at`, `incoming_at`, `in_transit_to`) |
 | `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_key` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
 | `GET /stops/{stop_key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
-| `GET /trips/{trip_key}/live` | to poll: every stop's predictions and passed/skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
+| `GET /trips/{trip_key}/live` | to poll: every stop's predictions and skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
@@ -198,7 +198,9 @@ Notes:
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
   delayed departures stay. Predictions are used only for the same version. `status`: `scheduled`, `live`,
-  `departed`, `canceled`, `skipped`; `time` is the estimate if known. Last stops and stops without pickup are not
+  `departed`, `canceled`, `skipped`; `time` is the estimate if known. `departed` is when the vehicle reports a later
+  stop of the trip (VehiclePosition `current_stop_sequence`), else when the time is past; a TripUpdate not listing a
+  stop doesn't count as passing it. `vehicle_state` (`at_stop`, `arriving`) is set when the vehicle reports this stop. Last stops and stops without pickup are not
   departures; `on_demand` marks GTFS pickup type 2/3.
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
   show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
@@ -208,8 +210,8 @@ Notes:
   the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish
   line variants as separate routes (km_mld has two `A18`), so a name can repeat: dedupe by name for display.
   `/vehicles` takes `routes` as well.
-- **Trip view**: `shape.source` is `shape`, or `stops` when the feed has none (trains). `current_index` is the
-  first stop not yet passed; `vehicle` is set while one runs the trip.
+- **Trip view**: `shape.source` is `shape`, or `stops` when the feed has none (trains). `vehicle` is set while one runs the
+  trip; its `stop_sequence` and `status` (where the feed reports them) say which stop it is at or heading to.
 - **Polling**: live responses are `no-cache`; clients refetch the open view about every 10 s with `If-None-Match`
   and stop in the background.
 - **Alerts**: `cause`/`effect` are the GTFS-RT enums in lowercase (`construction`, `detour`), `severity` is `info`,

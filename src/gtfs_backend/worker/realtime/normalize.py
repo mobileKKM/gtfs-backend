@@ -257,17 +257,17 @@ def build_trip(feed_id: str, ref: TripRef, tu, stops: list[StopTime], index: Tri
     }
 
 
-def merge_passed(prev: dict | None, trip: dict) -> dict:
-    """Keep stops the feed has dropped since `prev` (ZTP removes a stop once it is passed).
-
-    Kept rows get `passed: True` and their last known times; rows from the current update get `passed: False`.
+def merge_stops(prev: dict | None, trip: dict) -> dict:
+    """The current update's stops, preceded by the ones the feed has dropped since `prev` (ZTP removes a stop once
+    the vehicle is past it), with their last known times. A trip update only lists predictions, so dropped stops
+    are kept for their times and not marked: whether a vehicle is past a stop is up to its VehiclePosition.
     Stop sequences are only comparable within one version, so a version change starts over.
     """
-    rows = [{**r, "passed": False} for r in trip["stops"]]
+    rows = list(trip["stops"])
     if prev is None or prev.get("version") != trip["version"]:
         return {**trip, "stops": rows}
     first = min((r["stop_sequence"] for r in rows), default=None)
-    kept = [{**r, "passed": True} for r in prev.get("stops", []) if first is None or r["stop_sequence"] < first]
+    kept = [r for r in prev.get("stops", []) if first is None or r["stop_sequence"] < first]
     kept.sort(key=lambda r: r["stop_sequence"])
     return {**trip, "stops": kept + rows}
 

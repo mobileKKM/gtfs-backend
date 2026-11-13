@@ -13,9 +13,19 @@ MAX_BBOX_KM = 50
 COORD_DIGITS = 5  # ~1 m
 
 
+def stop_state(raw: dict) -> tuple[int | None, str | None]:
+    """(stop_sequence, status) the feed reports; the status only counts together with the sequence."""
+    seq = raw.get("current_stop_sequence")
+    status = raw.get("current_status")
+    if seq is None or status is None:
+        return seq, None
+    return seq, status.lower()
+
+
 def _model(raw: dict, refs: dict[tuple[str, str], RouteRef]) -> Vehicle:
     trip = raw["trip"]
     route = refs.get((version_id(raw["feed_id"], trip["version"]), trip["route_id"]))
+    stop_sequence, status = stop_state(raw)
     return Vehicle(
         key=vehicle_key(raw["feed_id"], raw["vehicle_id"]),
         label=raw.get("label"),
@@ -25,6 +35,8 @@ def _model(raw: dict, refs: dict[tuple[str, str], RouteRef]) -> Vehicle:
         route=route,
         headsign=trip.get("headsign"),
         delay_s=raw.get("delay_s"),
+        stop_sequence=stop_sequence,
+        status=status,
         trip_key=trip["key"],
         timestamp=raw.get("timestamp"),
     )

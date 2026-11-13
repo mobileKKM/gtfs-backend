@@ -2,7 +2,8 @@
 
 from datetime import date
 
-from gtfs_backend.api.services.departures import GRACE_S, Row, Scheduled, overlay, select
+from gtfs_backend.api.services.departures import GRACE_S, Row, Scheduled, overlay, select, vehicle_state
+from gtfs_backend.api.services.vehicles import stop_state
 
 NOW = 1_800_000_000
 
@@ -18,8 +19,7 @@ def rt(*rows, version=1, relationship="SCHEDULED", vehicle="704") -> dict:
         "vehicle_id": vehicle,
         "schedule_relationship": relationship,
         "stops": [
-            {"stop_sequence": q, "predicted_departure": p, "predicted_arrival": None, "delay_s": d, "passed": False, **x}
-            for q, p, d, x in rows
+            {"stop_sequence": q, "predicted_departure": p, "predicted_arrival": None, "delay_s": d, **x} for q, p, d, x in rows
         ],
     }
 
@@ -45,12 +45,31 @@ def test_arrival_only_prediction_is_used():
     assert overlay(sched(), update, NOW).estimated == NOW + 660
 
 
-def test_passed_stops_are_departed_with_last_known_time():
-    live = overlay(sched(dep=NOW - 300), rt((5, NOW - 60, 240, {"passed": True})), NOW)
-    assert (live.status, live.estimated, live.delay_s, live.realtime) == ("departed", NOW - 60, 240, True)
-    # dropped by the feed before we ever saw it: earlier than every row we have, no time known
-    live = overlay(sched(seq=2, dep=NOW - 300), rt((5, NOW + 720, 120, {})), NOW)
-    assert (live.status, live.estimated, live.realtime) == ("departed", None, False)
+def veh(seq, status="IN_TRANSIT_TO", trip="t1", version=1) -> dict:
+    return {"trip": {"key": f"kmk_t:20270115:{trip}", "version": version}, "current_stop_sequence": seq, "current_status": status}
+
+
+def test_departed_once_the_vehicle_reports_a_later_stop():
+    update = rt((5, NOW + 60, 240, {}))  # still listed by the feed: the TripUpdate doesn't say passed
+    assert overlay(sched(), update, NOW, veh(6)).status == "departed"
+    assert overlay(sched(), update, NOW, veh(5)).status == "live"  # heading to it
+    assert overlay(sched(), update, NOW, veh(5, "STOPPED_AT")).status == "live"  # at it, not yet left
+    assert overlay(sched(), update, NOW, veh(4)).status == "live"
+    # the last known time stays
+    live = overlay(sched(), update, NOW, veh(6))
+    assert (live.estimated, live.delay_s) == (NOW + 60, 240)
+
+
+def test_vehicle_of_another_trip_or_version_says_nothing():
+    update = rt((5, NOW + 600, 0, {}))
+    assert overlay(sched(), update, NOW, veh(9, trip="t2")).status == "live"
+    assert overlay(sched(), update, NOW, veh(9, version=2)).status == "live"
+
+
+def test_unlisted_stops_are_not_taken_as_passed():
+    # a TripUpdate lists predictions only; an earlier stop it doesn't list is decided by the vehicle or the clock
+    assert overlay(sched(seq=2, dep=NOW + 300), rt((5, NOW + 720, 120, {})), NOW).status == "scheduled"
+    assert overlay(sched(seq=2, dep=NOW - 300), rt((5, NOW + 720, 120, {})), NOW).status == "departed"
 
 
 def test_stop_beyond_the_predictions_keeps_the_schedule():
@@ -107,3 +126,31 @@ def test_paging_forward_by_time_without_gaps():
         seen += new
         start = max(r.time for r in rs if r.s.trip_id in seen)
     assert len(seen) == 12
+
+
+def _row(seq=5, status_dep=NOW + 600, update=None, vehicle=None) -> Row:
+    s = sched(seq=seq, dep=status_dep)
+    return Row(s, overlay(s, update if update is not None else rt((seq, NOW + 600, 0, {})), NOW, vehicle), vehicle)
+
+
+def test_vehicle_state_only_for_the_stop_it_reports():
+    veh = {"current_stop_sequence": 5, "current_status": "STOPPED_AT"}
+    assert vehicle_state(_row(seq=5), veh) == "at_stop"
+    assert vehicle_state(_row(seq=5), {**veh, "current_status": "INCOMING_AT"}) == "arriving"
+    assert vehicle_state(_row(seq=5), {**veh, "current_status": "IN_TRANSIT_TO"}) is None
+    assert vehicle_state(_row(seq=6), veh) is None
+    assert vehicle_state(_row(seq=5), None) is None
+
+
+def test_vehicle_state_not_for_departed_or_canceled():
+    at = veh(5, "STOPPED_AT")
+    assert vehicle_state(_row(vehicle=at), at) == "at_stop"
+    assert vehicle_state(_row(vehicle=veh(6)), veh(5, "STOPPED_AT")) is None  # the vehicle is past it: departed
+    assert vehicle_state(_row(update=rt((5, NOW + 600, 0, {}), relationship="CANCELED")), at) is None
+
+
+def test_status_needs_the_stop_sequence():
+    assert stop_state({"current_stop_sequence": 5, "current_status": "STOPPED_AT"}) == (5, "stopped_at")
+    assert stop_state({"current_status": "STOPPED_AT"}) == (None, None)
+    assert stop_state({"current_stop_sequence": 5}) == (5, None)
+    assert stop_state({}) == (None, None)

@@ -24,7 +24,8 @@ from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.data.sql import union_per_version
 from gtfs_backend.api.errors import InvalidInput
 from gtfs_backend.api.schemas import Departure, DepartureBoard, DepartureStatus, RouteRef
-from gtfs_backend.api.services import alerts, stops
+from gtfs_backend.api.schemas.departures import VehicleState
+from gtfs_backend.api.services import alerts, stops, vehicles
 
 LOOKBACK_S = 60 * 60  # delayed departures stay this long past their time
 GRACE_S = 30  # keep a departure this long after it leaves
@@ -67,6 +68,7 @@ class Live:
 class Row:
     s: Scheduled
     live: Live
+    vehicle: dict | None = None  # its vehicle's JSON, when it runs this trip
 
     @property
     def time(self) -> int:
@@ -131,11 +133,17 @@ async def scheduled(
     return out
 
 
-def overlay(s: Scheduled, raw: dict | None, now: int, grace: int = GRACE_S) -> Live:
+def runs(vehicle: dict | None, s: Scheduled) -> bool:
+    """Whether the vehicle is on this trip (it may have moved on to the next one) in this timetable version."""
+    return vehicle is not None and vehicle["trip"]["key"] == s.trip_key and vehicle["trip"]["version"] == s.version
+
+
+def overlay(s: Scheduled, raw: dict | None, now: int, vehicle: dict | None = None, grace: int = GRACE_S) -> Live:
     """Realtime state of one scheduled departure.
 
-    `departed` once the vehicle has passed the stop, or (without that knowledge) once its time is `grace` past.
-    Passed stops keep the last time realtime had for them.
+    `departed` once the vehicle reports a later stop of the trip (GTFS-RT VehiclePosition.current_stop_sequence),
+    or, without that, once its time is `grace` past. A TripUpdate says nothing about passed stops: it only lists
+    predictions, so a stop it doesn't list isn't taken as passed.
     """
     update = TripUpdate.for_version(raw, s.version)
     stop = update.stop(s.stop_sequence) if update else None
@@ -146,13 +154,18 @@ def overlay(s: Scheduled, raw: dict | None, now: int, grace: int = GRACE_S) -> L
         status = "canceled"
     elif stop is not None and stop.skipped:
         status = "skipped"
-    elif (update is not None and update.passed(s.stop_sequence)) or (estimated or s.scheduled_departure) + grace < now:
+    elif _vehicle_past(vehicle, s) or (estimated or s.scheduled_departure) + grace < now:
         status = "departed"
     else:
         status = "live" if is_live else "scheduled"
     if update is None:
         return Live(estimated, delay, is_live, status, None)
     return Live(estimated, delay, is_live, status, update.vehicle_id, update.timestamp)
+
+
+def _vehicle_past(vehicle: dict | None, s: Scheduled) -> bool:
+    seq, _ = vehicles.stop_state(vehicle) if runs(vehicle, s) else (None, None)
+    return seq is not None and seq > s.stop_sequence
 
 
 def _upcoming(row: Row, now: int, grace: int) -> bool:
@@ -168,6 +181,18 @@ def select(rows: list[Row], now: int, limit: int, start: int, end: int, live: bo
     if live:
         rows = [r for r in rows if _upcoming(r, now, grace)]
     return rows[:limit]
+
+
+async def _vehicles(ctx: Context, found: list[Scheduled], updates: dict[str, dict]) -> dict[str, dict]:
+    """trip_key -> JSON of the vehicle running it, for the trips whose update names one (one Redis call)."""
+    wanted = {
+        s.trip_key: keys.vehicle_key(s.feed_id, u["vehicle_id"])
+        for s in found
+        if (u := updates.get(s.trip_key)) and u.get("vehicle_id")
+    }
+    raws = await realtime.vehicle_json(ctx.redis, sorted(set(wanted.values())))
+    by_key = {keys.vehicle_key(v["feed_id"], v["vehicle_id"]): v for v in raws}
+    return {t: v for t, k in wanted.items() if (v := by_key.get(k)) and v["trip"]["key"] == t}
 
 
 async def _page(
@@ -192,14 +217,31 @@ async def _page(
         if route_names:
             found = [f for f in found if (ref := refs.get((f.feed_version_id, f.route_id))) and ref.name in route_names]
         updates = await realtime.trip_updates(ctx.redis, [s.trip_key for s in found])
-        rows = [Row(f, overlay(f, updates.get(f.trip_key), now)) for f in found]
+        by_vehicle = await _vehicles(ctx, found, updates)
+        rows = [
+            Row(f, overlay(f, updates.get(f.trip_key), now, by_vehicle.get(f.trip_key)), by_vehicle.get(f.trip_key))
+            for f in found
+        ]
         page = select(rows, now, limit, lo, hi, live)
         if len(page) >= limit:
             break
     return page, refs
 
 
-def _departure(row: Row, route: RouteRef | None, stop) -> Departure:
+VEHICLE_STATES = {"stopped_at": "at_stop", "incoming_at": "arriving"}
+
+
+def vehicle_state(row: Row, vehicle: dict | None) -> VehicleState | None:
+    """Whether the vehicle is at / arriving at this very stop; the feed's stop report says so only for one stop."""
+    if vehicle is None or row.live.status in ("departed", "canceled", "skipped"):
+        return None
+    seq, status = vehicles.stop_state(vehicle)
+    if seq != row.s.stop_sequence:
+        return None
+    return VEHICLE_STATES.get(status or "")
+
+
+def _departure(row: Row, route: RouteRef | None, stop, state: VehicleState | None = None) -> Departure:
     s, live = row.s, row.live
     return Departure(
         trip_key=s.trip_key,
@@ -213,6 +255,7 @@ def _departure(row: Row, route: RouteRef | None, stop) -> Departure:
         delay_s=live.delay_s,
         status=live.status,
         vehicle_key=keys.vehicle_key(s.feed_id, live.vehicle_id) if live.vehicle_id else None,
+        vehicle_state=state,
         on_demand=s.on_demand,
     )
 
@@ -254,7 +297,10 @@ async def board(ctx: Context, key: str, time: int | None, feeds: set[str], route
         page, refs = await _page(ctx, conn, pids, now if time is None else time, time is None, feeds, route_names, now, limit)
 
         by_id = await stops.stops_by_id(conn, {r.s.public_stop_id for r in page})
-        out = [_departure(r, refs.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.public_stop_id]) for r in page]
+        out = [
+            _departure(r, refs.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.public_stop_id], vehicle_state(r, r.vehicle))
+            for r in page
+        ]
         served = await _served(conn, ctx.catalog, pids)
     board_alerts = await _alerts(ctx, pids, page, served, feeds, route_names)
 

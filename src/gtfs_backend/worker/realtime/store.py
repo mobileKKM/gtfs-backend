@@ -9,7 +9,7 @@ from redis.asyncio import Redis
 
 from gtfs_backend import keys, live_layout
 from gtfs_backend.feeds import RealtimeKind
-from gtfs_backend.worker.realtime.normalize import Result, merge_passed
+from gtfs_backend.worker.realtime.normalize import Result, merge_stops
 
 
 @dataclass(frozen=True)
@@ -67,11 +67,11 @@ class RealtimeStore:
         if feed_id not in self._trip_keys:  # first update since the worker started: earlier trips count as written
             self._trip_keys[feed_id] = await self._stored_trip_keys(feed_id)
         current = {trip["key"] for trip in res.trips}
-        # the feed drops passed stops; read the previous JSON back so they (and restarts) survive
+        # the feed drops stops it is past; read the previous JSON back so their last times (and restarts) survive
         prevs = await self.redis.mget([live_layout.trip(trip["key"]) for trip in res.trips]) if res.trips else []
         pipe = self.redis.pipeline(transaction=True)
         for trip, prev in zip(res.trips, prevs, strict=True):
-            merged = merge_passed(json.loads(prev) if prev else None, trip)
+            merged = merge_stops(json.loads(prev) if prev else None, trip)
             pipe.set(live_layout.trip(trip["key"]), _dumps(merged), ex=self.ttls.trip)
         # FULL_DATASET: trips missing from this update are gone
         stale = self._trip_keys.get(feed_id, set()) - current

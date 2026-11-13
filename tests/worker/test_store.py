@@ -59,14 +59,11 @@ async def test_trips_mirror_the_latest_update(redis_url):
         "rt:trip:kmk_t:b:20261025",
     ]
     # trip b left the tram feed; the bus feed is untouched
-    # trip a passed pa (the feed dropped it): kept as passed with its last time
+    # trip a passed pa (the feed dropped it): kept with its last time
     await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:a:20261025", (2, "pb", 3))]))
     assert sorted(await r.keys("rt:trip:*")) == ["rt:trip:kmk_a:a:20261025", "rt:trip:kmk_t:a:20261025"]
     stops = json.loads(await r.get("rt:trip:kmk_t:a:20261025"))["stops"]
-    assert [(s["public_stop_id"], s["passed"], s["predicted_departure"]) for s in stops] == [
-        ("pa", True, 1),
-        ("pb", False, 3),
-    ]
+    assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3)]
     assert await r.keys("rt:stop:*") == []  # no derived departure index
     await r.aclose()
 

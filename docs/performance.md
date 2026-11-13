@@ -88,3 +88,52 @@ The current pandas import takes 33.6 s for kmk_a (macOS, dev Postgres).
 - **Freshness:** API responses never older than Redis (live cache follows `realtime:updated`); worker event-loop lag
   ≤ 50 ms, also during trip-index reloads.
 - **Memory:** worker main process ≤ 200 MB, no import child kept between imports, import peak ≤ 150 MB.
+
+## After the work on `perf-memory` (same setup, 2026-11-13 evening)
+
+### API (server time p50 / p95 ms, requests per second, 503s)
+
+| Scenario | 1 process | 2 processes | 4 processes |
+|---|---|---|---|
+| Boards, uncached | 294 / 347, 105 rps, **0** (was 5 rps, 68 × 503) | 200 / 266, 155 rps, **0** | 209 / 325, 140 rps, **0** (was 92 rps, 18 × 503) |
+| Boards, cached | 1.5 / 37, 268 rps, **0** (was 31 × 503) | 1.5 / 7–35, 311–331 rps, **0** | 1.5 / 8–9, 300–317 rps, **0** (was 62 ms p95, 5 × 503) |
+| Vehicles (city bbox) | 135 / 184 | 7.1 / 17 (was 63 / 161) | 6.9 / 14 (was 15 / 50) |
+| Trip live, cached | 0.9 / 2.8 | 0.9 / 2.3 | 0.9 / 2.1 |
+| Stop search, cached | 1.1 / 2.5 | 1.2 / 2.7 | 1.2 / 2.5 |
+
+- **One uncached board: 22 ms** (82 ms before), measured sequentially for Rondo Grunwaldzkie. The timetable query
+  takes 2.3 ms (49 ms before) and returns identical rows for all 180 boards compared. Most of the rest is reading
+  ~365 trips' full JSON from Redis (~11 ms). Under load, uncached boards stop scaling at ~150 rps at any process
+  count, which points at Redis bandwidth (~1.8 MB per board): the per-stop prediction layout is the next step if
+  that's ever needed.
+- One city vehicle list costs 11 instead of 14 µs per vehicle; most of what remains is the Redis round trip through
+  Docker Desktop's VM network and building ~580 response models.
+- Live responses are never older than Redis now (cached per realtime generation, CACHE_TTL_LIVE only bounds time).
+- `API_WORKERS` stays 4: with 2, the p95 of cached boards and vehicles was 23–270% higher at 32 concurrent clients,
+  though within the targets. 2 would save ~155 MB.
+
+### Worker and memory
+
+| | Before | After |
+|---|---|---|
+| Worker process, after 30+ min | 350 MB | 113 MB (macOS) / ~170 MB (Linux, estimated from imports) |
+| Import process, kmk_a (Linux) | ~970 MB peak, ~800 MB kept until the next job | 84 MB peak, exits after each job |
+| OSM refresh (Linux) | 607 MB peak | 156 MB peak |
+| API, 4 processes + supervisor | 341 MB | 395 MB (cached run; uncached-run baseline wasn't recorded) |
+| Worker image | 953 MB | 343 MB |
+| kmk_a trip index | 85,907 trips | 26,721 trips |
+| Event-loop lag (worst per 5 min) | 77–100 ms, 230 ms at startup | 35–77 ms |
+
+- An import of kmk_a takes ~10% longer (two CSV passes in Python instead of pandas; ~4 s more for core.departure).
+- Realtime freshness is unchanged, as expected: 6–7 s for buses arises at ZTP before we fetch the file.
+
+### Targets
+
+| Target | Result |
+|---|---|
+| No 503s, 32 clients, 1 and 4 processes | ✅ none |
+| Uncached board ≤ 25 ms sequentially; server p95 ≤ 100 ms with 4 processes under load | ✅ 22 ms; ❌ 325 ms p95 at 32 concurrent uncached boards (queueing; cached p95 9 ms) |
+| Vehicles server p95 ≤ 50 ms with 2 processes | ✅ 17 ms |
+| API responses never older than Redis | ✅ |
+| Event-loop lag ≤ 50 ms, also during reloads | ❌ 35–77 ms (processing kmk_a's trip updates on the loop); reloads no longer stall polling |
+| Worker process ≤ 200 MB, no import process kept, import peak ≤ 150 MB | ✅ |

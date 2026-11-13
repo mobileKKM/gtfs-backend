@@ -201,7 +201,8 @@ async def test_stops_on_map_by_mode(api, kind):
     everything, tram, bus = await ids(), await ids("tram"), await ids("bus")
     assert tram and bus and tram < everything and bus < everything
     assert await ids("tram,bus") == tram | bus
-    assert await ids("nonexistent") == set()
+    r = await api.get(f"/stops?bbox={CITY_BBOX}&kind={kind}&modes=nonexistent")
+    assert r.status_code == 422 and r.json()["error"]["code"] == "invalid_input"
 
 
 async def test_stop_search(api, sql):
@@ -736,7 +737,7 @@ async def test_openapi_lists_every_endpoint(api):
         "/api/v1/vehicles/{vehicle_key}/trip",
         "/api/v1/stops",
         "/api/v1/stops/search",
-        "/api/v1/stops/{key}/departures",
+        "/api/v1/stops/{stop_key}/departures",
         "/api/v1/trips/{trip_key}",
         "/api/v1/trips/{trip_key}/live",
         "/api/v1/routes/{route_key}/shapes",

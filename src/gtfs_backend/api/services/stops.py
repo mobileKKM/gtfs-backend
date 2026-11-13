@@ -204,7 +204,7 @@ async def group_info(ctx: Context, conn: AsyncConnection, groups: list[Stop]) ->
 async def served_routes(conn: AsyncConnection, catalog: Catalog, stops: list[str]) -> set[tuple[str, str]]:
     """(feed_version_id, route_id) of the routes departing from these stops in today's timetable versions, on any day
     (weekend routes too)."""
-    return {(fv, route) for _, _, _, fv, route, _, _ in await _direction_rows(conn, catalog, stops)}
+    return {(fv, route) for _, _, _, _, fv, route, _, _ in await _direction_rows(conn, catalog, stops)}
 
 
 # ------------------------------------------------------------------------------------------------- endpoints

@@ -79,6 +79,7 @@ async def test_meta_tracks_changes_unchanged_polls_and_failures(monkeypatch):
     assert meta["ok"] is True and meta["started_at"]
     assert meta["trips"] == 1 and meta["bytes"] == 1234 and meta["median_delay_s"] == 60
     assert meta["fetch_attempts"] == 2
+    assert meta["lag_s"] >= 0  # the fixture's feed is from 2026-10-25, so it is old
     for key in ("poll_seconds", "poll_seconds_max", "fetch_seconds", "index_seconds", "process_seconds", "write_seconds"):
         assert meta[key] >= 0
     assert store.published == 1 and task.etag == '"v1"'

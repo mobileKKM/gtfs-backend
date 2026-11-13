@@ -18,6 +18,7 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from gtfs_backend import procmem
 from gtfs_backend.logs import log
 from gtfs_backend.worker.static import derive, integrity, stops, versions
 from gtfs_backend.worker.static.partitions import FeedVersion, attach_version_partition, create_version_partition
@@ -216,13 +217,13 @@ def import_zip(
                 retired = []
 
         seconds = round(time.monotonic() - started, 1)
-        bound.info("import_ready", seconds=seconds, retired=retired)
+        bound.info("import_ready", seconds=seconds, retired=retired, peak_mb=procmem.peak_mb())
         return ImportResult(v, feed_id, number, "ready", row_counts, warnings, retired=retired, seconds=seconds)
 
     except Exception as exc:  # noqa: BLE001 - every failure is recorded on the version
         if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
             conn.rollback()
         error = f"{type(exc).__name__}: {exc}"
-        bound.error("import_failed", error=error)
+        bound.error("import_failed", error=error, peak_mb=procmem.peak_mb())
         fv = _record_failure(conn, feed_id, meta, error[:5000], warnings)
         return ImportResult(*fv, "failed", warnings=warnings, error=error, seconds=round(time.monotonic() - started, 1))

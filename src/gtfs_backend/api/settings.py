@@ -20,6 +20,8 @@ class ApiSettings(Settings):
 
     catalog_refresh_interval: float = Field(default=300, gt=0)  # also reloaded on `static:updated` and day change
     static_listener_retry_delay: float = Field(default=5, gt=0)
+    # every this often each process logs `api_timing` per route and `api_stats` (memory)
+    stats_log_interval: float = Field(default=300, gt=0)
 
     # Responses shared by all API processes through Redis (api/cache.py), also sent as Cache-Control max-age where
     # the response is public; 0 turns the shared cache off.

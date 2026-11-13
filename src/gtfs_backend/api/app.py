@@ -11,12 +11,13 @@ from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from redis.asyncio import BlockingConnectionPool, Redis
 
-from gtfs_backend import live_layout
+from gtfs_backend import live_layout, procmem
 from gtfs_backend.api import errors
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog, Clock
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
 from gtfs_backend.api.settings import ApiSettings, get_api_settings
+from gtfs_backend.api.timing import TimingMiddleware, Timings
 from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
@@ -36,6 +37,15 @@ async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: fl
         except Exception as exc:  # noqa: BLE001
             log.warning("static_updates_listener_failed", error=str(exc))
             await asyncio.sleep(retry_delay)
+
+
+async def _report_stats(timings: Timings, interval: float) -> None:
+    """Every `interval`: this process's request times per route (`api_timing`) and its memory (`api_stats`)."""
+    while True:
+        await asyncio.sleep(interval)
+        for r in timings.take():
+            log.info("api_timing", route=r.route, n=r.n, p50_ms=r.p50_ms, p95_ms=r.p95_ms, max_ms=r.max_ms, hit_rate=r.hit_rate)
+        log.info("api_stats", rss_mb=procmem.rss_mb())
 
 
 DESCRIPTION = """Read-only API behind the mobileKKM map: live vehicles, trip details, stop search and departures for
@@ -77,12 +87,14 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             log.warning("catalog_warmup_failed", error=str(exc))
         app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings)
         listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
+        reporter = asyncio.create_task(_report_stats(timings, settings.stats_log_interval))
         try:
             yield
         finally:
-            listener.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await listener
+            for task in (listener, reporter):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await redis.aclose()
             await pool.close()
 
@@ -96,6 +108,9 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         openapi_url="/api/openapi.json",
     )
     app.add_middleware(GZipMiddleware, minimum_size=1000)
+    timings = Timings()
+    app.state.timings = timings
+    app.add_middleware(TimingMiddleware, timings=timings)  # added last: outermost, so it times compression too
     errors.install(app)
 
     for module in (vehicles, stops, trips, routes, alerts, health):

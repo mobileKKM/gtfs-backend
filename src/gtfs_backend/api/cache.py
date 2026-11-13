@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from redis.exceptions import RedisError
 
 from gtfs_backend.api.context import Context
+from gtfs_backend.api.timing import CACHE_STATE
 from gtfs_backend.logs import log
 
 NO_STORE = "no-store"
@@ -126,6 +127,7 @@ async def cached(
         return json_response(request, await compute(), cache_control)
     key = cache_key(request, ctx.catalog.fingerprint)
     hit = await _get(ctx, key)
+    setattr(request.state, CACHE_STATE, "miss" if hit is None else "hit")
     if hit is None:
         task = ctx.inflight.get(key)
         if task is None:

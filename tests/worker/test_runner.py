@@ -64,6 +64,7 @@ async def test_retirement_waits_for_a_running_import(monkeypatch):
 class _Task:
     def __init__(self, name, last_cycle):
         self.name, self.last_cycle = name, last_cycle
+        self.meta: dict = {}
 
 
 async def test_heartbeat_is_touched_while_polling_works_and_a_stuck_task_stops_it(tmp_path, monkeypatch):
@@ -178,3 +179,24 @@ async def test_osm_loop_gives_up_on_the_first_fetch_after_a_few_tries_and_lets_t
 async def test_osm_is_not_used_when_refreshing_is_off_or_nobody_shares_stops(tmp_path):
     off = _worker(osm_refresh_interval=0)
     assert not off.uses_osm and off.osm_ready.is_set()
+
+
+async def test_loop_lag_shows_a_blocked_loop():
+    lag = runner.LoopLag()
+    task = runner.asyncio.create_task(lag.run())
+    await runner.asyncio.sleep(0.15)
+    time.sleep(0.3)  # something blocks the event loop
+    await runner.asyncio.sleep(0.15)
+    task.cancel()
+    worst = lag.take()
+    assert worst >= 150
+    assert lag.take() == 0  # reset by take()
+
+
+def test_stats_put_the_loop_lag_into_every_realtime_meta():
+    worker = _worker()
+
+    worker.realtime_tasks = [_Task("a", 0), _Task("b", 0)]
+    worker.loop_lag.worst_ms = 42.0
+    worker.record_stats(1)
+    assert [t.meta["loop_lag_ms"] for t in worker.realtime_tasks] == [42.0, 42.0]

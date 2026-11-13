@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
 
-from gtfs_backend import live_layout
+from gtfs_backend import live_layout, procmem
 from gtfs_backend.db import async_pool, connect
 from gtfs_backend.feeds import FeedConfig, load_feeds
 from gtfs_backend.logs import log
@@ -37,6 +37,28 @@ MAINTENANCE_CHECK_INTERVAL_S = 60
 OSM_CHECK_INTERVAL_S = 3600  # how often the OSM file's age is looked at
 OSM_FIRST_ATTEMPTS = 3  # the first fetch is tried this often before feeds that need the file start without it
 OSM_RETRY_DELAY_S = 30
+LOOP_LAG_INTERVAL_S = 0.1
+STATS_EVERY_BEATS = 10  # worker_stats is logged every 10 heartbeats (5 minutes)
+
+
+class LoopLag:
+    """How late the event loop wakes up. Every feed's polls share the loop, so anything that blocks it (building a trip
+    index, processing a big update) delays all of them; this shows by how much."""
+
+    def __init__(self) -> None:
+        self.worst_ms = 0.0
+
+    async def run(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            started = loop.time()
+            await asyncio.sleep(LOOP_LAG_INTERVAL_S)
+            self.worst_ms = max(self.worst_ms, (loop.time() - started - LOOP_LAG_INTERVAL_S) * 1000)
+
+    def take(self) -> float:
+        """The worst lag since the last call."""
+        worst, self.worst_ms = self.worst_ms, 0.0
+        return round(worst, 1)
 
 
 def _import_executor() -> ProcessPoolExecutor:
@@ -60,6 +82,8 @@ class Worker:
         if not self.uses_osm:
             self.osm_ready.set()
         self.realtime_tasks: list[RealtimeTask] = []
+        self.loop_lag = LoopLag()
+        self._worst_lag = 0.0  # since the last worker_stats line
         self.exit_code = 0
 
     async def run(self) -> int:
@@ -133,6 +157,7 @@ class Worker:
             tasks.append(asyncio.create_task(self._osm_loop(), name="osm"))
         tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
         tasks.append(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
+        tasks.append(asyncio.create_task(self.loop_lag.run(), name="loop_lag"))
         log.info("worker_started", tasks=[t.get_name() for t in tasks])
         return tasks
 
@@ -272,6 +297,7 @@ class Worker:
         """Touch HEARTBEAT_FILE while the realtime tasks keep polling (the Docker healthcheck reads its age). A stuck
         task ends this loop, which stops the worker; Docker then restarts it."""
         s = self.settings
+        beats = 0
         while True:
             if stuck := self.stuck_tasks():
                 log.error("worker_stuck", tasks=stuck, seconds=s.watchdog_timeout)
@@ -280,4 +306,20 @@ class Worker:
                 HEARTBEAT_FILE.touch()
             except OSError as exc:
                 log.warning("heartbeat_failed", path=str(HEARTBEAT_FILE), error=str(exc))
+            try:  # stats must never stop the heartbeat (that would stop the worker)
+                self.record_stats(beats)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("worker_stats_failed", error=f"{type(exc).__name__}: {exc}")
+            beats += 1
             await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+
+    def record_stats(self, beat: int) -> None:
+        """Every heartbeat: the loop's worst lag goes into each realtime file's meta (rt:meta). Every STATS_EVERY_BEATS:
+        a worker_stats log line with memory and the worst lag since the last one."""
+        lag = self.loop_lag.take()
+        self._worst_lag = max(self._worst_lag, lag)
+        for task in self.realtime_tasks:
+            task.meta["loop_lag_ms"] = lag
+        if beat % STATS_EVERY_BEATS == 0:
+            log.info("worker_stats", rss_mb=procmem.rss_mb(), loop_lag_max_ms=self._worst_lag)
+            self._worst_lag = 0.0

@@ -218,6 +218,8 @@ class RealtimeTask:
             process_seconds=_secs(t3 - t2),
             write_seconds=_secs(t4 - t3),
             feed_timestamp=ts,
+            # how old the feed's data was when it was stored (its header timestamp to our Redis write)
+            lag_s=round(time.time() - ts, 1) if ts else None,
             bytes=fetched.size,
             entities=res.entities,
             vehicles=len(res.vehicles),

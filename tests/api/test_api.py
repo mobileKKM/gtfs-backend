@@ -452,6 +452,27 @@ async def test_departure_board_etag(api, sql):
     assert again.status_code == 304 and again.content == b""
 
 
+
+async def test_server_timing_and_per_route_stats(loaded, sql):
+    """Every response says how long the server took; stats are kept per route template, never per URL."""
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=60)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        app.state.timings.take()  # whatever the warm-up recorded
+        url = f"/stops/{group_id(sql, '802')}/departures"
+        first, second = await c.get(url), await c.get(url)
+        uncached = await c.get(f"/vehicles?bbox={CITY_BBOX}")
+    assert first.headers["server-timing"].startswith("app;dur=") and first.headers["server-timing"].endswith("cache;desc=miss")
+    assert second.headers["server-timing"].endswith("cache;desc=hit")
+    assert "cache;desc" not in uncached.headers["server-timing"]
+    stats = {r.route: r for r in app.state.timings.take()}
+    board = stats["/api/v1/stops/{stop_key}/departures"]
+    assert board.n == 2 and board.hit_rate == 0.5 and 0 < board.p50_ms <= board.max_ms
+    assert stats["/api/v1/vehicles"].hit_rate is None
+    assert all("802" not in route and "bbox" not in route for route in stats)
+    assert app.state.timings.take() == []  # reset
+
+
 # ------------------------------------------------------------------------------------------------- trips + shapes
 
 

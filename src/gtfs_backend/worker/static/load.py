@@ -8,11 +8,12 @@ why; the versions already serving keep serving.
 
 from __future__ import annotations
 
+import csv
 import io
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
-import pandas as pd
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -21,32 +22,38 @@ from gtfs_backend import procmem
 from gtfs_backend.logs import log
 from gtfs_backend.worker.static import derive, integrity, stops, versions
 from gtfs_backend.worker.static.partitions import FeedVersion, attach_version_partition, create_version_partition
-from gtfs_backend.worker.static.read import GtfsData, read_gtfs
 from gtfs_backend.worker.static.results import ImportResult, SourceMeta
+from gtfs_backend.worker.static.source import GtfsSource, Row
 from gtfs_backend.worker.static.spec import TABLES
-from gtfs_backend.worker.static.validate import validate
+from gtfs_backend.worker.static.validate import KEYS_IN_DB, duplicate_keys_error, validate
 
-COPY_CHUNK_ROWS = 200_000
+COPY_BUFFER_CHARS = 1 << 20  # COPY data is sent in pieces of about this size
 
 
 class ImportFailed(Exception):
     pass
 
 
-def _copy_frame(
-    cur: psycopg.Cursor, part: sql.Identifier, columns: list[str], df: pd.DataFrame, v: str, chunk_rows: int = COPY_CHUNK_ROWS
-) -> None:
+def _copy_rows(cur: psycopg.Cursor, part: sql.Identifier, columns: list[str], rows: Iterable[Row], v: str) -> int:
+    """COPY the rows into the partition, streamed; returns how many. None is an unquoted empty field, which COPY reads
+    as NULL (an empty string can't occur: it reads as NULL)."""
     stmt = sql.SQL("COPY {part} (feed_version_id, {cols}) FROM STDIN (FORMAT csv)").format(
         part=part, cols=sql.SQL(", ").join(map(sql.Identifier, columns))
     )
+    count = 0
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
     with cur.copy(stmt) as cp:
-        for start in range(0, len(df), chunk_rows):
-            chunk = df.iloc[start : start + chunk_rows]
-            buf = io.StringIO()
-            # NA -> unquoted empty field -> NULL. Empty strings can't occur (read as NA).
-            chunk.insert(0, "feed_version_id", v)
-            chunk.to_csv(buf, index=False, header=False)
+        for row in rows:
+            writer.writerow([v, *row])
+            count += 1
+            if buf.tell() >= COPY_BUFFER_CHARS:
+                cp.write(buf.getvalue())
+                buf.seek(0)
+                buf.truncate()
+        if buf.tell():
             cp.write(buf.getvalue())
+    return count
 
 
 def _version_number(cur: psycopg.Cursor, feed_id: str, sha256: str) -> int:
@@ -83,12 +90,10 @@ def _record_failure(conn: psycopg.Connection, feed_id: str, meta: SourceMeta, er
         return FeedVersion(cur.fetchone()[0], feed_id, version)
 
 
-def _source_feed_version(data: GtfsData) -> str | None:
-    info = data.get("feed_info")
-    if info is None or info.empty or "feed_version" not in info:
-        return None
-    value = info["feed_version"].iloc[0]
-    return None if pd.isna(value) else str(value)
+def _source_feed_version(source: GtfsSource) -> str | None:
+    """feed_info.txt's feed_version (of its first row)."""
+    info = source.records("feed_info")
+    return info[0]["feed_version"] if info else None
 
 
 def import_zip(
@@ -106,14 +111,14 @@ def import_zip(
     warnings: list[str] = []
 
     try:
-        data = read_gtfs(zip_path)
-        result = validate(data)
+        source = GtfsSource(zip_path)
+        result = validate(source)
         warnings = result.warnings
         for w in warnings:
             bound.warning("gtfs_validation_warning", msg=w)
         if not result.ok:
             raise ImportFailed("validation failed: " + "; ".join(result.errors[:10]))
-        tz = data.tables["agency"]["agency_timezone"].dropna().iloc[0]
+        tz = next(a["agency_timezone"] for a in source.records("agency") if a["agency_timezone"] is not None)
 
         with conn.transaction():
             cur = conn.cursor()
@@ -130,28 +135,39 @@ def import_zip(
                     source_feed_version = excluded.source_feed_version
                 RETURNING id
                 """,
-                (feed_id, number, meta.sha256, meta.etag, meta.last_modified, meta.archive_path, tz, _source_feed_version(data)),
+                (
+                    feed_id,
+                    number,
+                    meta.sha256,
+                    meta.etag,
+                    meta.last_modified,
+                    meta.archive_path,
+                    tz,
+                    _source_feed_version(source),
+                ),
             )
             fv = FeedVersion(cur.fetchone()[0], feed_id, number)
             v = fv.id
             bound = bound.bind(version=number, feed_version_id=v)
 
             row_counts: dict[str, int] = {}
-            for name, df in data.tables.items():
+            for name in source.tables:
                 part = create_version_partition(cur, name, fv)
-                _copy_frame(cur, part, TABLES[name].column_names, df, v)
+                row_counts[name] = _copy_rows(cur, part, TABLES[name].column_names, source.rows(name), v)
+                # the big tables' primary keys are checked here rather than in memory (validate.KEYS_IN_DB)
+                if name in KEYS_IN_DB and (dup := duplicate_keys_error(cur, part, name)):
+                    raise ImportFailed("validation failed: " + dup)
                 attach_version_partition(cur, name, part, fv)
                 # fresh partitions have no statistics until autovacuum gets to them; the derive and stop matching
                 # queries below would be planned blind (nested loops over millions of stop_times)
                 cur.execute(sql.SQL("ANALYZE {}").format(part))
-                row_counts[name] = len(df)
             # tables missing from the zip still get an empty partition, so every version has the full set
             for name in TABLES:
-                if name not in data.tables:
+                if name not in source.tables:
                     attach_version_partition(cur, name, create_version_partition(cur, name, fv), fv)
             bound.info("gtfs_loaded", rows=row_counts)
 
-            integrity.check_version(conn, fv, zip_path, list(data.tables))
+            integrity.check_version(conn, fv, zip_path, source.tables)
             bound.info("integrity_ok")
 
             services, first, last = derive.build_service_dates(conn, v)
@@ -182,8 +198,8 @@ def import_zip(
                     Jsonb(
                         {
                             **row_counts,
-                            "unknown_columns": data.unknown_columns,
-                            "unknown_files": data.unknown_files,
+                            "unknown_columns": source.unknown_columns,
+                            "unknown_files": source.unknown_files,
                             "stop_matching": stop_stats["methods"],
                         }
                     ),

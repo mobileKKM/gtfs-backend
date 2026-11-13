@@ -1,15 +1,23 @@
-"""Structural validation of a GTFS feed before it is loaded (gtfs-kit 13 has no validator).
+"""Structural validation of a GTFS feed before it is loaded (gtfs-kit 13 has no validator, and isn't used any more).
 
 Errors fail the import (the current versions stay active); warnings are logged and stored on the version.
+
+The feed is read row by row (static/source.py), one pass per table; what is kept between rows is small: the ids that
+other tables reference, and per-trip stop counts. Duplicate primary keys of the two big tables (stop_times, shapes)
+are found in Postgres after their COPY (duplicate_keys_error), which needs no memory here.
 """
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 
-import pandas as pd
+import psycopg
+from psycopg import sql
 
-from gtfs_backend.worker.static.read import GtfsData
+from gtfs_backend.worker.static.source import GtfsSource
 from gtfs_backend.worker.static.spec import TABLES, Kind
 
 TIME_RE = r"^\d{1,3}:[0-5]\d:[0-5]\d$"
@@ -18,6 +26,11 @@ INT_RE = r"^-?\d+$"
 FLOAT_RE = r"^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$"
 SMALLINT_MAX = 32767
 INT_MAX = 2147483647
+SAMPLE = 5
+# primary keys checked in Postgres after COPY instead of in memory
+KEYS_IN_DB = frozenset({"stop_times", "shapes"})
+
+_PATTERNS = {Kind.TIME: TIME_RE, Kind.DATE: DATE_RE, Kind.INT: INT_RE, Kind.SMALLINT: INT_RE, Kind.FLOAT: FLOAT_RE}
 
 
 @dataclass
@@ -30,113 +43,195 @@ class ValidationResult:
         return not self.errors
 
 
-def _sample(values: pd.Series, n: int = 5) -> list[str]:
-    return [str(v) for v in values.head(n).tolist()]
+def _valid_date(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y%m%d")
+    except ValueError:
+        return False
+    return True
 
 
-def _check_formats(name: str, df: pd.DataFrame, res: ValidationResult) -> None:
-    table = TABLES[name]
-    for col in table.columns:
-        s = df[col.name]
-        present = s.dropna()
-        if col.required and s.isna().any():
-            res.errors.append(f"{name}.{col.name}: {int(s.isna().sum())} rows without a required value")
-        if present.empty or col.kind == Kind.TEXT:
-            continue
-        pattern = {Kind.TIME: TIME_RE, Kind.DATE: DATE_RE, Kind.INT: INT_RE, Kind.SMALLINT: INT_RE, Kind.FLOAT: FLOAT_RE}[
-            col.kind
-        ]
-        bad = present[~present.str.strip().str.match(pattern)]
-        if not bad.empty:
-            res.errors.append(
-                f"{name}.{col.name}: {len(bad)} values are not a valid {col.kind.name.lower()}, e.g. {_sample(bad)}"
-            )
-            continue
-        if col.kind == Kind.DATE:
-            parsed = pd.to_datetime(present, format="%Y%m%d", errors="coerce")
-            if parsed.isna().any():
-                res.errors.append(f"{name}.{col.name}: invalid calendar dates, e.g. {_sample(present[parsed.isna()])}")
-        elif col.kind in (Kind.INT, Kind.SMALLINT):
-            limit = SMALLINT_MAX if col.kind == Kind.SMALLINT else INT_MAX
-            nums = pd.to_numeric(present, errors="coerce")
-            if (nums.abs() > limit).any():
-                res.errors.append(f"{name}.{col.name}: values out of range for {col.kind.value}")
+class _Column:
+    """One column's checks, fed value by value."""
+
+    def __init__(self, table: str, column) -> None:
+        self.label = f"{table}.{column.name}"
+        self.column = column
+        self.missing = 0
+        self.pattern = None if column.kind == Kind.TEXT else re.compile(_PATTERNS[column.kind])
+        self.bad: list[str] = []
+        self.bad_count = 0
+        self.bad_dates: list[str] = []
+        self.out_of_range = False
+        self.limit = SMALLINT_MAX if column.kind == Kind.SMALLINT else INT_MAX
+
+    def feed(self, value: str | None) -> None:
+        if value is None:
+            self.missing += 1
+            return
+        if self.pattern is None:
+            return
+        if not self.pattern.match(value.strip()):
+            self.bad_count += 1
+            if len(self.bad) < SAMPLE:
+                self.bad.append(value)
+        elif self.column.kind == Kind.DATE:
+            if len(self.bad_dates) < SAMPLE and not _valid_date(value):
+                self.bad_dates.append(value)
+        elif self.column.kind in (Kind.INT, Kind.SMALLINT) and not self.out_of_range:
+            self.out_of_range = abs(int(value)) > self.limit
+
+    def errors(self) -> list[str]:
+        out = []
+        if self.column.required and self.missing:
+            out.append(f"{self.label}: {self.missing} rows without a required value")
+        if self.bad_count:
+            out.append(f"{self.label}: {self.bad_count} values are not a valid {self.column.kind.name.lower()}, e.g. {self.bad}")
+        elif self.bad_dates:
+            out.append(f"{self.label}: invalid calendar dates, e.g. {self.bad_dates}")
+        elif self.out_of_range:
+            out.append(f"{self.label}: values out of range for {self.column.kind.value}")
+        return out
 
 
-def _check_unique(name: str, df: pd.DataFrame, res: ValidationResult) -> None:
-    pk = list(TABLES[name].primary_key)
-    if not pk or df[pk].isna().any().any():
-        return
-    dup = df.duplicated(subset=pk, keep=False)
-    if dup.any():
-        sample = df.loc[dup, pk].head(3).to_dict("records")
-        res.errors.append(f"{name}: {int(dup.sum())} rows share a primary key ({', '.join(pk)}), e.g. {sample}")
+def _duplicates_message(table: str, pk: list[str], count: int, sample: list[dict]) -> str:
+    return f"{table}: {count} rows share a primary key ({', '.join(pk)}), e.g. {sample}"
 
 
-def _check_ref(
-    child: str, col: str, parent_values: set, parent: str, data: GtfsData, res: ValidationResult, *, error: bool = True
-) -> None:
-    df = data.get(child)
-    if df is None:
-        return
-    values = df[col].dropna()
-    missing = values[~values.isin(parent_values)]
-    if not missing.empty:
-        msg = (
-            f"{child}.{col}: {len(missing)} rows reference unknown {parent} ({missing.nunique()} distinct), "
-            f"e.g. {_sample(missing.drop_duplicates())}"
+def _duplicate_keys(table: str, pk_rows: list[tuple]) -> str | None:
+    """The duplicate-key error of a small table, from its key tuples in file order (None: all unique)."""
+    counts = Counter(pk_rows)
+    if len(counts) == len(pk_rows):
+        return None
+    pk = list(TABLES[table].primary_key)
+    dup = [k for k in pk_rows if counts[k] > 1]
+    return _duplicates_message(table, pk, len(dup), [dict(zip(pk, k, strict=True)) for k in dup[:3]])
+
+
+def duplicate_keys_error(cur: psycopg.Cursor, part: sql.Identifier, table: str) -> str | None:
+    """The duplicate-key error of a big table (KEYS_IN_DB), from its freshly filled partition: rows in file order are
+    in physical (ctid) order there. Values are shown as stored."""
+    pk = list(TABLES[table].primary_key)
+    cols = sql.SQL(", ").join(map(sql.Identifier, pk))
+    cur.execute(
+        sql.SQL("SELECT count(*), sum(n) FROM (SELECT count(*) AS n FROM {part} GROUP BY {cols} HAVING count(*) > 1) d").format(
+            part=part, cols=cols
         )
-        (res.errors if error else res.warnings).append(msg)
+    )
+    groups, rows = cur.fetchone()
+    if not groups:
+        return None
+    text_cols = sql.SQL(", ").join(sql.SQL("{}::text").format(sql.Identifier(c)) for c in pk)
+    cur.execute(
+        sql.SQL(
+            "SELECT {text_cols} FROM {part} WHERE ({cols}) IN "
+            "(SELECT {cols} FROM {part} GROUP BY {cols} HAVING count(*) > 1) ORDER BY ctid LIMIT 3"
+        ).format(text_cols=text_cols, part=part, cols=cols)
+    )
+    return _duplicates_message(table, pk, int(rows), [dict(zip(pk, r, strict=True)) for r in cur.fetchall()])
 
 
-def validate(data: GtfsData) -> ValidationResult:
+def _ref_message(child: str, col: str, parent: str, values: Counter[str], ids: set[str]) -> str | None:
+    """`values`: how often each value occurs in the child column, in order of first appearance (distinct values only,
+    so stop_times' trip ids cost their ~100k ids, not ~2M rows)."""
+    missing = [v for v in values if v not in ids]
+    if not missing:
+        return None
+    return (
+        f"{child}.{col}: {sum(values[v] for v in missing)} rows reference unknown {parent} ({len(missing)} distinct), "
+        f"e.g. {missing[:SAMPLE]}"
+    )
+
+
+def validate(source: GtfsSource) -> ValidationResult:
     res = ValidationResult()
+    present = set(source.tables)
 
     for name, table in TABLES.items():
-        if table.required_file and name not in data.tables:
+        if table.required_file and name not in present:
             res.errors.append(f"missing required file {table.filename}")
-    if "calendar" not in data.tables and "calendar_dates" not in data.tables:
+    if "calendar" not in present and "calendar_dates" not in present:
         res.errors.append("missing calendar.txt and calendar_dates.txt (one is required)")
     if res.errors:
         return res
 
-    for name, cols in data.unknown_columns.items():
+    for name, cols in source.unknown_columns.items():
         res.warnings.append(f"{name}: columns not in the GTFS spec are not stored: {cols}")
-    for name in data.unknown_files:
+    for name in source.unknown_files:
         res.warnings.append(f"file not in the spec is not stored: {name}")
 
-    for name, df in data.tables.items():
-        _check_formats(name, df, res)
-        _check_unique(name, df, res)
+    ids: dict[str, set[str]] = {"routes": set(), "trips": set(), "stops": set(), "services": set()}
+    ids_of = {"routes": "route_id", "trips": "trip_id", "stops": "stop_id", "shapes": "shape_id", "blocks": "block_id"}
+    # value -> rows, in order of first appearance (Counter keeps insertion order)
+    trip_refs: dict[str, Counter[str]] = {c: Counter() for c in ("route_id", "service_id", "shape_id", "block_id")}
+    stop_time_refs: dict[str, Counter[str]] = {c: Counter() for c in ("trip_id", "stop_id")}
+    timezones: list[str] = []
 
-    routes = set(data.tables["routes"]["route_id"].dropna())
-    trips = set(data.tables["trips"]["trip_id"].dropna())
-    stops = set(data.tables["stops"]["stop_id"].dropna())
-    services: set = set()
-    for name in ("calendar", "calendar_dates"):
-        if name in data.tables:
-            services |= set(data.tables[name]["service_id"].dropna())
+    for name in source.tables:  # spec order: agency, stops, routes, trips, stop_times, ... (parents of stop_times first)
+        table = TABLES[name]
+        cols = table.column_names
+        checks = [_Column(name, c) for c in table.columns]
+        pk_at = [cols.index(c) for c in table.primary_key]
+        pk_rows: list[tuple] | None = [] if table.primary_key and name not in KEYS_IN_DB else None
+        pk_has_null = False
+        id_at = cols.index(ids_of[name]) if name in ids_of else None
+        if name in ids_of and name not in ids:
+            ids[name] = set()
+        service_at = cols.index("service_id") if name in ("calendar", "calendar_dates") else None
+        trip_at = {c: cols.index(c) for c in trip_refs} if name == "trips" else {}
+        st_at = {c: cols.index(c) for c in stop_time_refs} if name == "stop_times" else {}
+        tz_at = cols.index("agency_timezone") if name == "agency" else None
 
-    _check_ref("trips", "route_id", routes, "routes", data, res)
-    _check_ref("trips", "service_id", services, "services", data, res)
-    _check_ref("stop_times", "trip_id", trips, "trips", data, res)
-    _check_ref("stop_times", "stop_id", stops, "stops", data, res)
-    if "shapes" in data.tables:
-        _check_ref("trips", "shape_id", set(data.tables["shapes"]["shape_id"].dropna()), "shapes", data, res, error=False)
-    if "blocks" in data.tables:
-        _check_ref("trips", "block_id", set(data.tables["blocks"]["block_id"].dropna()), "blocks", data, res, error=False)
+        for row in source.rows(name):
+            for check, value in zip(checks, row, strict=True):
+                check.feed(value)
+            if pk_at:
+                key = tuple(row[i] for i in pk_at)
+                if None in key:
+                    pk_has_null = True
+                elif pk_rows is not None:
+                    pk_rows.append(key)
+            if id_at is not None and row[id_at] is not None:
+                ids[name].add(row[id_at])
+            if service_at is not None and row[service_at] is not None:
+                ids["services"].add(row[service_at])
+            for c, i in trip_at.items():
+                if row[i] is not None:
+                    trip_refs[c][row[i]] += 1
+            for c, i in st_at.items():
+                if row[i] is not None:
+                    stop_time_refs[c][row[i]] += 1
+            if tz_at is not None and row[tz_at] is not None:
+                timezones.append(row[tz_at])
 
-    agencies = data.tables["agency"]
-    if agencies["agency_timezone"].dropna().nunique() != 1:
-        res.errors.append(
-            f"agency.txt must have exactly one timezone, found {agencies['agency_timezone'].dropna().unique().tolist()}"
-        )
+        for check in checks:
+            res.errors += check.errors()
+        if pk_rows is not None and not pk_has_null and (dup := _duplicate_keys(name, pk_rows)):
+            res.errors.append(dup)
 
-    counts = data.tables["stop_times"].groupby("trip_id").size()
-    short = counts[counts < 2]
-    if not short.empty:
-        res.warnings.append(f"{len(short)} trips have fewer than 2 stop_times")
-    without = trips - set(counts.index)
+    refs = [
+        ("trips", "route_id", "routes", trip_refs["route_id"], ids["routes"], True),
+        ("trips", "service_id", "services", trip_refs["service_id"], ids["services"], True),
+        ("stop_times", "trip_id", "trips", stop_time_refs["trip_id"], ids["trips"], True),
+        ("stop_times", "stop_id", "stops", stop_time_refs["stop_id"], ids["stops"], True),
+    ]
+    if "shapes" in present:
+        refs.append(("trips", "shape_id", "shapes", trip_refs["shape_id"], ids["shapes"], False))
+    if "blocks" in present:
+        refs.append(("trips", "block_id", "blocks", trip_refs["block_id"], ids["blocks"], False))
+    for child, col, parent, values, parent_ids, error in refs:
+        if msg := _ref_message(child, col, parent, values, parent_ids):
+            (res.errors if error else res.warnings).append(msg)
+
+    distinct_tz = list(dict.fromkeys(timezones))
+    if len(distinct_tz) != 1:
+        res.errors.append(f"agency.txt must have exactly one timezone, found {distinct_tz}")
+
+    stops_per_trip = stop_time_refs["trip_id"]
+    short = sum(1 for n in stops_per_trip.values() if n < 2)
+    if short:
+        res.warnings.append(f"{short} trips have fewer than 2 stop_times")
+    without = ids["trips"] - stops_per_trip.keys()
     if without:
         res.warnings.append(f"{len(without)} trips have no stop_times")
     return res

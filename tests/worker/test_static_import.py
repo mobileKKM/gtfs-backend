@@ -1,6 +1,7 @@
 """Static import against a real Postgres (skipped if not running)."""
 
 import time
+import zipfile
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -298,6 +299,22 @@ def test_invalid_feed_fails_and_keeps_current_version(db, tmp_path):
     assert days == [(good.feed_version_id, 1)]
 
 
+def test_duplicate_stop_times_fail_the_import_from_the_database_check(db, tmp_path):
+    """stop_times' and shapes' keys are checked in Postgres after their COPY (not in memory), with the same message."""
+    path = tiny_feed(tmp_path / "dup.zip", "dup", [date.today().strftime("%Y%m%d")], night_trip=False)
+    with zipfile.ZipFile(path) as zf:
+        files = {n: zf.read(n).decode() for n in zf.namelist()}
+    files["stop_times.txt"] += "T1,06:20:00,06:20:00,S2,2\n"  # a second stop_sequence 2
+    dup = make_zip(tmp_path / "dup2.zip", files)
+    result = import_zip(db, "kmk_t", dup, meta(dup), "ztp", stop_code_pattern=ZTP_STOP_CODES)
+    assert result.status == "failed"
+    assert result.error == (
+        "ImportFailed: validation failed: stop_times: 2 rows share a primary key (trip_id, stop_sequence), "
+        "e.g. [{'trip_id': 'T1', 'stop_sequence': '2'}, {'trip_id': 'T1', 'stop_sequence': '2'}]"
+    )
+    assert db.execute("SELECT to_regclass('gtfs.stop_times__kmk_t__v1')").fetchone()[0] is None  # rolled back
+
+
 def test_integrity_check_catches_changed_values(db, tmp_path, monkeypatch):
     path = tiny_feed(tmp_path / "t.zip", "x", [date.today().strftime("%Y%m%d")], night_trip=True)
     original = integrity.canonical_db
@@ -315,8 +332,8 @@ def test_integrity_check_catches_changed_values(db, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("name", ["GTFS_KRK_A.zip", "GTFS_KRK_M.zip", "GTFS_KRK_T.zip"])
 def test_fixtures_validate_cleanly(name):
-    from gtfs_backend.worker.static.read import read_gtfs
+    from gtfs_backend.worker.static.source import GtfsSource
     from gtfs_backend.worker.static.validate import validate
 
-    res = validate(read_gtfs(STATIC / name))
+    res = validate(GtfsSource(STATIC / name))
     assert res.errors == []

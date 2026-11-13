@@ -23,11 +23,9 @@ api = [
 ]
 worker = [
     "alembic>=1.20.1",
-    "gtfs-kit>=13.0.1",
     "gtfs-realtime-bindings>=3.0.0",
     "httpx>=0.28.1",
     "osmium>=4.3.2",
-    "pyarrow>=26.0.0",
     "sqlalchemy>=2.1.6",
 ]
 

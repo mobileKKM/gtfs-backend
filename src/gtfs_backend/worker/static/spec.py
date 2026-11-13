@@ -39,7 +39,7 @@ class Table:
     required_file: bool = False
     # Extra (derived) columns: name -> SQL definition. Never replace an original column.
     generated: dict[str, str] = field(default_factory=dict)
-    # Non-standard extension tables (not read by gtfs-kit, loaded directly).
+    # Non-standard extension tables (ZTP's blocks.txt): read like the others, but present with only a header too.
     extension: bool = False
 
     @property

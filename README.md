@@ -37,8 +37,8 @@ uv run gtfs-worker rebuild-service-days
 **Production**: `POSTGRES_PASSWORD=... docker compose up -d --build` runs Postgres, Redis, the worker (migrates on
 start) and the API (`API_PORT`, default 8000; `API_WORKERS`, default 4). The API also joins the external
 `nginx_proxy` network (`docker network create nginx_proxy` once), so a proxy there reaches it as `http://api:8000`.
-The Dockerfile has a target per program (`worker`, `api`); the API image lacks the worker's dependencies (pandas,
-gtfs-kit, pyarrow, protobuf). On Apple Silicon set `POSTGIS_IMAGE=imresamu/postgis:17-3.5` (the official image is
+The Dockerfile has a target per program (`worker`, `api`); the API image lacks the worker's dependencies (httpx,
+protobuf, osmium). On Apple Silicon set `POSTGIS_IMAGE=imresamu/postgis:17-3.5` (the official image is
 amd64-only).
 
 Settings come from env vars or `.env`; [`.env.example`](.env.example) lists all with defaults. Realtime timings can

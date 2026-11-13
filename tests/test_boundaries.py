@@ -60,3 +60,13 @@ def test_worker_process_does_not_load_import_dependencies():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
     assert out == "[]"
+
+
+def test_the_import_reads_zips_without_pandas():
+    """Zips are streamed row by row (static/source.py): nothing in the import loads a dataframe library."""
+    code = (
+        "import sys, gtfs_backend.worker.static.load, gtfs_backend.worker.static.fetch; "
+        "print(sorted(m for m in ('pandas', 'gtfs_kit', 'pyarrow', 'numpy') if m in sys.modules))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[]"

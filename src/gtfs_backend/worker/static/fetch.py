@@ -19,7 +19,7 @@ from gtfs_backend.worker.http import fetch_to_file
 from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static import archive
 from gtfs_backend.worker.static.archive import sha256_file, validate_zip
-from gtfs_backend.worker.static.load import ImportResult, SourceMeta
+from gtfs_backend.worker.static.results import ImportResult, SourceMeta
 
 PREVIOUSLY_FAILED = "previously_failed"  # ImportResult.status of a zip that is known to fail
 IMPORT_NICENESS = 10  # added to the import process's nice value (lower CPU priority)

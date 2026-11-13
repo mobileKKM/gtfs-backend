@@ -22,7 +22,8 @@ from gtfs_backend.feeds import FeedConfig, FeedsFile, load_feeds
 from gtfs_backend.logs import setup_logging
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.realtime.store import TTLs
-from gtfs_backend.worker.static.load import SourceMeta, import_zip
+from gtfs_backend.worker.static.load import import_zip
+from gtfs_backend.worker.static.results import SourceMeta
 from gtfs_backend.worker.static.spec import TABLES
 
 ROOT = Path(__file__).parent.parent

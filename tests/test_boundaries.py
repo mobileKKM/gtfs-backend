@@ -49,3 +49,14 @@ def test_api_does_not_load_worker_dependencies():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
     assert out == "[]"
+
+
+def test_worker_process_does_not_load_import_dependencies():
+    """pandas, gtfs-kit, pyarrow and osmium are for the import process only: the worker process (which runs for days)
+    loading them cost ~100 MB."""
+    code = (
+        "import sys, gtfs_backend.worker.runner, gtfs_backend.worker.cli; "
+        "print(sorted(m for m in ('pandas', 'gtfs_kit', 'pyarrow', 'osmium', 'numpy') if m in sys.modules))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
+    assert out == "[]"

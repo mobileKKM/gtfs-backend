@@ -15,7 +15,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import httpx
-import osmium
 
 from gtfs_backend.logs import log
 
@@ -67,23 +66,26 @@ def load_osm_poles(path: Path) -> list[OsmPole]:
         return []
 
 
-class _Poles(osmium.SimpleHandler):
-    def __init__(self) -> None:
-        super().__init__()
-        self.poles: list[OsmPole] = []
-
-    def node(self, n) -> None:
-        if n.location.valid() and (p := make_pole(f"node/{n.id}", n.tags, n.location.lat, n.location.lon)):
-            self.poles.append(p)
-
-    def way(self, w) -> None:  # platforms drawn as areas or lines: their middle node stands for them
-        nodes = [n for n in w.nodes if n.location.valid()]
-        if nodes and (p := make_pole(f"way/{w.id}", w.tags, nodes[len(nodes) // 2].lat, nodes[len(nodes) // 2].lon)):
-            self.poles.append(p)
-
-
 def read_extract(pbf: Path) -> list[OsmPole]:
-    handler = _Poles()
+    """The stop poles in an OSM extract. osmium is imported only here: the worker process never loads it (the extract is
+    read in the import process)."""
+    import osmium
+
+    class Poles(osmium.SimpleHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.poles: list[OsmPole] = []
+
+        def node(self, n) -> None:
+            if n.location.valid() and (p := make_pole(f"node/{n.id}", n.tags, n.location.lat, n.location.lon)):
+                self.poles.append(p)
+
+        def way(self, w) -> None:  # platforms drawn as areas or lines: their middle node stands for them
+            nodes = [n for n in w.nodes if n.location.valid()]
+            if nodes and (p := make_pole(f"way/{w.id}", w.tags, nodes[len(nodes) // 2].lat, nodes[len(nodes) // 2].lon)):
+                self.poles.append(p)
+
+    handler = Poles()
     handler.apply_file(str(pbf), locations=True)
     return handler.poles
 

@@ -35,7 +35,8 @@ def _report(feed_id: str, result) -> int:
 
 def _import_file(settings: WorkerSettings, feed: FeedConfig, path: Path) -> int:
     from gtfs_backend.worker.static import archive
-    from gtfs_backend.worker.static.load import SourceMeta, import_zip
+    from gtfs_backend.worker.static.load import import_zip
+    from gtfs_backend.worker.static.results import SourceMeta
 
     archive.validate_zip(path)
     sha = archive.sha256_file(path)

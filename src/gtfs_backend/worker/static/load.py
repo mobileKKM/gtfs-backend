@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import io
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
@@ -23,6 +22,7 @@ from gtfs_backend.logs import log
 from gtfs_backend.worker.static import derive, integrity, stops, versions
 from gtfs_backend.worker.static.partitions import FeedVersion, attach_version_partition, create_version_partition
 from gtfs_backend.worker.static.read import GtfsData, read_gtfs
+from gtfs_backend.worker.static.results import ImportResult, SourceMeta
 from gtfs_backend.worker.static.spec import TABLES
 from gtfs_backend.worker.static.validate import validate
 
@@ -31,27 +31,6 @@ COPY_CHUNK_ROWS = 200_000
 
 class ImportFailed(Exception):
     pass
-
-
-@dataclass
-class SourceMeta:
-    sha256: str
-    etag: str | None = None
-    last_modified: str | None = None
-    archive_path: str | None = None
-
-
-@dataclass
-class ImportResult:
-    feed_version_id: str  # `kmk_t_v3`
-    feed_id: str
-    version: int  # per-feed version number
-    status: str
-    row_counts: dict[str, int] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
-    error: str | None = None
-    retired: list[int] = field(default_factory=list)  # version numbers of the same feed
-    seconds: float = 0.0
 
 
 def _copy_frame(

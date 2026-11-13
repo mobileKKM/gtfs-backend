@@ -52,9 +52,9 @@ services:
       ARCHIVE_DIR: /data/archive
       OSM_STOPS_FILE: /data/osm/stops.json
     command: ["sh", "-c", "alembic upgrade head && exec gtfs-worker run"]
-    # the worker process ~170 MB; an import runs in a process of its own (up to ~1 GB for kmk_a, gone when it ends).
+    # the worker process ~170 MB; an import runs in a process of its own (kmk_a: ~85 MB, gone when it ends).
     # Over the limit the import process is killed first (the import is retried) or Docker restarts the worker
-    mem_limit: 2g
+    mem_limit: 768m
     volumes:
       - ./data:/data
       - ./feeds.yml:/app/feeds.yml:ro

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from functools import cached_property
 
 from psycopg import AsyncConnection
 
@@ -49,7 +50,7 @@ class Scheduled:
     route_id: str
     on_demand: bool = False
 
-    @property
+    @cached_property  # read many times per row while a board is sorted and paged
     def trip_key(self) -> str:
         return keys.trip_key(self.feed_id, self.service_date, self.trip_id)
 

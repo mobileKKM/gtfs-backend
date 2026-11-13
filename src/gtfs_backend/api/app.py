@@ -137,7 +137,8 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    # level 5: a third of level 9's CPU for vehicle lists (0.8 vs 3 ms for 140 KB), ~10% larger
+    app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
     timings = Timings()
     app.state.timings = timings
     app.add_middleware(TimingMiddleware, timings=timings)  # added last: outermost, so it times compression too

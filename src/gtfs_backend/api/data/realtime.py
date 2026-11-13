@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+import orjson
 from redis.asyncio import Redis
 
 from gtfs_backend import live_layout
@@ -13,7 +13,7 @@ from gtfs_backend import live_layout
 async def get_json_many(redis: Redis, keys: list[str]) -> list[dict | list | None]:
     if not keys:
         return []
-    return [json.loads(v) if v else None for v in await redis.mget(keys)]
+    return [orjson.loads(v) if v else None for v in await redis.mget(keys)]
 
 
 async def vehicle_json(redis: Redis, ids: list[str]) -> list[dict]:
@@ -68,15 +68,9 @@ class TripUpdate:
         self.timestamp: int | None = raw.get("timestamp")  # when the feed measured it
         self.delay_s: int | None = raw.get("delay_s")
         self.canceled = raw.get("schedule_relationship") == "CANCELED"
-        self._stops = {
-            r["stop_sequence"]: StopUpdate(
-                r.get("predicted_arrival"),
-                r.get("predicted_departure"),
-                r.get("delay_s"),
-                r.get("schedule_relationship") == "SKIPPED",
-            )
-            for r in raw.get("stops") or []
-        }
+        # a board needs one stop of each trip: rows are turned into StopUpdates only when asked for
+        self._rows = {r["stop_sequence"]: r for r in raw.get("stops") or []}
+        self._stops: dict[int, StopUpdate] = {}
 
     @classmethod
     def for_version(cls, raw: dict | None, version: int) -> TripUpdate | None:
@@ -84,7 +78,18 @@ class TripUpdate:
         return cls(raw) if raw is not None and raw.get("version") == version else None
 
     def stop(self, sequence: int) -> StopUpdate | None:
-        return self._stops.get(sequence)
+        if (done := self._stops.get(sequence)) is not None:
+            return done
+        r = self._rows.get(sequence)
+        if r is None:
+            return None
+        self._stops[sequence] = update = StopUpdate(
+            r.get("predicted_arrival"),
+            r.get("predicted_departure"),
+            r.get("delay_s"),
+            r.get("schedule_relationship") == "SKIPPED",
+        )
+        return update
 
 
 async def trip_updates(redis: Redis, keys: list[str]) -> dict[str, dict]:

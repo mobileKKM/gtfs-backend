@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+import orjson
 from redis.asyncio import Redis
 
 from gtfs_backend import keys, live_layout
@@ -22,8 +22,8 @@ class TTLs:
     unmatched: int
 
 
-def _dumps(value) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def _dumps(value) -> bytes:
+    return orjson.dumps(value)  # compact UTF-8, as json.dumps(ensure_ascii=False, separators=(",", ":")), several times faster
 
 
 class RealtimeStore:
@@ -71,7 +71,7 @@ class RealtimeStore:
         prevs = await self.redis.mget([live_layout.trip(trip["key"]) for trip in res.trips]) if res.trips else []
         pipe = self.redis.pipeline(transaction=True)
         for trip, prev in zip(res.trips, prevs, strict=True):
-            merged = merge_stops(json.loads(prev) if prev else None, trip)
+            merged = merge_stops(orjson.loads(prev) if prev else None, trip)
             pipe.set(live_layout.trip(trip["key"]), _dumps(merged), ex=self.ttls.trip)
         # FULL_DATASET: trips missing from this update are gone
         stale = self._trip_keys.get(feed_id, set()) - current

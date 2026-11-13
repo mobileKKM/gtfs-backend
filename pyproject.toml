@@ -8,6 +8,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 # Shared by the worker and the API (the modules at the gtfs_backend root).
 dependencies = [
+    "orjson>=3.10",
     "psycopg[binary,pool]>=3.3.6",
     "pydantic-settings>=2.16.1",
     "pyyaml>=6.0.3",

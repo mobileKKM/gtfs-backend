@@ -62,8 +62,10 @@ class LoopLag:
 
 
 def _import_executor() -> ProcessPoolExecutor:
-    """Static imports are CPU-heavy: one at a time, in a separate process."""
-    return ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    """Static imports are CPU-heavy: one at a time, in a separate process. The process exits after each job (an import
+    or an OSM refresh): what a job allocated isn't all handed back to the system while the process lives (an import
+    of kmk_a kept ~800 MB), and a fresh process costs a second or two once per job."""
+    return ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"), max_tasks_per_child=1)
 
 
 class Worker:

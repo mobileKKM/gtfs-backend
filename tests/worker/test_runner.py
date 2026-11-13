@@ -223,3 +223,12 @@ def test_imports_run_at_lower_cpu_priority(monkeypatch):
     monkeypatch.setattr(load, "import_zip", lambda *a, **k: load.ImportResult("kmk_t_v1", "kmk_t", 1, "ready"))
     fetch.run_import_job("kmk_t", "ztp", [], None, "x.zip", {"sha256": "abc"}, "postgresql://unused")
     assert calls == [fetch.IMPORT_NICENESS]
+
+
+def test_each_import_job_gets_a_fresh_process():
+    executor = runner._import_executor()
+    try:
+        first, second = executor.submit(os.getpid).result(60), executor.submit(os.getpid).result(60)
+    finally:
+        executor.shutdown()
+    assert first != second

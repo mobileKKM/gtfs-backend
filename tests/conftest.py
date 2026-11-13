@@ -18,6 +18,7 @@ from alembic import command
 from alembic.config import Config
 from google.transit import gtfs_realtime_pb2 as pb
 
+from gtfs_backend import live_layout
 from gtfs_backend.feeds import FeedConfig, FeedsFile, load_feeds
 from gtfs_backend.logs import setup_logging
 from gtfs_backend.worker.feed_sync import sync_feeds
@@ -54,6 +55,11 @@ def _refuse_standard_ports() -> None:
 _refuse_standard_ports()
 
 setup_logging("WARNING")
+
+# Pub/sub channels belong to the whole Redis server, not to the test database: a dev worker publishing on the same server
+# would reach the API under test. Everything looks the names up in live_layout when it publishes or subscribes.
+live_layout.REALTIME_UPDATED = "test:" + live_layout.REALTIME_UPDATED
+live_layout.STATIC_UPDATED = "test:" + live_layout.STATIC_UPDATED
 
 # ZTP names its stations in stop codes (`802-01`): the pattern feeds.yml declares for its feeds
 ZTP_STOP_CODES = load_feeds(ROOT / "feeds.yml").get("kmk_a").stop_code_pattern

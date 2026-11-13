@@ -25,7 +25,9 @@ services:
     image: redis:7.4-alpine
     container_name: mkkm-gtfs-redis
     restart: unless-stopped
-    command: ["redis-server", "--save", "", "--appendonly", "no"] # live data only, nothing to persist
+    # live data only, nothing to persist. ~10-20 MB in use; the cap is a safety net: everything evictable has a TTL
+    # (rt:meta keys have none and are never evicted)
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-ttl"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -50,6 +52,9 @@ services:
       ARCHIVE_DIR: /data/archive
       OSM_STOPS_FILE: /data/osm/stops.json
     command: ["sh", "-c", "alembic upgrade head && exec gtfs-worker run"]
+    # the worker process ~170 MB; an import runs in a process of its own (up to ~1 GB for kmk_a, gone when it ends).
+    # Over the limit the import process is killed first (the import is retried) or Docker restarts the worker
+    mem_limit: 2g
     volumes:
       - ./data:/data
       - ./feeds.yml:/app/feeds.yml:ro
@@ -77,6 +82,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-gtfs}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gtfs}
       REDIS_URL: redis://redis:6379/0
       API_WORKERS: ${API_WORKERS:-4}
+    # ~100 MB per API process plus the supervisor (4 processes: ~400 MB)
+    mem_limit: 768m
     networks:
       - default
       - nginx_proxy

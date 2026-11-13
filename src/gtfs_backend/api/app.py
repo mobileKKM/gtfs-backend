@@ -80,7 +80,12 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             )
         )
         feeds_file = feeds or load_feeds(settings.feeds_config)
-        catalog = Catalog(pool, feeds_file, clock, refresh_s=settings.catalog_refresh_interval)
+        # its own pool: services call the catalog while holding a request connection (see api/data/catalog.py)
+        catalog_pool = async_pool(
+            settings.database_url, max_size=settings.catalog_pool_max_size, timeout=settings.db_pool_timeout
+        )
+        await catalog_pool.open()
+        catalog = Catalog(catalog_pool, feeds_file, clock, refresh_s=settings.catalog_refresh_interval)
         try:  # warm up, so the first requests don't all wait for it; they retry if the database is down
             await catalog.ensure_fresh()
         except Exception as exc:  # noqa: BLE001
@@ -96,6 +101,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             await redis.aclose()
+            await catalog_pool.close()
             await pool.close()
 
     app = FastAPI(

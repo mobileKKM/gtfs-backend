@@ -93,9 +93,14 @@ def loaded(database_url):
 NO_CACHE = {"cache_ttl_live": 0, "cache_ttl_static": 0, "cache_ttl_alerts": 0}
 
 
+# One request connection per process: a service that takes a second one while holding the first waits for itself and
+# fails with 503 after the timeout, so every test through `api` also checks that no request ever needs two.
+ONE_CONNECTION = {"db_pool_max_size": 1, "db_pool_timeout": 2}
+
+
 @pytest.fixture
 async def api(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE, **ONE_CONNECTION)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c
@@ -471,6 +476,19 @@ async def test_server_timing_and_per_route_stats(loaded, sql):
     assert stats["/api/v1/vehicles"].hit_rate is None
     assert all("802" not in route and "bbox" not in route for route in stats)
     assert app.state.timings.take() == []  # reset
+
+
+
+async def test_concurrent_boards_never_wait_for_a_second_connection(loaded, sql):
+    """Boards on days the catalog hasn't loaded make it query them. It has its own pool: with requests' only connection
+    held by the board, a shared pool would leave them waiting for each other until the 503."""
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE, **ONE_CONNECTION)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        group = group_id(sql, "802")
+        later = [NOW + days * 86400 for days in (9, 10, 11, 12)]  # outside the loaded yesterday/today/tomorrow
+        answers = await asyncio.gather(*(c.get(f"/stops/{group}/departures?time={t}") for t in later * 3))
+    assert [r.status_code for r in answers] == [200] * len(answers)
 
 
 # ------------------------------------------------------------------------------------------------- trips + shapes

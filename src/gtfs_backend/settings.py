@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     feeds_config: Path = Path("feeds.yml")
     log_level: str = "INFO"
     # Connections per process (the worker, and each API process). Postgres allows 100 in all: the worker's pool +
-    # API_WORKERS x this (+ imports, psql) must stay below that.
+    # API_WORKERS x (this + CATALOG_POOL_MAX_SIZE) (+ imports, psql) must stay below that.
     db_pool_max_size: int = Field(default=10, ge=1)
 
 

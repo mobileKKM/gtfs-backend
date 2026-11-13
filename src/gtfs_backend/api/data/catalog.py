@@ -1,8 +1,13 @@
 """Small static data the API needs on every request, cached in memory.
 
 Per feed: timezone, day start, and the authoritative version of yesterday/today/tomorrow (with the epoch its GTFS
-times count from). Routes (with agency) are cached per feed version, loaded on first use. Everything is
-reloaded when the local date changes, when the worker publishes `static:updated`, and every CATALOG_REFRESH_INTERVAL (5 minutes).
+times count from). Routes (with agency) are cached per feed version: those of the loaded days with every reload,
+others on first use. Everything is reloaded when the local date changes, when the worker publishes `static:updated`, and
+every CATALOG_REFRESH_INTERVAL (5 minutes).
+
+The catalog has a connection pool of its own (CATALOG_POOL_MAX_SIZE), apart from the one requests use: services call
+it while they hold a request connection, so if it took from the same pool, enough concurrent requests would each hold
+one connection and wait for a second, and none would ever get it (until DB_POOL_TIMEOUT: 503).
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from gtfs_backend.modes import MODE_SQL, Mode
 from gtfs_backend.servicetime import DayStart, day_base, local_date, nearby_dates
 
 REFRESH_S = 300
+MAX_OTHER_DAYS = 1000  # service days outside the loaded ones remembered between reloads (any date can be asked for)
 
 Clock = Callable[[], float]
 
@@ -87,6 +93,7 @@ class Catalog:
         self.clock = clock
         self.feeds: dict[str, FeedInfo] = {}
         self._routes: dict[str, dict[str, RouteInfo]] = {}  # feed_version_id -> route_id -> info
+        self._other_days: dict[tuple[str, date], Day | None] = {}  # (feed_id, date) -> its day, or None: none serves it
         self._loaded_at = 0.0
         self._loaded_for: dict[str, date] = {}
         self._dirty = True
@@ -136,11 +143,14 @@ class Catalog:
                 info.days = [
                     Day(info.feed_id, d, fv_id, v, day_base(d, info.tz, info.day_start)) for d, fv_id, v in await cur.fetchall()
                 ]
+            # versions may have been retired: start over, with the routes of the loaded days already in
+            routes = await self._fetch_routes(conn, sorted({d.feed_version_id for info in feeds.values() for d in info.days}))
         self.feeds = feeds
         self._loaded_for = loaded_for
         versions = sorted(f"{d.feed_id}/{d.date}/{d.feed_version_id}" for info in feeds.values() for d in info.days)
         self.fingerprint = hashlib.blake2b("|".join(versions).encode(), digest_size=6).hexdigest()
-        self._routes.clear()  # versions may have been retired
+        self._routes = routes
+        self._other_days = {}
         self._loaded_at = now
         self._dirty = False
 
@@ -165,6 +175,8 @@ class Catalog:
         for day in info.days:
             if day.date == d:
                 return day
+        if (feed_id, d) in self._other_days:
+            return self._other_days[(feed_id, d)]
         async with self.pool.connection() as conn:
             cur = await conn.execute(
                 """
@@ -175,7 +187,11 @@ class Catalog:
                 (feed_id, d),
             )
             row = await cur.fetchone()
-        return Day(feed_id, d, row[0], row[1], day_base(d, info.tz, info.day_start)) if row else None
+        day = Day(feed_id, d, row[0], row[1], day_base(d, info.tz, info.day_start)) if row else None
+        if len(self._other_days) >= MAX_OTHER_DAYS:
+            self._other_days.clear()
+        self._other_days[(feed_id, d)] = day
+        return day
 
     async def days_between(self, start: float, end: float) -> list[Day]:
         """Service days whose trips can run between two epochs: from the day before `start` to the day of `end`."""
@@ -190,41 +206,38 @@ class Catalog:
 
     # ------------------------------------------------------------------------------------------- routes
 
+    @staticmethod
+    async def _fetch_routes(conn, feed_version_ids: list[str]) -> dict[str, dict[str, RouteInfo]]:
+        """feed_version_id -> route_id -> route, for these versions (every one of them gets an entry)."""
+        loaded: dict[str, dict[str, RouteInfo]] = {v: {} for v in feed_version_ids}
+        if not feed_version_ids:
+            return loaded
+        cur = await conn.execute(
+            f"""
+            SELECT r.feed_version_id, fv.feed_id, r.route_id, r.route_short_name, r.route_type,
+                   {MODE_SQL} AS mode, a.agency_name, a.agency_url, a.agency_phone
+            FROM gtfs.routes r
+            JOIN core.feed_version fv ON fv.id = r.feed_version_id
+            LEFT JOIN LATERAL (
+                SELECT agency_name, agency_url, agency_phone FROM gtfs.agency a
+                WHERE a.feed_version_id = r.feed_version_id AND (a.agency_id = r.agency_id OR r.agency_id IS NULL)
+                ORDER BY a.agency_id = r.agency_id DESC NULLS LAST LIMIT 1
+            ) a ON true
+            WHERE r.feed_version_id = ANY(%s)
+            """,
+            (feed_version_ids,),
+        )
+        for fv_id, feed_id, route_id, short, rtype, mode, a_name, a_url, a_phone in await cur.fetchall():
+            agency = {"name": a_name, "url": a_url, "phone": a_phone} if a_name is not None else None
+            loaded[fv_id][route_id] = RouteInfo(feed_id, route_id, short, rtype, mode, agency)
+        return loaded
+
     async def routes(self, feed_version_ids: set[str] | list[str]) -> dict[tuple[str, str], RouteInfo]:
         """(feed_version_id, route_id) -> route, for the given versions."""
-        missing = [v for v in set(feed_version_ids) if v not in self._routes]
+        missing = sorted(v for v in set(feed_version_ids) if v not in self._routes)
         if missing:
             async with self.pool.connection() as conn:
-                cur = await conn.execute(
-                    f"""
-                    SELECT r.feed_version_id, fv.feed_id, r.route_id, r.route_short_name, r.route_type,
-                           {MODE_SQL} AS mode, a.agency_name, a.agency_url, a.agency_phone
-                    FROM gtfs.routes r
-                    JOIN core.feed_version fv ON fv.id = r.feed_version_id
-                    LEFT JOIN LATERAL (
-                        SELECT agency_name, agency_url, agency_phone FROM gtfs.agency a
-                        WHERE a.feed_version_id = r.feed_version_id AND (a.agency_id = r.agency_id OR r.agency_id IS NULL)
-                        ORDER BY a.agency_id = r.agency_id DESC NULLS LAST LIMIT 1
-                    ) a ON true
-                    WHERE r.feed_version_id = ANY(%s)
-                    """,
-                    (missing,),
-                )
-                loaded: dict[str, dict[str, RouteInfo]] = {v: {} for v in missing}
-                for (
-                    fv_id,
-                    feed_id,
-                    route_id,
-                    short,
-                    rtype,
-                    mode,
-                    a_name,
-                    a_url,
-                    a_phone,
-                ) in await cur.fetchall():
-                    agency = {"name": a_name, "url": a_url, "phone": a_phone} if a_name is not None else None
-                    loaded[fv_id][route_id] = RouteInfo(feed_id, route_id, short, rtype, mode, agency)
-            self._routes.update(loaded)
+                self._routes.update(await self._fetch_routes(conn, missing))
         return {(v, rid): info for v in set(feed_version_ids) for rid, info in self._routes.get(v, {}).items()}
 
     async def route(self, feed_version_id: str, route_id: str) -> RouteInfo | None:

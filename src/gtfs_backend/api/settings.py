@@ -15,6 +15,8 @@ class ApiSettings(Settings):
     api_workers: int = Field(default=1, ge=1)  # processes; each has its own connection pools and caches
 
     db_pool_timeout: float = Field(default=5, gt=0)  # wait for a free connection, then answer 503
+    # the catalog's own connections (api/data/catalog.py), apart from DB_POOL_MAX_SIZE: short queries, a few at most
+    catalog_pool_max_size: int = Field(default=2, ge=1)
     redis_pool_max_size: int = Field(default=50, ge=1)
     redis_pool_timeout: float = Field(default=5, gt=0)
 

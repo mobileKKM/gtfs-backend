@@ -27,8 +27,30 @@ from gtfs_backend.worker.static.spec import TABLES
 
 ROOT = Path(__file__).parent.parent
 FIXTURES = Path(__file__).parent / "fixtures"
-TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "postgresql://gtfs:gtfs@localhost:5432/gtfs_test")
-TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
+TEST_DB_URL = os.environ.get("TEST_DATABASE_URL", "postgresql://gtfs:gtfs@localhost:55432/gtfs_test")
+TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:56379/15")
+
+# The session fixtures drop the test database and flush the test Redis db. The standard ports on this machine may be an
+# SSH tunnel to production, so tests never run against them unless explicitly allowed.
+STANDARD_PORTS = {5432, 6379}
+
+
+def _refuse_standard_ports() -> None:
+    from urllib.parse import urlsplit
+
+    if os.environ.get("TEST_ALLOW_STANDARD_PORTS") == "1":
+        return
+    for url in (TEST_DB_URL, TEST_REDIS_URL):
+        port = urlsplit(url).port
+        if port in STANDARD_PORTS:
+            pytest.exit(
+                f"refusing to run tests against port {port} ({url.rsplit('@', 1)[-1]}): it may be a tunnel to production. "
+                "Use the dev services (docker-compose.dev.yml: 55432/56379) or set TEST_ALLOW_STANDARD_PORTS=1.",
+                returncode=2,
+            )
+
+
+_refuse_standard_ports()
 
 setup_logging("WARNING")
 

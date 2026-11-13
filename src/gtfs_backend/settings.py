@@ -12,8 +12,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql://gtfs:gtfs@localhost:5432/gtfs"
-    redis_url: str = "redis://localhost:6379/0"
+    database_url: str = "postgresql://gtfs:gtfs@localhost:55432/gtfs"
+    redis_url: str = "redis://localhost:56379/0"
     feeds_config: Path = Path("feeds.yml")
     log_level: str = "INFO"
     # Connections per process (the worker, and each API process). Postgres allows 100 in all: the worker's pool +

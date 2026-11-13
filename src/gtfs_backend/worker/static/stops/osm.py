@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import httpx
@@ -67,27 +67,49 @@ def load_osm_poles(path: Path) -> list[OsmPole]:
 
 
 def read_extract(pbf: Path) -> list[OsmPole]:
-    """The stop poles in an OSM extract. osmium is imported only here: the worker process never loads it (the extract is
-    read in the import process)."""
+    """The stop poles in an OSM extract: tagged nodes, and platforms drawn as ways, placed at their middle node.
+
+    Two passes instead of one with osmium's location index: that keeps every node's location of the region in memory
+    (Malopolska: ~600 MB) to place a few thousand ways. The first pass reads only the ways and keeps the platforms'
+    node ids, the second only the nodes. osmium is imported only here: the worker process never loads it (the extract
+    is read in the import process)."""
     import osmium
 
-    class Poles(osmium.SimpleHandler):
+    class Ways(osmium.SimpleHandler):
         def __init__(self) -> None:
             super().__init__()
+            self.platforms: list[tuple[OsmPole, list[int]]] = []  # pole without its position yet, node ids
+
+        def way(self, w) -> None:
+            if pole := make_pole(f"way/{w.id}", w.tags, 0.0, 0.0):  # whether it is one only depends on its tags
+                self.platforms.append((pole, [n.ref for n in w.nodes]))
+
+    class Nodes(osmium.SimpleHandler):
+        def __init__(self, wanted: set[int]) -> None:
+            super().__init__()
+            self.wanted = wanted
             self.poles: list[OsmPole] = []
+            self.locations: dict[int, tuple[float, float]] = {}
 
         def node(self, n) -> None:
-            if n.location.valid() and (p := make_pole(f"node/{n.id}", n.tags, n.location.lat, n.location.lon)):
+            if not n.location.valid():
+                return
+            if n.id in self.wanted:
+                self.locations[n.id] = (n.location.lat, n.location.lon)
+            if p := make_pole(f"node/{n.id}", n.tags, n.location.lat, n.location.lon):
                 self.poles.append(p)
 
-        def way(self, w) -> None:  # platforms drawn as areas or lines: their middle node stands for them
-            nodes = [n for n in w.nodes if n.location.valid()]
-            if nodes and (p := make_pole(f"way/{w.id}", w.tags, nodes[len(nodes) // 2].lat, nodes[len(nodes) // 2].lon)):
-                self.poles.append(p)
-
-    handler = Poles()
-    handler.apply_file(str(pbf), locations=True)
-    return handler.poles
+    ways = Ways()
+    ways.apply_file(str(pbf))
+    nodes = Nodes({ref for _, refs in ways.platforms for ref in refs})
+    nodes.apply_file(str(pbf))
+    poles = nodes.poles
+    for pole, refs in ways.platforms:
+        located = [nodes.locations[ref] for ref in refs if ref in nodes.locations]
+        if located:  # its middle located node stands for it
+            lat, lon = located[len(located) // 2]
+            poles.append(replace(pole, lat=lat, lon=lon))
+    return poles
 
 
 def fetch_osm_poles(path: Path, *, url: str = EXTRACT_URL) -> int:

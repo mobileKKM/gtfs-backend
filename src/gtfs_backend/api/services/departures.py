@@ -46,7 +46,6 @@ class Scheduled:
     scheduled_departure: int  # epoch
     headsign: str | None
     route_id: str
-    wheelchair_accessible: int | None
     on_demand: bool = False
 
     @property
@@ -95,7 +94,7 @@ async def scheduled(
         """
         SELECT {i}, st.trip_id, st.stop_sequence, l.public_stop_id,
                extract(epoch FROM st.departure_time)::int, coalesce(st.stop_headsign, t.trip_headsign),
-               t.route_id, t.wheelchair_accessible, coalesce(st.pickup_type, 0) IN (2, 3)
+               t.route_id, coalesce(st.pickup_type, 0) IN (2, 3)
         FROM core.stop_link l
         JOIN gtfs.stop_times st ON st.feed_version_id = %(fv{i})s AND st.stop_id = l.stop_id
              AND st.departure_time BETWEEN %(lo{i})s * interval '1 second' AND %(hi{i})s * interval '1 second'
@@ -112,7 +111,7 @@ async def scheduled(
     )
     cur = await conn.execute(sql, params)
     out = []
-    for i, trip_id, seq, pid, dep, headsign, route_id, wheelchair, on_demand in await cur.fetchall():
+    for i, trip_id, seq, pid, dep, headsign, route_id, on_demand in await cur.fetchall():
         d = days[i]
         out.append(
             Scheduled(
@@ -126,7 +125,6 @@ async def scheduled(
                 d.base + dep,
                 headsign,
                 route_id,
-                wheelchair,
                 on_demand,
             )
         )
@@ -216,7 +214,6 @@ def _departure(row: Row, route: RouteRef | None, stop) -> Departure:
         status=live.status,
         vehicle_key=keys.vehicle_key(s.feed_id, live.vehicle_id) if live.vehicle_id else None,
         on_demand=s.on_demand,
-        wheelchair_accessible=s.wheelchair_accessible,
     )
 
 

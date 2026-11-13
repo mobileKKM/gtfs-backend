@@ -8,7 +8,7 @@ NOW = 1_800_000_000
 
 
 def sched(trip="t1", seq=5, dep=NOW + 600, version=1) -> Scheduled:
-    return Scheduled("kmk_t", "kmk_t_v1", version, date(2027, 1, 15), trip, seq, "plat1", dep, "Bardosa", "r1", None)
+    return Scheduled("kmk_t", "kmk_t_v1", version, date(2027, 1, 15), trip, seq, "plat1", dep, "Bardosa", "r1")
 
 
 def rt(*rows, version=1, relationship="SCHEDULED", vehicle="704") -> dict:

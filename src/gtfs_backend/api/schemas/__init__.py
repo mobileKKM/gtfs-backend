@@ -11,7 +11,7 @@ from gtfs_backend.api.schemas.alerts import (
     AlertSeverity,
 )
 from gtfs_backend.api.schemas.common import Agency, Route, RouteRef, StopRef
-from gtfs_backend.api.schemas.departures import Departure, DepartureBoard, DepartureStatus, Wheelchair
+from gtfs_backend.api.schemas.departures import Departure, DepartureBoard, DepartureStatus
 from gtfs_backend.api.schemas.health import FeedHealth, Health
 from gtfs_backend.api.schemas.routes import RouteShape, RouteShapes
 from gtfs_backend.api.schemas.stops import Direction, SearchResult, Stop, StopGroupInfo, StopInfo, StopList
@@ -51,5 +51,4 @@ __all__ = [
     "TripView",
     "Vehicle",
     "VehicleList",
-    "Wheelchair",
 ]

@@ -38,11 +38,11 @@ async def search_stops(
     return await cached(request, ctx, s.cache_ttl_static, cache_control, lambda: stops.search(ctx, q, limit))
 
 
-@router.get("/stops/{key}/departures", response_model=DepartureBoard)
+@router.get("/stops/{stop_key}/departures", response_model=DepartureBoard)
 async def departure_board(
     request: Request,
     ctx: Ctx,
-    key: str,
+    stop_key: str,
     feeds: FeedsQuery,
     routes: RoutesQuery,
     time: Annotated[int | None, Query(ge=0, description="epoch seconds: departures from then on; none: from now")] = None,
@@ -56,5 +56,5 @@ async def departure_board(
     names) narrow the board and its alerts. Canceled trips and skipped stops stay with their status.
     """
     return await cached(
-        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: departures.board(ctx, key, time, feeds, routes, limit)
+        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: departures.board(ctx, stop_key, time, feeds, routes, limit)
     )

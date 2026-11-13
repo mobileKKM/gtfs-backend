@@ -34,8 +34,7 @@ class Route(RouteRef):
 
 
 class StopRef(BaseModel):
-    id: str
     key: str  # stop key, as Stop.key
     name: str
-    group_id: str  # its stop group: /stops/{group_id}/departures
+    group_key: str  # its stop group: /stops/{group_key}/departures
     platform_code: str | None = None

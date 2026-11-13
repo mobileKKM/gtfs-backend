@@ -38,6 +38,19 @@ async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: fl
             await asyncio.sleep(retry_delay)
 
 
+DESCRIPTION = """Read-only API behind the mobileKKM map: live vehicles, trip details, stop search and departures for
+Kraków's public transport (ZTP trams and buses, Koleje Małopolskie trains and feeder buses), from GTFS timetables and
+GTFS-Realtime.
+
+**Keys.** Everything the app can open has a `key` that endpoints take: a stop's slug (`rondo-mogilskie01-qphdu`), a
+vehicle `{feed_id}:{vehicle_id}`, a trip `{feed_id}:{YYYYMMDD}:{trip_id}`, a route `{feed_id}:{route_id}`, an alert
+`{feed_id}:{id}`. A field named `<thing>_key` points at another thing's key.
+
+**Conventions.** Times are epoch seconds, dates `YYYYMMDD`. Every field of a schema is always present (`null` when
+unset). Responses carry `ETag`; live ones are `no-cache`, so poll them (about every 10 s) with `If-None-Match`.
+Errors are `{"error": {"code", "message"}}`."""
+
+
 def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None = None, clock: Clock = time.time) -> FastAPI:
     """Called once in every API process (API_WORKERS), so each sets up its own logging, pools and catalog."""
     settings = settings or get_api_settings()
@@ -75,7 +88,8 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
 
     app = FastAPI(
         title="mobileKKM GTFS API",
-        version="1",
+        version="1.2",
+        description=DESCRIPTION,
         lifespan=lifespan,
         docs_url="/api/docs",
         redoc_url=None,

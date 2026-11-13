@@ -110,6 +110,11 @@ def sql(loaded):
     return run
 
 
+def ident(item: dict, field: str = "key") -> str:
+    """Our public id: the last part of a key."""
+    return item[field].rsplit("-", 1)[-1]
+
+
 def group_id(sql, code: str) -> str:
     return sql("SELECT id FROM core.stop_group WHERE current_code = %s", code)[0][0]
 
@@ -170,18 +175,18 @@ async def test_vehicles_bad_bbox(api, bbox):
 async def test_stops_on_map_are_stops(api, sql):
     body = (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()
     assert not body["truncated"] and all(s["kind"] == "stop" for s in body["stops"])
-    rondo = [p for p in body["stops"] if p["group_id"] == group_id(sql, "802")]
+    rondo = [p for p in body["stops"] if ident(p, "group_key") == group_id(sql, "802")]
     assert len(rondo) >= 4 and all(p["name"] == "Rondo Mogilskie" and p["platform_code"] for p in rondo)
-    assert all(p["key"] == f"rondo-mogilskie{p['platform_code']}-{p['id']}" for p in rondo)
+    assert all(p["key"] == f"rondo-mogilskie{p['platform_code']}-{ident(p)}" for p in rondo)
     assert {"bus", "tram"} <= {m for p in rondo for m in p["modes"]}
 
 
 async def test_stops_on_map_as_groups(api, sql):
     body = (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=group")).json()
     assert not body["truncated"] and body["stops"] and all(s["kind"] == "group" for s in body["stops"])
-    assert all(s["group_id"] is None and s["platform_code"] is None for s in body["stops"])
-    rondo = next(s for s in body["stops"] if s["id"] == group_id(sql, "802"))
-    assert rondo["key"] == f"rondo-mogilskie-{rondo['id']}" and {"bus", "tram"} <= set(rondo["modes"])
+    assert all(s["group_key"] is None and s["platform_code"] is None for s in body["stops"])
+    rondo = next(s for s in body["stops"] if ident(s) == group_id(sql, "802"))
+    assert rondo["key"] == f"rondo-mogilskie-{ident(rondo)}" and {"bus", "tram"} <= set(rondo["modes"])
     assert (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=bogus")).status_code == 422
 
 
@@ -191,7 +196,7 @@ async def test_stops_on_map_by_mode(api, kind):
         body = (await api.get(f"/stops?bbox={CITY_BBOX}&kind={kind}&modes={modes}")).json()
         assert not body["truncated"]
         assert not modes or all(set(s["modes"]) & set(modes.split(",")) for s in body["stops"])
-        return {s["id"] for s in body["stops"]}
+        return {ident(s) for s in body["stops"]}
 
     everything, tram, bus = await ids(), await ids("tram"), await ids("bus")
     assert tram and bus and tram < everything and bus < everything
@@ -202,19 +207,19 @@ async def test_stops_on_map_by_mode(api, kind):
 async def test_stop_search(api, sql):
     results = (await api.get("/stops/search?q=rondo mog")).json()["results"]
     rondo = results[0]
-    assert rondo["name"] == "Rondo Mogilskie" and rondo["id"] == group_id(sql, "802")
-    assert rondo["key"] == f"rondo-mogilskie-{rondo['id']}"
+    assert rondo["name"] == "Rondo Mogilskie" and ident(rondo) == group_id(sql, "802")
+    assert rondo["key"] == f"rondo-mogilskie-{ident(rondo)}"
     assert {"tram", "bus"} <= {line["mode"] for p in rondo["stops"] for d in p["directions"] for line in d["routes"]}
     served = [p for p in rondo["stops"] if p["directions"]]
     assert len(served) >= 4
-    assert "kind" not in rondo and not any({"kind", "group_id"} & set(p) for p in rondo["stops"])
-    own = {p[0] for p in sql("SELECT id FROM core.stop WHERE stop_group_id = %s", rondo["id"])}
-    assert {p["id"] for p in rondo["stops"]} <= own
+    assert "kind" not in rondo and not any({"kind", "group_key"} & set(p) for p in rondo["stops"])
+    own = {p[0] for p in sql("SELECT id FROM core.stop WHERE stop_group_id = %s", ident(rondo))}
+    assert {ident(p) for p in rondo["stops"]} <= own
     for p in served:
         for d in p["directions"]:
             assert d["towards"] != "Rondo Mogilskie" and d["routes"] and len(d["headsigns"]) <= 3
     # the hint is the next stop group a trip from that stop reaches
-    p1 = next(p for p in rondo["stops"] if p["id"] == stop_by_code(sql, "802-01"))
+    p1 = next(p for p in rondo["stops"] if ident(p) == stop_by_code(sql, "802-01"))
     ((nxt,),) = sql(
         """
         SELECT g.name FROM gtfs.stop_times st
@@ -251,19 +256,20 @@ async def test_stops_without_trips_are_never_returned(api, sql, loaded):
             conn.execute(f"UPDATE core.stop SET modes = '{{}}' WHERE {where} = %s", (param,))
 
     async def map_ids():
-        return {s["id"] for s in (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]}
+        return {ident(s) for s in (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]}
 
     try:
         # one stop without trips: gone from the map and from its group, which is still found
         clear_modes("id", pid)
         assert pid not in await map_ids()
         found = (await api.get("/stops/search?q=rondo mog")).json()["results"][0]
-        assert found["id"] == gid and found["stops"] and pid not in {p["id"] for p in found["stops"]}
+        assert ident(found) == gid and found["stops"] and pid not in {ident(p) for p in found["stops"]}
         # all of its stops without trips: the group disappears from search too
         clear_modes("stop_group_id", gid)
-        assert gid not in {r["id"] for r in (await api.get("/stops/search?q=rondo mog")).json()["results"]}
-        assert not {s["id"] for s in (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"] if s["group_id"] == gid}
-        assert gid not in {s["id"] for s in (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=group")).json()["stops"]}
+        assert gid not in {ident(r) for r in (await api.get("/stops/search?q=rondo mog")).json()["results"]}
+        on_map = (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]
+        assert not {ident(s) for s in on_map if ident(s, "group_key") == gid}
+        assert gid not in {ident(s) for s in (await api.get(f"/stops?bbox={RONDO_BBOX}&kind=group")).json()["stops"]}
     finally:
         with psycopg.connect(loaded) as conn:
             conn.cursor().executemany("UPDATE core.stop SET modes = %s WHERE id = %s", [(m, i) for i, m in saved])
@@ -277,7 +283,8 @@ async def test_stop_search_covers_only_search_namespaces(loaded, sql):
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         assert (await c.get("/stops/search?q=rondo mog")).json()["results"] == []
         gid = group_id(sql, "802")
-        assert any(s["group_id"] == gid for s in (await c.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"])
+        on_map = (await c.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]
+        assert any(ident(s, "group_key") == gid for s in on_map)
         assert (await c.get(f"/stops/{gid}/departures")).status_code == 200
 
 
@@ -301,7 +308,7 @@ async def test_departure_board_merges_feeds_with_realtime(api, sql):
     assert r.status_code == 200
     board = r.json()
     deps = board["departures"]
-    assert board["stop"]["id"] == gid and "next_update" not in board
+    assert ident(board["stop"]) == gid and "next_update" not in board
     assert r.headers["cache-control"] == "no-cache"
     assert len(deps) == 60
     assert [d["time"] for d in deps] == sorted(d["time"] for d in deps)
@@ -309,7 +316,7 @@ async def test_departure_board_merges_feeds_with_realtime(api, sql):
     assert {feed_of(d) for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
     assert not {"feed_id", "trip_id", "service_date", "realtime", "vehicle_id"} & {k for d in deps for k in d}
     own = {p[0] for p in sql("SELECT id FROM core.stop WHERE stop_group_id = %s", gid)}
-    assert all(d["stop"]["id"] in own and d["stop"]["group_id"] == gid for d in deps)
+    assert all(ident(d["stop"]) in own and ident(d["stop"], "group_key") == gid for d in deps)
     assert all(d["route"]["name"] for d in deps)
 
     live = [d for d in deps if d["status"] == "live"]
@@ -397,7 +404,7 @@ async def test_departure_board_filters(api, sql):
 async def test_departure_board_stop_and_other_days(api, sql):
     pid = stop_by_code(sql, "802-01")
     deps = (await api.get(f"/stops/{pid}/departures?limit=5")).json()["departures"]
-    assert 0 < len(deps) <= 5 and {d["stop"]["id"] for d in deps} == {pid}
+    assert 0 < len(deps) <= 5 and {ident(d["stop"]) for d in deps} == {pid}
 
     # starting far enough back reaches the day before (another service day, its own base, CEST)
     url = f"/stops/{group_id(sql, '360')}/departures"
@@ -495,7 +502,7 @@ async def test_trip_of_a_live_vehicle(api):
     stops = trip["stops"]
     seqs = [s["stop_sequence"] for s in stops]
     assert seqs == sorted(seqs) == [s["stop_sequence"] for s in live["stops"]]
-    assert all(s["stop"]["name"] and s["stop"]["group_id"] and "estimated_arrival" not in s for s in stops)
+    assert all(s["stop"]["name"] and s["stop"]["group_key"] and "estimated_arrival" not in s for s in stops)
 
     shape = trip["shape"]
     assert shape["source"] == "shape"
@@ -585,7 +592,7 @@ async def alerts_in_redis(api, sql):
     tram["direction_id"] = (await api.get(f"/trips/{tram['trip_key']}")).json()["direction_id"]
     feed, service_date, trip_id = tram["trip_key"].split(":", 2)
     next_week = (date.fromisoformat(service_date) + timedelta(days=7)).strftime("%Y%m%d")
-    pid = tram["stop"]["id"]  # a stop the tram stops at
+    pid = ident(tram["stop"])  # a stop the tram stops at
     group = group_id(sql, "802")
     group_pids = [r[0] for r in sql("SELECT id FROM core.stop WHERE stop_group_id = %s ORDER BY id", group)]
     far = stop_by_code(sql, "125-01")
@@ -643,15 +650,15 @@ async def test_alert_entities(api, alerts_in_redis):
     assert (stop["cause"], stop["effect"], stop["severity"]) == ("construction", "detour", "severe")
     none = {"mode": None, "route": None, "direction_id": None, "trip_key": None, "stop": None}
     assert by_id["route"]["entities"] == [none | {"route": tram["route"]}]
-    assert stop["entities"][0]["stop"]["id"] == alerts_in_redis["pid"] and stop["entities"][0]["stop"]["kind"] == "stop"
+    assert ident(stop["entities"][0]["stop"]) == alerts_in_redis["pid"] and stop["entities"][0]["stop"]["kind"] == "stop"
     assert by_id["trip"]["entities"] == [none | {"trip_key": tram["trip_key"]}]
     assert by_id["feed"]["entities"] == [none]  # whole feed
     # route AND stop stay one entity: line X at that stop only
     (elsewhere,) = by_id["route_elsewhere"]["entities"]
-    assert elsewhere["route"]["key"] == tram["route"]["key"] and elsewhere["stop"]["id"] == alerts_in_redis["far"]
+    assert elsewhere["route"]["key"] == tram["route"]["key"] and ident(elsewhere["stop"]) == alerts_in_redis["far"]
     # a station is shown as its stop group
     (station,) = by_id["station"]["entities"]
-    assert station["stop"]["kind"] == "group" and station["stop"]["id"] == alerts_in_redis["group"]
+    assert station["stop"]["kind"] == "group" and ident(station["stop"]) == alerts_in_redis["group"]
     assert by_id["other_direction"]["entities"][0]["direction_id"] is not None
     assert by_id["other_route"]["entities"] == []  # a route we don't have: applies nowhere
     assert (await api.get("/alerts/kmk_t:stop")).json() == stop

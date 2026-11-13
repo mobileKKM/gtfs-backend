@@ -37,30 +37,30 @@ GROUP_COLS = f"""
     'group', g.id, g.url_key, g.name, ST_Y(g.geom), ST_X(g.geom),
     coalesce((SELECT array_agg(DISTINCT m ORDER BY m) FROM core.stop p, unnest(p.modes) m
               WHERE p.stop_group_id = g.id AND {SERVED}), '{{}}'),
-    NULL, NULL
+    NULL, NULL, NULL
 """
 STOP_COLS = """
-    'stop', p.id, p.url_key, p.name, ST_Y(p.geom), ST_X(p.geom), p.modes, p.stop_group_id, p.platform_code
+    'stop', p.id, p.url_key, p.name, ST_Y(p.geom), ST_X(p.geom), p.modes, p.stop_group_id, p.platform_code,
+    (SELECT url_key FROM core.stop_group WHERE id = p.stop_group_id)
 """
 
 
 def stop_from_row(row) -> Stop:
-    kind, sid, key, name, lat, lon, modes, group_id, platform_code = row[:9]
+    kind, _, key, name, lat, lon, modes, _, platform_code, group_key = row[:10]
     return Stop(
         kind=kind,
-        id=sid,
         key=key,
         name=name,
         lat=lat,
         lon=lon,
         modes=list(modes or []),
-        group_id=group_id,
+        group_key=group_key,
         platform_code=platform_code,
     )
 
 
 def stop_ref(stop: Stop) -> StopRef:
-    return StopRef(id=stop.id, key=stop.key, name=stop.name, group_id=stop.group_id, platform_code=stop.platform_code)
+    return StopRef(key=stop.key, name=stop.name, group_key=stop.group_key, platform_code=stop.platform_code)
 
 
 # ------------------------------------------------------------------------------------------------- lookups
@@ -135,14 +135,14 @@ def sorted_routes(routes) -> list[RouteRef]:
 
 
 async def _direction_rows(conn: AsyncConnection, catalog: Catalog, stops: list[str]) -> list[tuple]:
-    """(stop, next group id, its name, feed_version_id, route_id, headsign, trips) in the timetable versions serving
+    """(stop, next group id, its name and key, feed_version_id, route_id, headsign, trips) in the timetable versions serving
     today: all their trips, whatever day they run."""
     versions = sorted({d.feed_version_id for d in catalog.today_days()})
     if not stops or not versions:
         return []
     cur = await conn.execute(
         """
-        SELECT d.public_stop_id, d.next_group_id, g.name, d.feed_version_id, d.route_id, d.headsign, d.trips
+        SELECT d.public_stop_id, d.next_group_id, g.name, g.url_key, d.feed_version_id, d.route_id, d.headsign, d.trips
         FROM core.stop_direction d JOIN core.stop_group g ON g.id = d.next_group_id
         WHERE d.feed_version_id = ANY(%s) AND d.public_stop_id = ANY(%s)
         """,
@@ -158,12 +158,12 @@ async def directions(
     trams and buses), most served first. Stops without departures today get none.
     """
     rows = await _direction_rows(conn, catalog, stops)
-    refs = await catalog.route_refs((fv, route) for _, _, _, fv, route, _, _ in rows)
+    refs = await catalog.route_refs((fv, route) for _, _, _, _, fv, route, _, _ in rows)
 
-    # stop -> next group -> [name, trips, routes, headsign counts]
+    # stop -> next group -> [name, trips, routes, headsign counts, key]
     acc: dict[str, dict[str, list]] = defaultdict(dict)
-    for pid, gid, name, fv, route_id, headsign, trips in rows:
-        d = acc[pid].setdefault(gid, [name, 0, [], Counter()])
+    for pid, gid, name, gkey, fv, route_id, headsign, trips in rows:
+        d = acc[pid].setdefault(gid, [name, 0, [], Counter(), gkey])
         d[1] += trips
         if ref := refs.get((fv, route_id)):
             d[2].append(ref)
@@ -177,11 +177,11 @@ async def directions(
         out[pid] = [
             Direction(
                 towards=name,
-                towards_id=gid,
+                towards_key=gkey,
                 routes=sorted_routes(group_routes),
                 headsigns=[h for h, _ in headsigns.most_common(3)],
             )
-            for i, (gid, (name, trips, group_routes, headsigns)) in enumerate(ranked)
+            for i, (gid, (name, trips, group_routes, headsigns, gkey)) in enumerate(ranked)
             if i == 0 or trips >= min_share * total
         ]
     return out

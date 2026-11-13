@@ -82,7 +82,7 @@ Static imports are CPU-heavy and run in a separate process.
   our own stable 5-letter ids and URL keys like `rondo-mogilskie01-qphdu`; only the part after the last dash counts.
   GTFS words keep their GTFS meaning: a *station* is a feed's `location_type=1` stop and `platform_code` is the
   GTFS field. Stop groups are ours. `stop_id` is always a feed's GTFS id; our stop, wherever a column or payload
-  points at it, is `public_stop_id` (its public 5-letter id, the `id` the API shows).
+  points at it, is `public_stop_id` (its public 5-letter id, the last part of the `key` the API shows).
   - A feed's stations seed the stop groups. ZTP has none and names them in its stop codes instead, which
     `stop_code_pattern` in feeds.yml reads: `802-01` is `platform_code` 01 of station 802. A feed that follows GTFS
     needs no pattern; a stop's own `parent_station` and `platform_code` always win.
@@ -148,11 +148,11 @@ dates `YYYYMMDD`.
 
 | thing | key | endpoint |
 |---|---|---|
-| stop | `rondo-mogilskie01-qphdu` (or the bare id) | `/stops/{key}/departures` |
-| vehicle | `{feed_id}:{vehicle_id}` | `/vehicles/{key}/trip` |
-| trip | `{feed_id}:{YYYYMMDD}:{trip_id}` (`trip_key`) | `/trips/{key}`, `/trips/{key}/live` |
-| route | `{feed_id}:{route_id}` | `/routes/{key}/shapes`, `/alerts?route={key}` |
-| alert | `{feed_id}:{id}` | `/alerts/{key}` |
+| stop or stop group | `rondo-mogilskie01-qphdu` (or the bare id) | `/stops/{stop_key}/departures` |
+| vehicle | `{feed_id}:{vehicle_id}` | `/vehicles/{vehicle_key}/trip` |
+| trip | `{feed_id}:{YYYYMMDD}:{trip_id}` (`trip_key`) | `/trips/{trip_key}`, `/trips/{trip_key}/live` |
+| route | `{feed_id}:{route_id}` | `/routes/{route_key}/shapes`, `/alerts?route={key}` |
+| alert | `{feed_id}:{id}` | `/alerts/{alert_key}` |
 
 The source id comes last and is kept whole, so ids with `:` or `/` work. Responses carry no id a key already
 holds (no `feed_id`/`trip_id` next to `trip_key`, no `feed_id` next to a route's `key`): the feed id is a key's
@@ -165,9 +165,9 @@ of the request, so their ETag only changes with the data.
 |---|---|
 | `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, route (`RouteRef`, with its mode), headsign, delay, `trip_key` |
 | `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
-| `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_id` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
+| `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_key` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
-| `GET /stops/{key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
+| `GET /stops/{stop_key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and passed/skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |

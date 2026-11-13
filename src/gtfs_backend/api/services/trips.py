@@ -30,10 +30,11 @@ SHAPE_SQL = f"SELECT {POLYLINE_SQL} FROM core.shape_line s WHERE s.feed_version_
 STOPS_SQL = """
     SELECT st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
            st.pickup_type, st.drop_off_type,
-           p.id, p.url_key, p.name, p.stop_group_id, p.platform_code, ST_Y(p.geom), ST_X(p.geom)
+           p.url_key, p.name, g.url_key, p.platform_code, ST_Y(p.geom), ST_X(p.geom)
     FROM gtfs.stop_times st
     LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
     LEFT JOIN core.stop p ON p.id = l.public_stop_id
+    LEFT JOIN core.stop_group g ON g.id = p.stop_group_id
     WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
     ORDER BY st.stop_sequence
 """
@@ -64,10 +65,10 @@ async def _trip(conn, params: dict) -> tuple:
 
 
 def _stop(row, day: Day) -> TripStop:
-    seq, arr, dep, pickup, drop_off, pid, pkey, pname, gid, pcode, lat, lon = row
+    seq, arr, dep, pickup, drop_off, pkey, pname, gkey, pcode, lat, lon = row
     return TripStop(
         stop_sequence=seq,
-        stop=StopRef(id=pid, key=pkey, name=pname, group_id=gid, platform_code=pcode) if pid else None,
+        stop=StopRef(key=pkey, name=pname, group_key=gkey, platform_code=pcode) if pkey else None,
         lat=lat,
         lon=lon,
         scheduled_arrival=day.base + arr if arr is not None else None,

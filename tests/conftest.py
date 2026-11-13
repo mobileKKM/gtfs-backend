@@ -104,6 +104,12 @@ def reset_db(database_url: str) -> None:
             ).fetchall()
             for (part,) in parts:
                 conn.execute(f'DROP TABLE gtfs."{part}"')
+        for (part,) in conn.execute(
+            "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
+            "JOIN pg_class p ON p.oid = i.inhparent JOIN pg_namespace n ON n.oid = p.relnamespace "
+            "WHERE n.nspname = 'core' AND p.relname = 'departure'"
+        ).fetchall():
+            conn.execute(f'DROP TABLE core."{part}"')
         conn.execute(
             "TRUNCATE core.stop_direction, core.stop_link, core.shape_line, core.service_day_version, core.service_date, "
             "core.stop, core.stop_group, core.public_id, core.feed_version, core.feed CASCADE"

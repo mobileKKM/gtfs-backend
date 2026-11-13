@@ -85,28 +85,21 @@ class Row:
 async def scheduled(
     conn: AsyncConnection, days: list[Day], public_stop_ids: list[str], start: int, end: int, lookback: int = LOOKBACK_S
 ) -> list[Scheduled]:
-    """Timetabled departures at `public_stop_ids` between start - lookback and end (epochs).
-
-    Skips stops without pickup and the trip's last stop (arrivals only).
-    """
+    """Timetabled departures at `public_stop_ids` between start - lookback and end (epochs), from core.departure (which
+    has no stops without pickup and no trips' last stops: arrivals only)."""
     days = [d for d in days if end - d.base >= 0 and start - lookback - d.base <= MAX_GTFS_TIME_S]
     if not days or not public_stop_ids:
         return []
     sql, params = union_per_version(
         """
-        SELECT {i}, st.trip_id, st.stop_sequence, l.public_stop_id,
-               extract(epoch FROM st.departure_time)::int, coalesce(st.stop_headsign, t.trip_headsign),
-               t.route_id, coalesce(st.pickup_type, 0) IN (2, 3)
+        SELECT {i}, d.trip_id, d.stop_sequence, l.public_stop_id, d.departure_s, d.headsign, d.route_id, d.on_demand
         FROM core.stop_link l
-        JOIN gtfs.stop_times st ON st.feed_version_id = %(fv{i})s AND st.stop_id = l.stop_id
-             AND st.departure_time BETWEEN %(lo{i})s * interval '1 second' AND %(hi{i})s * interval '1 second'
-        JOIN gtfs.trips t ON t.feed_version_id = %(fv{i})s AND t.trip_id = st.trip_id
+        JOIN core.departure d ON d.feed_version_id = %(fv{i})s AND d.stop_id = l.stop_id
+             AND d.departure_s BETWEEN %(lo{i})s AND %(hi{i})s
+             -- the day's services, checked in the index: rows of other days are never read
+             AND d.service_id = ANY(ARRAY(SELECT sd.service_id FROM core.service_date sd
+                                          WHERE sd.feed_version_id = %(fv{i})s AND sd.date = %(date{i})s))
         WHERE l.feed_version_id = %(fv{i})s AND l.public_stop_id = ANY(%(public_stop_ids)s)
-          AND coalesce(st.pickup_type, 0) <> 1
-          AND EXISTS (SELECT 1 FROM core.service_date sd
-                      WHERE sd.feed_version_id = %(fv{i})s AND sd.date = %(date{i})s AND sd.service_id = t.service_id)
-          AND EXISTS (SELECT 1 FROM gtfs.stop_times n
-                      WHERE n.feed_version_id = %(fv{i})s AND n.trip_id = st.trip_id AND n.stop_sequence > st.stop_sequence)
         """,
         [{"fv": d.feed_version_id, "date": d.date, "lo": start - lookback - d.base, "hi": end - d.base} for d in days],
         {"public_stop_ids": public_stop_ids},

@@ -15,6 +15,7 @@ from gtfs_backend.worker.static.versions import RetirementBusy, retire_versions
 
 STATUS = "SELECT status FROM core.feed_version WHERE feed_id = 'kmk_t' AND version = 1"
 V1_STOP_TIMES = "SELECT to_regclass('gtfs.stop_times__kmk_t__v1')"
+V1_DEPARTURES = "SELECT to_regclass('core.departure__kmk_t__v1')"
 
 
 def _two_versions(db, tmp_path, old_days: list[date], new_days: list[date]) -> None:
@@ -27,6 +28,7 @@ def test_busy_tables_postpone_retirement_and_leave_the_transaction_usable(db, da
     d = date.today()
     _two_versions(db, tmp_path, [d], [d + timedelta(days=1)])
     db.commit()
+    assert db.execute("SELECT count(*) FROM core.departure WHERE feed_version_id = 'kmk_t_v1'").fetchone()[0] > 0
 
     # like an import in another transaction: holds the parent table for as long as it runs
     with psycopg.connect(database_url) as importer:
@@ -43,6 +45,9 @@ def test_busy_tables_postpone_retirement_and_leave_the_transaction_usable(db, da
     assert db.execute("SELECT current_setting('lock_timeout')").fetchone()[0] == "0"  # put back after the drops
     db.commit()
     assert db.execute(STATUS).fetchone()[0] == "retired"
+    # its partitions are gone, the derived departures with the GTFS tables
+    assert db.execute(V1_STOP_TIMES).fetchone()[0] is None
+    assert db.execute(V1_DEPARTURES).fetchone()[0] is None
 
 
 def test_import_succeeds_when_its_retirement_is_blocked(db, database_url, tmp_path, monkeypatch):

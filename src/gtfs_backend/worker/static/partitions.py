@@ -24,23 +24,30 @@ class FeedVersion(NamedTuple):
         return partition_name(table, self.feed_id, self.version)
 
 
-def create_version_partition(cur: psycopg.Cursor, table: str, fv: FeedVersion) -> sql.Identifier:
-    """A standalone table shaped like the GTFS table, to be filled and then attached."""
-    part = sql.Identifier("gtfs", fv.partition(table))
+# Tables outside the `gtfs` schema that are partitioned per feed version too: derived at import (static/derive.py) and
+# dropped with the version's GTFS partitions.
+DERIVED = {"departure": "core"}
+
+
+def create_version_partition(cur: psycopg.Cursor, table: str, fv: FeedVersion, schema: str = "gtfs") -> sql.Identifier:
+    """A standalone table shaped like the parent table, to be filled and then attached."""
+    part = sql.Identifier(schema, fv.partition(table))
     cur.execute(
         sql.SQL(
             "CREATE TABLE {part} (LIKE {parent} INCLUDING DEFAULTS INCLUDING GENERATED, "
             # matches the partition bound, so ATTACH doesn't need to scan the rows
             "CONSTRAINT version_chk CHECK (feed_version_id = {id}))"
-        ).format(part=part, parent=sql.Identifier("gtfs", table), id=sql.Literal(fv.id))
+        ).format(part=part, parent=sql.Identifier(schema, table), id=sql.Literal(fv.id))
     )
     return part
 
 
-def attach_version_partition(cur: psycopg.Cursor, table: str, part: sql.Identifier, fv: FeedVersion) -> None:
+def attach_version_partition(
+    cur: psycopg.Cursor, table: str, part: sql.Identifier, fv: FeedVersion, schema: str = "gtfs"
+) -> None:
     cur.execute(
         sql.SQL("ALTER TABLE {parent} ATTACH PARTITION {part} FOR VALUES IN ({id})").format(
-            parent=sql.Identifier("gtfs", table), part=part, id=sql.Literal(fv.id)
+            parent=sql.Identifier(schema, table), part=part, id=sql.Literal(fv.id)
         )
     )
 
@@ -49,3 +56,5 @@ def drop_version_partitions(conn: psycopg.Connection, fv: FeedVersion) -> None:
     cur = conn.cursor()
     for name in TABLES:
         cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier("gtfs", fv.partition(name))))
+    for name, schema in DERIVED.items():
+        cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier(schema, fv.partition(name))))

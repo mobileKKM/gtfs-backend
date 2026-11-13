@@ -56,6 +56,49 @@ def test_fixture_round_trip_is_value_identical(db):
     ).fetchone() == ("text", "802-01")
 
 
+def test_departures_are_the_boardable_stop_times(db):
+    """core.departure, rebuilt here from the zip's CSV: every stop time with a departure where boarding is allowed
+    (pickup_type not 1) that isn't its trip's last stop, with the trip's service, route and headsign."""
+    t = do_import(db, "kmk_t", STATIC / "GTFS_KRK_T.zip")
+    trips = {r["trip_id"]: r for r in read_zip_csv(STATIC / "GTFS_KRK_T.zip", "trips.txt")}
+    stop_times = read_zip_csv(STATIC / "GTFS_KRK_T.zip", "stop_times.txt")
+    last = {}
+    for r in stop_times:
+        last[r["trip_id"]] = max(last.get(r["trip_id"], -1), int(r["stop_sequence"]))
+
+    def secs(text: str) -> int:
+        h, m, sec = text.strip().split(":")
+        return int(h) * 3600 + int(m) * 60 + int(sec)
+
+    expected = set()
+    for r in stop_times:
+        pickup = int(r.get("pickup_type") or 0)
+        if not (r.get("departure_time") or "").strip() or pickup == 1 or int(r["stop_sequence"]) >= last[r["trip_id"]]:
+            continue
+        trip = trips[r["trip_id"]]
+        headsign = (r.get("stop_headsign") or "").strip() and r["stop_headsign"] or trip.get("trip_headsign") or None
+        expected.add(
+            (
+                r["stop_id"],
+                secs(r["departure_time"]),
+                trip["service_id"],
+                r["trip_id"],
+                int(r["stop_sequence"]),
+                trip["route_id"],
+                headsign,
+                pickup in (2, 3),
+            )
+        )
+    stored = set(
+        db.execute(
+            "SELECT stop_id, departure_s, service_id, trip_id, stop_sequence, route_id, headsign, on_demand "
+            "FROM core.departure WHERE feed_version_id = %s",
+            (t.feed_version_id,),
+        ).fetchall()
+    )
+    assert expected and stored == expected
+
+
 def test_latest_version_is_picked_by_number_not_by_id_text(db):
     # "kmk_t_v10" sorts before "kmk_t_v9" as text
     db.execute("INSERT INTO core.feed (feed_id, stop_namespace) VALUES ('kmk_t', 'ztp') ON CONFLICT DO NOTHING")

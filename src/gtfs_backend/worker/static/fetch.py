@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from concurrent.futures import Executor
 from dataclasses import asdict
@@ -21,6 +22,7 @@ from gtfs_backend.worker.static.archive import sha256_file, validate_zip
 from gtfs_backend.worker.static.load import ImportResult, SourceMeta
 
 PREVIOUSLY_FAILED = "previously_failed"  # ImportResult.status of a zip that is known to fail
+IMPORT_NICENESS = 10  # added to the import process's nice value (lower CPU priority)
 
 
 def import_order(feeds: FeedsFile) -> list[FeedConfig]:
@@ -40,7 +42,13 @@ def run_import_job(
     log_level: str = "INFO",
 ) -> dict:
     """Entry point for the import process (must be top-level for ProcessPoolExecutor)."""
+    import os
+
     from gtfs_backend.db import connect
+
+    # an import is CPU-heavy for a minute: it must not take CPU from realtime polling or the API on the same host
+    with contextlib.suppress(OSError):
+        os.nice(IMPORT_NICENESS)
     from gtfs_backend.logs import setup_logging
     from gtfs_backend.worker.static.load import import_zip
 

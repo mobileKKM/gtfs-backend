@@ -209,3 +209,17 @@ def test_an_import_invalidates_only_the_feeds_it_can_change():
     assert ztp == ["km_mld", "kmk_a", "kmk_m", "kmk_t"]  # the trains' index is left alone
     assert sorted(worker.affected_by(feeds["km_mld"])) == ["km_mld", "kmk_a", "kmk_m", "kmk_t"]
     assert worker.affected_by(feeds["km_kolej"]) == ["km_kolej"]
+
+
+def test_imports_run_at_lower_cpu_priority(monkeypatch):
+    import contextlib
+
+    from gtfs_backend import db
+    from gtfs_backend.worker.static import fetch, load
+
+    calls = []
+    monkeypatch.setattr(os, "nice", lambda n: calls.append(n) or n)
+    monkeypatch.setattr(db, "connect", lambda url: contextlib.nullcontext())
+    monkeypatch.setattr(load, "import_zip", lambda *a, **k: load.ImportResult("kmk_t_v1", "kmk_t", 1, "ready"))
+    fetch.run_import_job("kmk_t", "ztp", [], None, "x.zip", {"sha256": "abc"}, "postgresql://unused")
+    assert calls == [fetch.IMPORT_NICENESS]

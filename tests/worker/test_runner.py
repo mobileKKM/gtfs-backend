@@ -200,3 +200,12 @@ def test_stats_put_the_loop_lag_into_every_realtime_meta():
     worker.loop_lag.worst_ms = 42.0
     worker.record_stats(1)
     assert [t.meta["loop_lag_ms"] for t in worker.realtime_tasks] == [42.0, 42.0]
+
+
+def test_an_import_invalidates_only_the_feeds_it_can_change():
+    worker = _worker()  # feeds.yml: kmk_a/m/t (namespace ztp), km_kolej, km_mld (shares ztp's stops)
+    feeds = {f.feed_id: f for f in worker.enabled}
+    ztp = sorted(worker.affected_by(feeds["kmk_t"]))
+    assert ztp == ["km_mld", "kmk_a", "kmk_m", "kmk_t"]  # the trains' index is left alone
+    assert sorted(worker.affected_by(feeds["km_mld"])) == ["km_mld", "kmk_a", "kmk_m", "kmk_t"]
+    assert worker.affected_by(feeds["km_kolej"]) == ["km_kolej"]

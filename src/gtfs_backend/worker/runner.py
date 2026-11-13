@@ -171,9 +171,16 @@ class Worker:
         self.exit_code = 1
         self.stop.set()
 
-    def _invalidate_runtimes(self) -> None:
-        for rt in self.runtimes.values():  # stop links of other feeds may change too
-            rt.invalidate()
+    def affected_by(self, feed: FeedConfig) -> list[str]:
+        """Feeds whose trip index an import of `feed` can change: its own, and those of the namespaces whose stops the
+        import updates (its own and the ones it shares), whose stations then belong to other stop groups."""
+        namespaces = {feed.namespace, *feed.share_stops_with}
+        return [f.feed_id for f in self.enabled if f.namespace in namespaces or namespaces & set(f.share_stops_with)]
+
+    def _invalidate_runtimes(self, feed_ids) -> None:
+        for feed_id in feed_ids:
+            if rt := self.runtimes.get(feed_id):
+                rt.invalidate()
 
     # ------------------------------------------------------------------------------------------- loops
 
@@ -240,7 +247,7 @@ class Worker:
                     error=result.error,
                 )
                 if result.status == "ready":
-                    self._invalidate_runtimes()
+                    self._invalidate_runtimes(self.affected_by(feed))
                     await self.redis.publish(live_layout.STATIC_UPDATED, feed.feed_id)
         except asyncio.CancelledError:
             raise
@@ -274,8 +281,7 @@ class Worker:
             log.error("daily_retirement_failed", error=str(exc))
             return False
         log.info("daily_retirement", retired=retired, busy=busy)
-        if any(retired.values()):
-            self._invalidate_runtimes()
+        self._invalidate_runtimes(feed_id for feed_id, versions in retired.items() if versions)
         return not busy
 
     async def _maintenance_loop(self) -> None:

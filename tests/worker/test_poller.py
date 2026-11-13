@@ -135,3 +135,54 @@ async def test_unchanged_polls_keep_the_data_alive_until_max_age(monkeypatch):
     task.last_change -= 601
     await task.cycle()
     assert store.touched == 2
+
+
+class _Index:
+    def __init__(self, n: int, now: float):
+        from zoneinfo import ZoneInfo
+
+        from gtfs_backend.servicetime import local_date
+
+        self.n, self.tz, self.trips, self.days = n, ZoneInfo("Europe/Warsaw"), {}, []
+        self.loaded_for = local_date(now, self.tz)
+
+
+async def test_a_stale_index_keeps_serving_while_one_rebuild_runs(monkeypatch):
+    import asyncio
+
+    now = 1_800_000_000.0
+    gate, loads = asyncio.Event(), []
+
+    async def load_index(pool, feed_id, at, day_start):
+        loads.append(at)
+        if len(loads) == 3:
+            raise ConnectionError("database down")
+        if len(loads) > 1:
+            await gate.wait()
+        return _Index(len(loads), at)
+
+    monkeypatch.setattr(poller, "load_index", load_index)
+    runtime = FeedRuntime(FeedConfig(feed_id="kmk_t", static="https://x.test/t.zip"), pool=None)
+    assert (await runtime.get_index(now)).n == 1  # the first load is waited for
+
+    runtime.invalidate()  # e.g. a new timetable version
+    assert (await runtime.get_index(now)).n == 1  # the old index keeps serving...
+    await asyncio.sleep(0)  # (the rebuild starts)
+    assert (await runtime.get_index(now)).n == 1 and len(loads) == 2  # ...while one rebuild runs
+    gate.set()
+    await runtime._rebuild
+    assert (await runtime.get_index(now)).n == 2
+
+    # a failed rebuild keeps the index it has and is tried again on the next poll
+    runtime.invalidate()
+    await runtime.get_index(now)
+    await runtime._rebuild
+    assert runtime.index.n == 2 and runtime._dirty
+    await runtime.get_index(now)
+    await runtime._rebuild
+    assert runtime.index.n == 4
+
+    # a new day: rebuilt the same way
+    assert (await runtime.get_index(now + 86400)).n == 4
+    await runtime._rebuild
+    assert runtime.index.n == 5

@@ -35,7 +35,12 @@ def median_delay(res: Result) -> float | None:
 
 
 class FeedRuntime:
-    """Per-feed shared state: trip index (reloaded on static updates and day change) + recent trip delays."""
+    """Per-feed shared state: trip index (reloaded on static updates and day change) + recent trip delays.
+
+    Only the first load is waited for. Afterwards a stale index (new day, new timetable version) keeps serving while
+    one rebuild runs in the background and replaces it when done: polls never wait for a reload. The old index stays
+    right meanwhile: it has tomorrow loaded, and a new version's trips only match a few seconds later.
+    """
 
     def __init__(self, feed: FeedConfig, pool: AsyncConnectionPool, state: FeedRealtimeState | None = None):
         self.feed = feed
@@ -44,26 +49,46 @@ class FeedRuntime:
         self.index: TripIndex | None = None
         self._dirty = True
         self._lock = asyncio.Lock()
+        self._rebuild: asyncio.Task | None = None
 
     def invalidate(self) -> None:
         self._dirty = True
 
+    def _stale(self, now: float) -> bool:
+        return self._dirty or self.index is None or self.index.loaded_for != local_date(now, self.index.tz)
+
     async def get_index(self, now: float) -> TripIndex | None:
-        async with self._lock:
-            stale = self.index is None or self.index.loaded_for != local_date(now, self.index.tz)
-            if self._dirty or stale:
-                started = time.monotonic()
-                self.index = await load_index(self.pool, self.feed.feed_id, now, self.feed.day_start)
-                self._dirty = False
-                if self.index:
-                    log.info(
-                        "trip_index_loaded",
-                        feed=self.feed.feed_id,
-                        trips=len(self.index.trips),
-                        days=[(d.date.isoformat(), d.version) for d in self.index.days],
-                        seconds=round(time.monotonic() - started, 1),
-                    )
+        if self.index is None:  # nothing to serve yet: wait for the load
+            async with self._lock:
+                if self._stale(now):
+                    await self._load(now)
             return self.index
+        if self._stale(now) and (self._rebuild is None or self._rebuild.done()):
+            self._rebuild = asyncio.create_task(self._load(now), name=f"trip_index:{self.feed.feed_id}")
+        return self.index
+
+    async def _load(self, now: float) -> None:
+        self._dirty = False  # an invalidation while loading marks it dirty again: loaded once more afterwards
+        started = time.monotonic()
+        try:
+            index = await load_index(self.pool, self.feed.feed_id, now, self.feed.day_start)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep serving the old index; tried again on the next poll
+            self._dirty = True
+            log.warning("trip_index_load_failed", feed=self.feed.feed_id, error=f"{type(exc).__name__}: {exc}")
+            if self.index is None:
+                raise
+            return
+        self.index = index
+        if index:
+            log.info(
+                "trip_index_loaded",
+                feed=self.feed.feed_id,
+                trips=len(index.trips),
+                days=[(d.date.isoformat(), d.version) for d in index.days],
+                seconds=round(time.monotonic() - started, 1),
+            )
 
 
 RECENT_POLLS = 60  # window for poll_seconds_max (10 minutes at the default 10 s interval)

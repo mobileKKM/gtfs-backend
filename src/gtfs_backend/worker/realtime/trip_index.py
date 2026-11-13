@@ -6,6 +6,7 @@ are fetched lazily for trips that appear in realtime data and cached until the n
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -134,9 +135,15 @@ async def load_index(
             """,
             (ids,),
         )
-        for row in await cur.fetchall():
-            if row[10] is not None:
-                index.add_trip(TripInfo(number[row[0]], *row[1:]))
+        rows = await cur.fetchall()
+
+        def add_trips() -> None:
+            for row in rows:
+                if row[10] is not None:
+                    index.add_trip(TripInfo(number[row[0]], *row[1:]))
+
+        # ~100k objects for a big feed: built in a thread, so the event loop (every feed's polls) keeps running
+        await asyncio.to_thread(add_trips)
 
         cur = await conn.execute(
             "SELECT feed_version_id, stop_id, public_stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (ids,)

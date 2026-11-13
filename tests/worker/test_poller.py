@@ -186,3 +186,23 @@ async def test_a_stale_index_keeps_serving_while_one_rebuild_runs(monkeypatch):
     assert (await runtime.get_index(now + 86400)).n == 4
     await runtime._rebuild
     assert runtime.index.n == 5
+
+
+def test_stop_times_of_ended_trips_are_forgotten():
+    from datetime import date
+    from zoneinfo import ZoneInfo
+
+    from gtfs_backend.worker.realtime.trip_index import ServiceDay, StopTime, TripIndex, TripInfo
+
+    base = 1_800_000_000  # the service day's base
+    index = TripIndex("kmk_t", ZoneInfo("Europe/Warsaw"))
+    index.days = [ServiceDay(date(2027, 1, 15), 1, base, frozenset({"s"}))]
+    for trip_id, last_arrival in (("ended", 3600), ("running", 7200)):
+        index.add_trip(TripInfo(1, trip_id, "s", "R1", None, None, None, None, "1", 0, 0, last_arrival))
+        index.stop_times[(1, trip_id)] = [StopTime(1, "S1", 0, 0)]
+    index.stop_times[(1, "unknown")] = []  # its trip isn't in the index (any more)
+
+    late = 600
+    # "ended" arrived at base + 3600 and can't match after base + 3600 + late; "running" still can
+    assert index.forget_finished(base + 3600 + late + 1, late) == 2
+    assert list(index.stop_times) == [(1, "running")]

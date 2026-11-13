@@ -170,7 +170,6 @@ def tiny_feed(path: Path, start: str, dates: list[str], night_trip: bool) -> Pat
     )
 
 
-
 async def test_trip_index_holds_only_trips_running_on_its_days(db, database_url, tmp_path):
     """The realtime trip index loads yesterday/today/tomorrow; trips of services running on none of them can't match."""
     from gtfs_backend.db import async_pool

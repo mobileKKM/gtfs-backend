@@ -34,6 +34,9 @@ def median_delay(res: Result) -> float | None:
     return statistics.median(delays) if delays else None
 
 
+FORGET_EVERY_S = 60  # how often a feed's cached stop times of ended trips are dropped
+
+
 class FeedRuntime:
     """Per-feed shared state: trip index (reloaded on static updates and day change) + recent trip delays.
 
@@ -50,6 +53,7 @@ class FeedRuntime:
         self._dirty = True
         self._lock = asyncio.Lock()
         self._rebuild: asyncio.Task | None = None
+        self._forgotten_at = 0.0  # time.monotonic() of the last TripIndex.forget_finished
 
     def invalidate(self) -> None:
         self._dirty = True
@@ -66,6 +70,13 @@ class FeedRuntime:
         if self._stale(now) and (self._rebuild is None or self._rebuild.done()):
             self._rebuild = asyncio.create_task(self._load(now), name=f"trip_index:{self.feed.feed_id}")
         return self.index
+
+    def forget_finished(self, now: float) -> None:
+        """Every FORGET_EVERY_S: drop the stop times of trips that ended (TripIndex.forget_finished)."""
+        if self.index is None or time.monotonic() - self._forgotten_at < FORGET_EVERY_S:
+            return
+        self._forgotten_at = time.monotonic()
+        self.index.forget_finished(now, self.state.late_window_s)
 
     async def _load(self, now: float) -> None:
         self._dirty = False  # an invalidation while loading marks it dirty again: loaded once more afterwards
@@ -220,6 +231,7 @@ class RealtimeTask:
 
         t2 = time.perf_counter()
         res = await process_message(self.feed_id, msg, index, self.runtime.state, load, now)
+        self.runtime.forget_finished(now)
         t3 = time.perf_counter()
         combined = self.kind == RealtimeKind.COMBINED
         if combined or self.kind == RealtimeKind.VEHICLE_POSITIONS:

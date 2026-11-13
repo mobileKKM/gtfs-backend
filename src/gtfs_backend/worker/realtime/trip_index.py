@@ -83,6 +83,23 @@ class TripIndex:
     def public_stop(self, version: int, stop_id: str | None) -> str | None:
         return self.stop_links.get((version, stop_id)) if stop_id else None
 
+    def forget_finished(self, now: float, late_s: int) -> int:
+        """Drop the cached stop times of trips that can't match any more: every instance (a loaded day of its version
+        running its service) ended more than `late_s` ago (normalize's window). Returns how many were dropped. Without
+        this the cache grows all day, to every trip that ran (kmk_a: ~100 MB by the evening)."""
+        gone = []
+        for key in self.stop_times:
+            info = self.trips.get(key)
+            if info is None or all(
+                d.base + info.last_arrival + late_s < now
+                for d in self.days
+                if d.version == info.version and info.service_id in d.services
+            ):
+                gone.append(key)
+        for key in gone:
+            del self.stop_times[key]
+        return len(gone)
+
 
 async def load_index(
     pool: AsyncConnectionPool, feed_id: str, now: float, day_start: DayStart = "noon_minus_12h"

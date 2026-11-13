@@ -64,6 +64,9 @@ class TripIndex:
     by_trip_id: dict[str, list[TripInfo]] = field(default_factory=lambda: defaultdict(list))
     by_base_id: dict[str, list[TripInfo]] = field(default_factory=lambda: defaultdict(list))  # trip id without `_service_N`
     stop_links: dict[tuple[int, str], str] = field(default_factory=dict)  # (version, stop_id) -> public_stop_id
+    # (version, station stop_id) -> (its stop group, the public_stop_ids of its stops): GTFS stations (location_type 1)
+    stations: dict[tuple[int, str], tuple[str, tuple[str, ...]]] = field(default_factory=dict)
+    routes: set[tuple[int, str]] = field(default_factory=set)  # (version, route_id)
     stop_times: dict[tuple[int, str], list[StopTime]] = field(default_factory=dict)
     version_ids: dict[int, str] = field(default_factory=dict)  # version number -> core.feed_version.id
     loaded_for: date | None = None
@@ -140,6 +143,26 @@ async def load_index(
         )
         for fv_id, stop_id, pid in await cur.fetchall():
             index.stop_links[(number[fv_id], stop_id)] = pid
+
+        # a station's stops can be split over groups: it is shown as the group most of them are in
+        cur = await conn.execute(
+            """
+            SELECT p.feed_version_id, p.stop_id, mode() WITHIN GROUP (ORDER BY s.stop_group_id),
+                   array_agg(DISTINCT l.public_stop_id ORDER BY l.public_stop_id)
+            FROM gtfs.stops p
+            JOIN gtfs.stops c ON c.feed_version_id = p.feed_version_id AND c.parent_station = p.stop_id
+            JOIN core.stop_link l ON l.feed_version_id = c.feed_version_id AND l.stop_id = c.stop_id
+            JOIN core.stop s ON s.id = l.public_stop_id
+            WHERE p.feed_version_id = ANY(%s) AND p.location_type = 1
+            GROUP BY p.feed_version_id, p.stop_id
+            """,
+            (ids,),
+        )
+        for fv_id, stop_id, group_id, pids in await cur.fetchall():
+            index.stations[(number[fv_id], stop_id)] = (group_id, tuple(pids))
+
+        cur = await conn.execute("SELECT feed_version_id, route_id FROM gtfs.routes WHERE feed_version_id = ANY(%s)", (ids,))
+        index.routes = {(number[fv_id], route_id) for fv_id, route_id in await cur.fetchall()}
     return index
 
 

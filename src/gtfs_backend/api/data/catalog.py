@@ -20,7 +20,7 @@ from psycopg_pool import AsyncConnectionPool
 from gtfs_backend.api.schemas import Route, RouteRef
 from gtfs_backend.feeds import FeedsFile
 from gtfs_backend.keys import route_key
-from gtfs_backend.modes import MODE_SQL
+from gtfs_backend.modes import MODE_SQL, Mode
 from gtfs_backend.servicetime import DayStart, day_base, local_date, nearby_dates
 
 REFRESH_S = 300
@@ -42,30 +42,31 @@ class RouteInfo:
     feed_id: str
     route_id: str
     short_name: str | None
-    long_name: str | None
     route_type: int
-    mode: str
+    mode: Mode
     agency: dict | None  # {name, url, phone} as given in agency.txt
 
     @property
     def key(self) -> str:
         return route_key(self.feed_id, self.route_id)
 
+    @property
+    def name(self) -> str:
+        return self.short_name or self.route_id
+
     def model(self) -> Route:
         return Route(
             key=self.key,
-            route_id=self.route_id,
-            short_name=self.short_name,
-            long_name=self.long_name,
-            route_type=self.route_type,
+            name=self.name,
             mode=self.mode,
+            route_type=self.route_type,
             agency=self.agency,
         )
 
     def ref(self) -> RouteRef:
         return RouteRef(
             key=self.key,
-            name=self.short_name or self.route_id,
+            name=self.name,
             mode=self.mode,
         )
 
@@ -196,7 +197,7 @@ class Catalog:
             async with self.pool.connection() as conn:
                 cur = await conn.execute(
                     f"""
-                    SELECT r.feed_version_id, fv.feed_id, r.route_id, r.route_short_name, r.route_long_name, r.route_type,
+                    SELECT r.feed_version_id, fv.feed_id, r.route_id, r.route_short_name, r.route_type,
                            {MODE_SQL} AS mode, a.agency_name, a.agency_url, a.agency_phone
                     FROM gtfs.routes r
                     JOIN core.feed_version fv ON fv.id = r.feed_version_id
@@ -215,7 +216,6 @@ class Catalog:
                     feed_id,
                     route_id,
                     short,
-                    long,
                     rtype,
                     mode,
                     a_name,
@@ -223,7 +223,7 @@ class Catalog:
                     a_phone,
                 ) in await cur.fetchall():
                     agency = {"name": a_name, "url": a_url, "phone": a_phone} if a_name is not None else None
-                    loaded[fv_id][route_id] = RouteInfo(feed_id, route_id, short, long, rtype, mode, agency)
+                    loaded[fv_id][route_id] = RouteInfo(feed_id, route_id, short, rtype, mode, agency)
             self._routes.update(loaded)
         return {(v, rid): info for v in set(feed_version_ids) for rid, info in self._routes.get(v, {}).items()}
 

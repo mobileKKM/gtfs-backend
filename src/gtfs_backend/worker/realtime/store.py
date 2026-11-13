@@ -84,10 +84,16 @@ class RealtimeStore:
         await self.redis.set(live_layout.alerts(feed_id), _dumps(res.alerts), ex=self.ttls.alert)
 
     async def write_unmatched(self, feed_id: str, kind: str, res: Result) -> None:
-        if res.unmatched_trips or res.unmatched_vehicles:
+        if res.unmatched_trips or res.unmatched_vehicles or res.unmatched_alert_entities:
             await self.redis.set(
                 live_layout.unmatched(feed_id, kind),
-                _dumps({"trips": res.unmatched_trips, "vehicles": res.unmatched_vehicles}),
+                _dumps(
+                    {
+                        "trips": res.unmatched_trips,
+                        "vehicles": res.unmatched_vehicles,
+                        "alert_entities": res.unmatched_alert_entities,
+                    }
+                ),
                 ex=self.ttls.unmatched,
             )
 

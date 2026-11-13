@@ -131,7 +131,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     key = keys.trip_key(feed_id, service_date, trip_id)
     async with ctx.pool.connection() as conn:
-        route_id, _, _, _ = await _trip(conn, params)
+        route_id, _, direction_id, _ = await _trip(conn, params)
         rows = await (await conn.execute(STOPS_LIVE_SQL, params)).fetchall()
 
     update = TripUpdate.for_version((await realtime.trip_updates(ctx.redis, [key])).get(key), day.version)
@@ -145,7 +145,8 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     info = await ctx.catalog.route(day.feed_version_id, route_id)
     scope = alerts.Scope(
         routes={(feed_id, route_id): info.route_type if info else None},
-        trips={(feed_id, trip_id)},
+        directions={(feed_id, route_id, direction_id)} if direction_id is not None else set(),
+        trips={key},
         public_stop_ids={pid for *_, pid in rows if pid},
         feeds={feed_id},
     )

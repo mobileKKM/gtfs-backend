@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 from gtfs_backend.api.schemas.alerts import AlertRef
-from gtfs_backend.api.schemas.common import Route, StopRef
+from gtfs_backend.api.schemas.common import DirectionId, Route, StopRef
 from gtfs_backend.api.schemas.vehicles import Vehicle
 
 
@@ -34,7 +34,7 @@ class TripView(BaseModel):
     service_date: str
     route: Route | None = None
     headsign: str | None = None
-    direction_id: int | None = None
+    direction_id: DirectionId | None = None
     shape: TripShape | None = None  # None only when no stop has coordinates
     stops: list[TripStop]
 

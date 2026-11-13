@@ -22,8 +22,8 @@ async def list_alerts(
     stop: Annotated[str | None, Query(description="stop key or id (a stop group covers its stops)")] = None,
     active: Annotated[bool, Query(description="only alerts active now or starting within a day")] = False,
 ):
-    """Service alerts as the feeds publish them (texts, active periods and entities unchanged). Boards and trip views
-    only carry the active ones (`active=true` here)."""
+    """Service alerts, severe first, with `entities` saying where each applies in our terms (routes, trips, stops,
+    stop groups). Boards and trip views only carry the active ones (`active=true` here)."""
     s = ctx.settings
     cache_control = public(s.cache_ttl_alerts)
     return await cached(request, ctx, s.cache_ttl_alerts, cache_control, lambda: alerts.search(ctx, feed, route, stop, active))

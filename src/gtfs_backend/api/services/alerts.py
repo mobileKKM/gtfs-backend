@@ -1,7 +1,8 @@
-"""Service alerts from Redis, passed through as the feeds give them, and matching them to a board/trip/route/stop.
+"""Service alerts from Redis, with what they apply to in our terms, and matching them to a board/trip/route/stop.
 
-GTFS-RT: the fields of one informed entity are combined with AND (route 52 *at* stop X), an alert applies if any
-of its entities does. A scope says what is being looked at; dimensions it leaves as None aren't checked.
+The worker stores each informed entity resolved (trip key, our public stop ids). GTFS-RT: the fields of one entity
+are combined with AND (route 52 *at* stop X), an alert applies if any of its entities does. A scope says what is being
+looked at; dimensions it leaves as None aren't checked.
 """
 
 from __future__ import annotations
@@ -14,30 +15,36 @@ from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.errors import InvalidInput, NotFound
-from gtfs_backend.api.schemas import Alert, AlertList, AlertRef
+from gtfs_backend.api.schemas import Alert, AlertEntity, AlertList, AlertRef
 from gtfs_backend.api.services import stops
+from gtfs_backend.modes import mode_of
 
 
 @dataclass
 class Scope:
     routes: dict[tuple[str, str], int | None] | None = None  # (feed_id, route_id) -> route_type
+    directions: set[tuple[str, str, int]] | None = None  # (feed_id, route_id, direction_id) running here
     public_stop_ids: set[str] | None = None
-    trips: set[tuple[str, str]] | None = None  # (feed_id, trip_id)
+    trips: set[str] | None = None  # trip keys
     feeds: set[str] | None = None  # feed-wide alerts (agency / no selector) of these feeds apply
 
 
 def entity_matches(feed_id: str, ie: dict, scope: Scope) -> bool:
     hit = False
-    if ie.get("route_id") is not None and scope.routes is not None:
-        if (feed_id, ie["route_id"]) not in scope.routes:
+    route_id = ie.get("route_id")
+    if route_id is not None and scope.routes is not None:
+        if (feed_id, route_id) not in scope.routes:
+            return False
+        direction = ie.get("direction_id")
+        if direction is not None and scope.directions is not None and (feed_id, route_id, direction) not in scope.directions:
             return False
         hit = True
-    if ie.get("trip_id") is not None and scope.trips is not None:
-        if (feed_id, ie["trip_id"]) not in scope.trips:
+    if ie.get("trip_key") is not None and scope.trips is not None:
+        if ie["trip_key"] not in scope.trips:
             return False
         hit = True
-    if ie.get("stop_id") is not None and scope.public_stop_ids is not None:
-        if ie.get("public_stop_id") not in scope.public_stop_ids:
+    if ie.get("public_stop_ids") and scope.public_stop_ids is not None:
+        if scope.public_stop_ids.isdisjoint(ie["public_stop_ids"]):
             return False
         hit = True
     if ie.get("route_type") is not None and scope.routes is not None:
@@ -46,7 +53,7 @@ def entity_matches(feed_id: str, ie: dict, scope: Scope) -> bool:
         hit = True
     if hit:
         return True
-    feed_wide = all(ie.get(k) is None for k in ("route_id", "trip_id", "stop_id", "route_type"))
+    feed_wide = not any(ie.get(k) for k in ("route_id", "trip_key", "public_stop_ids")) and ie.get("route_type") is None
     return feed_wide and scope.feeds is not None and feed_id in scope.feeds
 
 
@@ -71,34 +78,16 @@ def current(ctx: Context, raws: list[dict]) -> list[dict]:
 
 
 def matches(alert: dict, scope: Scope) -> bool:
-    entities = alert.get("informed_entities") or [{}]
-    return any(entity_matches(alert["feed_id"], ie, scope) for ie in entities)
+    return any(entity_matches(alert["feed_id"], ie, scope) for ie in alert.get("entities") or [])
 
 
-async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> list[Alert]:
-    """Add the routes (today's timetable) and stops named by the informed entities; the alert itself stays as given."""
+SEVERITY_ORDER = {"severe": 0, "warning": 1, "info": 2}
 
-    def entities(a: dict) -> list[dict]:
-        return a.get("informed_entities") or []
 
-    def route_keys(a: dict) -> list[tuple[str | None, str]]:
-        version = ctx.catalog.today_version(a["feed_id"])
-        return list(dict.fromkeys((version, ie["route_id"]) for ie in entities(a) if ie.get("route_id")))
-
-    def public_stop_ids(a: dict) -> list[str]:
-        return list(dict.fromkeys(ie["public_stop_id"] for ie in entities(a) if ie.get("public_stop_id")))
-
-    routes = await ctx.catalog.route_models(k for a in raws for k in route_keys(a))
-    by_id = await stops.stops_by_id(conn, {p for a in raws for p in public_stop_ids(a)})
-    return [
-        Alert(
-            key=keys.alert_key(a["feed_id"], a["id"]),
-            **a,
-            routes=[routes[k] for k in route_keys(a) if k in routes],
-            stops=[by_id[p] for p in public_stop_ids(a) if p in by_id],
-        )
-        for a in raws
-    ]
+def _order(a: dict) -> tuple[int, int]:
+    """Severe first, then the ones that started (or start) earliest."""
+    starts = [p.get("start") or 0 for p in a.get("active_periods") or []]
+    return SEVERITY_ORDER.get(a.get("severity"), len(SEVERITY_ORDER)), min(starts, default=0)
 
 
 def ref(a: dict) -> AlertRef:
@@ -106,15 +95,63 @@ def ref(a: dict) -> AlertRef:
         key=keys.alert_key(a["feed_id"], a["id"]),
         cause=a.get("cause"),
         effect=a.get("effect"),
+        severity=a.get("severity"),
         header=a.get("header"),
+        description=a.get("description"),
         active_periods=a.get("active_periods") or [],
     )
+
+
+async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> list[Alert]:
+    """Each alert with its entities as routes (today's timetable), trips and stops or stop groups. An entity whose route
+    or stop we can't show is left out: without it, it would read as applying more widely than it does."""
+    raws = sorted(raws, key=_order)
+
+    def entities(a: dict) -> list[dict]:
+        return a.get("entities") or []
+
+    def route_key(a: dict, ie: dict) -> tuple[str | None, str] | None:
+        return (ctx.catalog.today_version(a["feed_id"]), ie["route_id"]) if ie.get("route_id") else None
+
+    routes = await ctx.catalog.route_refs(k for a in raws for ie in entities(a) if (k := route_key(a, ie)))
+    named = [ie for a in raws for ie in entities(a)]
+    groups = await stops.groups_by_id(conn, {ie["stop_group_id"] for ie in named if ie.get("stop_group_id")})
+    poles = await stops.stops_by_id(
+        conn, {ie["public_stop_ids"][0] for ie in named if ie.get("public_stop_ids") and not ie.get("stop_group_id")}
+    )
+
+    def entity(a: dict, ie: dict) -> AlertEntity | None:
+        route = stop = None
+        if (k := route_key(a, ie)) is not None and (route := routes.get(k)) is None:
+            return None
+        if ie.get("stop_group_id"):
+            stop = groups.get(ie["stop_group_id"])
+        elif ie.get("public_stop_ids"):
+            stop = poles.get(ie["public_stop_ids"][0])
+        if ie.get("public_stop_ids") and stop is None:
+            return None
+        return AlertEntity(
+            mode=mode_of(ie["route_type"]) if ie.get("route_type") is not None else None,
+            route=route,
+            direction_id=ie.get("direction_id"),
+            trip_key=ie.get("trip_key"),
+            stop=stop,
+        )
+
+    return [
+        Alert(
+            **ref(a).model_dump(),
+            url=a.get("url"),
+            entities=[e for ie in entities(a) if (e := entity(a, ie)) is not None],
+        )
+        for a in raws
+    ]
 
 
 async def in_scope(ctx: Context, scope: Scope) -> list[AlertRef]:
     """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them."""
     raws = current(ctx, await realtime.alerts_json(ctx.redis, ctx.feed_ids))
-    return [ref(a) for a in raws if matches(a, scope)]
+    return [ref(a) for a in sorted(raws, key=_order) if matches(a, scope)]
 
 
 # ------------------------------------------------------------------------------------------------- endpoints

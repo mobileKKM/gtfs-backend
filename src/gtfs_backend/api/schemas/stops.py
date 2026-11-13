@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from gtfs_backend.api.schemas.common import RouteRef
+from gtfs_backend.modes import Mode
 
 
 class Stop(BaseModel):
@@ -18,7 +19,7 @@ class Stop(BaseModel):
     name: str
     lat: float | None = None
     lon: float | None = None
-    modes: list[str] = Field(default_factory=list)
+    modes: list[Mode] = Field(default_factory=list)
     group_id: str | None = None  # stops only
     platform_code: str | None = None  # stops only: GTFS platform_code, e.g. "01"
 
@@ -45,7 +46,7 @@ class StopInfo(BaseModel):
     name: str
     lat: float | None = None
     lon: float | None = None
-    modes: list[str] = Field(default_factory=list)
+    modes: list[Mode] = Field(default_factory=list)
     platform_code: str | None = None
     directions: list[Direction] = Field(default_factory=list)  # most served first
 
@@ -58,7 +59,7 @@ class StopGroupInfo(BaseModel):
     name: str
     lat: float | None = None
     lon: float | None = None
-    modes: list[str] = Field(default_factory=list)
+    modes: list[Mode] = Field(default_factory=list)
     stops: list[StopInfo] = Field(default_factory=list)  # active ones
 
 

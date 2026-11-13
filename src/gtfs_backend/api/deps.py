@@ -11,6 +11,7 @@ from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.geo import BBOX_FORMAT, Bbox
 from gtfs_backend.api.errors import InvalidInput
 from gtfs_backend.keys import InvalidKey, parse_service_date
+from gtfs_backend.modes import Mode
 
 
 def bare_context(request: Request) -> Context:
@@ -45,7 +46,10 @@ def _query_date(date_: Annotated[str | None, Query(alias="date", description="YY
 
 
 def _modes(modes: Annotated[list[str] | None, Query(description="e.g. tram,bus")] = None) -> set[str]:
-    return split_csv(modes)
+    chosen = split_csv(modes)
+    if unknown := chosen - {m.value for m in Mode}:
+        raise InvalidInput(f"unknown modes {sorted(unknown)}; one of {[m.value for m in Mode]}")
+    return chosen
 
 
 StopKind = Literal["stop", "group"]

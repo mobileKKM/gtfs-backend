@@ -1,8 +1,17 @@
 """API response models, one module per resource. Times are epoch seconds, coordinates WGS84."""
 
-from gtfs_backend.api.schemas.alerts import ActivePeriod, Alert, AlertList, AlertRef, InformedEntity
+from gtfs_backend.api.schemas.alerts import (
+    ActivePeriod,
+    Alert,
+    AlertCause,
+    AlertEffect,
+    AlertEntity,
+    AlertList,
+    AlertRef,
+    AlertSeverity,
+)
 from gtfs_backend.api.schemas.common import Agency, Route, RouteRef, StopRef
-from gtfs_backend.api.schemas.departures import Departure, DepartureBoard, DepartureStatus
+from gtfs_backend.api.schemas.departures import Departure, DepartureBoard, DepartureStatus, Wheelchair
 from gtfs_backend.api.schemas.health import FeedHealth, Health
 from gtfs_backend.api.schemas.routes import RouteShape, RouteShapes
 from gtfs_backend.api.schemas.stops import Direction, SearchResult, Stop, StopGroupInfo, StopInfo, StopList
@@ -13,15 +22,18 @@ __all__ = [
     "ActivePeriod",
     "Agency",
     "Alert",
+    "AlertCause",
+    "AlertEffect",
+    "AlertEntity",
     "AlertList",
     "AlertRef",
+    "AlertSeverity",
     "Departure",
     "DepartureBoard",
     "DepartureStatus",
     "Direction",
     "FeedHealth",
     "Health",
-    "InformedEntity",
     "Route",
     "RouteRef",
     "RouteShape",
@@ -39,4 +51,5 @@ __all__ = [
     "TripView",
     "Vehicle",
     "VehicleList",
+    "Wheelchair",
 ]

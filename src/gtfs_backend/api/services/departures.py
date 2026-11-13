@@ -235,7 +235,7 @@ async def _alerts(
     scope = alerts.Scope(
         routes={(i.feed_id, i.route_id): i.route_type for i in shown},
         public_stop_ids=set(pids),
-        trips={(r.s.feed_id, r.s.trip_id) for r in page},
+        trips={r.s.trip_key for r in page},
         feeds={i.feed_id for i in shown} | {r.s.feed_id for r in page},
     )
     for r in page:

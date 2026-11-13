@@ -108,6 +108,14 @@ async def stops_by_id(conn: AsyncConnection, ids) -> dict[str, Stop]:
     return {r[1]: stop_from_row(r) for r in await cur.fetchall()}
 
 
+async def groups_by_id(conn: AsyncConnection, ids) -> dict[str, Stop]:
+    ids = list(ids)
+    if not ids:
+        return {}
+    cur = await conn.execute(f"SELECT {GROUP_COLS} FROM core.stop_group g WHERE g.id = ANY(%s)", (ids,))
+    return {r[1]: stop_from_row(r) for r in await cur.fetchall()}
+
+
 async def public_stop_ids(conn: AsyncConnection, stop: Stop) -> list[str]:
     """The stops a stop or group covers: all of a group's (active or not, the timetables decide), or itself."""
     if stop.kind == "stop":

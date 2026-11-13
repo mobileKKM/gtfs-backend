@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import IntEnum
 from typing import Literal
 
 from pydantic import BaseModel
@@ -11,6 +12,14 @@ from gtfs_backend.api.schemas.common import RouteRef, StopRef
 from gtfs_backend.api.schemas.stops import Stop
 
 DepartureStatus = Literal["scheduled", "live", "departed", "canceled", "skipped"]
+
+
+class Wheelchair(IntEnum):
+    """GTFS wheelchair_accessible of the trip."""
+
+    UNKNOWN = 0
+    ACCESSIBLE = 1
+    NOT_ACCESSIBLE = 2
 
 
 class Departure(BaseModel):
@@ -26,7 +35,7 @@ class Departure(BaseModel):
     status: DepartureStatus
     vehicle_key: str | None = None  # set: /vehicles/{vehicle_key}/trip follows the vehicle
     on_demand: bool = False  # request stop: signal the driver / call ahead to board (GTFS pickup type 2, 3)
-    wheelchair_accessible: int | None = None
+    wheelchair_accessible: Wheelchair | None = None
 
 
 class DepartureBoard(BaseModel):

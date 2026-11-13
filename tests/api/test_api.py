@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date, timedelta
 
 import psycopg
 import pytest
@@ -490,7 +491,7 @@ async def test_trip_of_a_live_vehicle(api):
     assert r.headers["cache-control"].startswith("public, max-age=")
     trip = r.json()
     assert trip["key"] == live["key"] and not {"vehicle", "status", "alerts", "current_index"} & set(trip)
-    assert trip["route"]["short_name"] == v["route"]["name"] and trip["headsign"] == v["headsign"]
+    assert trip["route"]["name"] == v["route"]["name"] and trip["headsign"] == v["headsign"]
     stops = trip["stops"]
     seqs = [s["stop_sequence"] for s in stops]
     assert seqs == sorted(seqs) == [s["stop_sequence"] for s in live["stops"]]
@@ -577,65 +578,83 @@ async def test_errors_have_one_shape(api):
 
 @pytest.fixture
 async def alerts_in_redis(api, sql):
-    """Alerts as the worker stores them (the snapshot had none)."""
+    """Alerts as the worker stores them, entities resolved to our ids (the snapshot had none)."""
     deps = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()["departures"]
     tram = next(d for d in deps if feed_of(d) == "kmk_t")
     tram["route_id"] = tram["route"]["key"].split(":", 1)[1]
-    tram["trip_id"] = tram["trip_key"].split(":", 2)[2]
+    tram["direction_id"] = (await api.get(f"/trips/{tram['trip_key']}")).json()["direction_id"]
+    feed, service_date, trip_id = tram["trip_key"].split(":", 2)
+    next_week = (date.fromisoformat(service_date) + timedelta(days=7)).strftime("%Y%m%d")
     pid = tram["stop"]["id"]  # a stop the tram stops at
-    (code,) = sql("SELECT current_code FROM core.stop WHERE id = %s", pid)[0]
+    group = group_id(sql, "802")
+    group_pids = [r[0] for r in sql("SELECT id FROM core.stop WHERE stop_group_id = %s ORDER BY id", group)]
     far = stop_by_code(sql, "125-01")
 
-    def alert(id_, **entity):
+    def alert(id_, severity=None, **entity):
         base = {
             "agency_id": None,
             "route_id": None,
             "route_type": None,
-            "trip_id": None,
-            "stop_id": None,
-            "public_stop_id": None,
+            "direction_id": None,
+            "trip_key": None,
+            "public_stop_ids": [],
+            "stop_group_id": None,
         }
         return {
             "feed_id": "kmk_t",
             "id": id_,
-            "cause": "CONSTRUCTION",
-            "effect": "DETOUR",
+            "cause": "construction",
+            "effect": "detour",
+            "severity": severity,
             "header": f"Header {id_}",
-            "description": "Opis\r\nz Polskimi znakami: łódź",
+            "description": "Opis\nz Polskimi znakami: łódź",
             "url": None,
             "active_periods": [{"start": NOW - 3600, "end": None}],
-            "informed_entities": [base | entity],
+            "entities": [base | entity],
         }
 
     raws = [
-        alert("route", route_id=tram["route_id"]),
-        alert("stop", stop_id=code, public_stop_id=pid),
-        alert("trip", trip_id=tram["trip_id"]),
+        alert("route", "warning", route_id=tram["route_id"]),
+        alert("stop", "severe", public_stop_ids=[pid]),
+        alert("trip", trip_key=tram["trip_key"]),
+        alert("trip_next_week", trip_key=f"{feed}:{next_week}:{trip_id}"),
         alert("feed", agency_id="agency_1"),
-        alert("route_elsewhere", route_id=tram["route_id"], stop_id="125-01", public_stop_id=far),
+        alert("route_elsewhere", route_id=tram["route_id"], public_stop_ids=[far]),
         alert("other_route", route_id="route_does_not_exist"),
+        alert("station", public_stop_ids=group_pids, stop_group_id=group),
+        alert("other_direction", route_id=tram["route_id"], direction_id=1 - (tram["direction_id"] or 0)),
     ]
     r = Redis.from_url(TEST_REDIS_URL)
     await r.set("rt:alerts:kmk_t", json.dumps(raws))
-    yield {"raws": raws, "tram": tram, "pid": pid, "code": code}
+    yield {"raws": raws, "tram": tram, "pid": pid, "group": group, "far": far}
     await r.delete("rt:alerts:kmk_t")
     await r.aclose()
 
 
-async def test_alerts_are_passed_through(api, alerts_in_redis):
-    raws = alerts_in_redis["raws"]
+async def test_alert_entities(api, alerts_in_redis):
+    tram = alerts_in_redis["tram"]
     out = (await api.get("/alerts")).json()["alerts"]
-    assert [a["id"] for a in out] == [a["id"] for a in raws]
-    for got, raw in zip(out, raws, strict=True):
-        assert {k: got[k] for k in raw if k != "informed_entities"} == {k: v for k, v in raw.items() if k != "informed_entities"}
-        # entities as GTFS-RT has them (`stop_id` is the feed's); our public_stop_id stays internal, the stops are in `stops`
-        as_given = [{k: v for k, v in ie.items() if k != "public_stop_id"} for ie in raw["informed_entities"]]
-        assert got["informed_entities"] == as_given
-        assert got["key"] == f"kmk_t:{raw['id']}"
-    assert out[0]["routes"][0]["route_id"] == alerts_in_redis["tram"]["route_id"]
-    assert out[1]["stops"][0]["id"] == alerts_in_redis["pid"]
-    assert out[1]["informed_entities"][0]["stop_id"] == alerts_in_redis["code"]
-    assert (await api.get("/alerts/kmk_t:stop")).json() == out[1]
+    # severe first, then warnings, then the rest as published
+    assert [a["key"].split(":", 1)[1] for a in out][:2] == ["stop", "route"]
+    by_id = {a["key"].split(":", 1)[1]: a for a in out}
+    assert set(by_id) == {r["id"] for r in alerts_in_redis["raws"]}
+    stop = by_id["stop"]
+    assert set(stop) == {"key", "cause", "effect", "severity", "header", "description", "url", "active_periods", "entities"}
+    assert (stop["cause"], stop["effect"], stop["severity"]) == ("construction", "detour", "severe")
+    none = {"mode": None, "route": None, "direction_id": None, "trip_key": None, "stop": None}
+    assert by_id["route"]["entities"] == [none | {"route": tram["route"]}]
+    assert stop["entities"][0]["stop"]["id"] == alerts_in_redis["pid"] and stop["entities"][0]["stop"]["kind"] == "stop"
+    assert by_id["trip"]["entities"] == [none | {"trip_key": tram["trip_key"]}]
+    assert by_id["feed"]["entities"] == [none]  # whole feed
+    # route AND stop stay one entity: line X at that stop only
+    (elsewhere,) = by_id["route_elsewhere"]["entities"]
+    assert elsewhere["route"]["key"] == tram["route"]["key"] and elsewhere["stop"]["id"] == alerts_in_redis["far"]
+    # a station is shown as its stop group
+    (station,) = by_id["station"]["entities"]
+    assert station["stop"]["kind"] == "group" and station["stop"]["id"] == alerts_in_redis["group"]
+    assert by_id["other_direction"]["entities"][0]["direction_id"] is not None
+    assert by_id["other_route"]["entities"] == []  # a route we don't have: applies nowhere
+    assert (await api.get("/alerts/kmk_t:stop")).json() == stop
     assert (await api.get("/alerts/kmk_t:nope")).status_code == 404
     assert (await api.get("/alerts/nope:stop")).status_code == 404
     assert (await api.get("/alerts?feed=kmk_a")).json()["alerts"] == []
@@ -643,33 +662,47 @@ async def test_alerts_are_passed_through(api, alerts_in_redis):
 
 async def test_alert_filters(api, sql, alerts_in_redis):
     route = alerts_in_redis["tram"]["route"]["key"]
-    ids = lambda r: {a["id"] for a in r.json()["alerts"]}  # noqa: E731
-    # an entity naming route + stop is about that route (the stop isn't asked for)
-    assert ids(await api.get(f"/alerts?route={route}")) == {"route", "feed", "route_elsewhere"}
-    assert ids(await api.get(f"/alerts?feed=kmk_t&route={route}")) == {"route", "feed", "route_elsewhere"}
+    ids = lambda r: {a["key"].split(":", 1)[1] for a in r.json()["alerts"]}  # noqa: E731
+    # an entity naming route + stop is about that route (the stop isn't asked for); directions aren't asked for either
+    about_route = {"route", "feed", "route_elsewhere", "other_direction"}
+    assert ids(await api.get(f"/alerts?route={route}")) == about_route
+    assert ids(await api.get(f"/alerts?feed=kmk_t&route={route}")) == about_route
     assert (await api.get(f"/alerts?feed=kmk_a&route={route}")).status_code == 422
-    assert ids(await api.get(f"/alerts?stop={group_id(sql, '802')}")) == {"stop"}
+    assert ids(await api.get(f"/alerts?stop={group_id(sql, '802')}")) == {"stop", "station"}
     # route AND stop given: the route-at-another-stop alert doesn't apply here; feed-wide ones still do
-    assert ids(await api.get(f"/alerts?route={route}&stop={group_id(sql, '802')}")) == {"route", "stop", "feed"}
+    assert ids(await api.get(f"/alerts?route={route}&stop={group_id(sql, '802')}")) == {
+        "route",
+        "stop",
+        "feed",
+        "station",
+        "other_direction",
+    }
 
 
 async def test_alerts_on_board_and_trip(api, sql, alerts_in_redis):
     board = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()
-    assert {a["key"] for a in board["alerts"]} == {"kmk_t:route", "kmk_t:stop", "kmk_t:trip", "kmk_t:feed"}
-    # boards and trips carry what a banner needs; the rest is at /alerts/{key}
+    # a board shows both directions of its routes
+    assert {a["key"] for a in board["alerts"]} == {
+        f"kmk_t:{i}" for i in ("route", "stop", "trip", "feed", "station", "other_direction")
+    }
+    # boards and trips carry what a banner needs; where it applies is at /alerts/{key}
     ref = next(a for a in board["alerts"] if a["key"] == "kmk_t:stop")
     assert ref == {
         "key": "kmk_t:stop",
-        "cause": "CONSTRUCTION",
-        "effect": "DETOUR",
+        "cause": "construction",
+        "effect": "detour",
+        "severity": "severe",
         "header": "Header stop",
+        "description": "Opis\nz Polskimi znakami: łódź",
         "active_periods": [{"start": NOW - 3600, "end": None}],
     }
-    assert (await api.get(f"/alerts/{ref['key']}")).json()["description"].startswith("Opis")
+    assert board["alerts"][0]["key"] == "kmk_t:stop"  # severe first
     tram = alerts_in_redis["tram"]
     trip = (await api.get(f"/trips/{tram['trip_key']}/live")).json()
-    assert {"kmk_t:route", "kmk_t:stop", "kmk_t:trip", "kmk_t:feed"} <= {a["key"] for a in trip["alerts"]}
-    assert "kmk_t:other_route" not in {a["key"] for a in trip["alerts"]}
+    keys_ = {a["key"] for a in trip["alerts"]}
+    assert {f"kmk_t:{i}" for i in ("route", "stop", "trip", "feed", "station")} <= keys_
+    # another route, the same trip next week, the route's other direction
+    assert not {"kmk_t:other_route", "kmk_t:trip_next_week", "kmk_t:other_direction"} & keys_
     assert "alerts" not in (await api.get(f"/trips/{tram['trip_key']}")).json()
 
 
@@ -813,7 +846,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
             "feed_id": "kmk_t",
             "id": id_,
             "active_periods": [{"start": s, "end": e} for s, e in periods],
-            "informed_entities": [{"agency_id": "agency_1"}],
+            "entities": [{"agency_id": "agency_1"}],
         }
 
     raws = [
@@ -834,9 +867,9 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
         assert {a["key"] for a in board["alerts"]} == keys
         tram = next(d for d in board["departures"] if feed_of(d) == "kmk_t")
         assert {a["key"] for a in (await api.get(f"/trips/{tram['trip_key']}/live")).json()["alerts"]} == keys
-        # /alerts passes everything on unless asked
+        # /alerts lists everything unless asked
         assert len((await api.get("/alerts")).json()["alerts"]) == len(raws)
-        assert {a["id"] for a in (await api.get("/alerts?active=true")).json()["alerts"]} == current
+        assert {a["key"] for a in (await api.get("/alerts?active=true")).json()["alerts"]} == keys
     finally:
         await r.delete("rt:alerts:kmk_t")
         await r.aclose()

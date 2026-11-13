@@ -107,9 +107,9 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
 | `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with `passed: true`; removed when the trip leaves the feed |
-| `rt:alerts:{feed_id}` | service alerts |
+| `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
-| `rt:unmatched:{feed_id}:{kind}` | unmatched ids, for debugging |
+| `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
 | pub/sub `rt:updated`, `static:updated` | change notifications |
 | `api:resp:{hash}` | the API's response cache |
 
@@ -156,8 +156,8 @@ dates `YYYYMMDD`.
 
 The source id comes last and is kept whole, so ids with `:` or `/` work. Responses carry no id a key already
 holds (no `feed_id`/`trip_id` next to `trip_key`, no `feed_id` next to a route's `key`): the feed id is a key's
-first part. Routes appear in full (`Route`, with names, type, agency and the feed's `route_id`, which alert entities
-name) or as a `RouteRef` (`key`, `name`, `mode`) in lists. Every field of a schema is always present (`null` when unset).
+first part. Routes appear in full (`Route`: a `RouteRef` plus `route_type` and `agency`) or as a `RouteRef` (`key`, `name`, `mode`)
+in lists. No feed-internal id (`route_id`, `stop_id`, `trip_id`) appears on its own, alerts included. Every field of a schema is always present (`null` when unset).
 Polled responses (vehicles, boards, live trips) carry the `timestamp` of the newest realtime data they show, not
 of the request, so their ETag only changes with the data.
 
@@ -171,7 +171,7 @@ of the request, so their ETag only changes with the data.
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and passed/skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
-| `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts as published (boards and trips carry only `key`, `cause`, `effect`, `header`, `active_periods`) |
+| `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
 
 **Errors**: `{"error": {"code": "not_found" | "invalid_input" | "method_not_allowed" | …, "message": "…"}}`: 404
@@ -212,8 +212,13 @@ Notes:
   first stop not yet passed; `vehicle` is set while one runs the trip.
 - **Polling**: live responses are `no-cache`; clients refetch the open view about every 10 s with `If-None-Match`
   and stop in the background.
-- Alerts follow GTFS-RT matching (an entity's fields combine with AND). Boards and trips carry alerts active now or
-  starting within a day; `/alerts` returns all unless `active=true`.
+- **Alerts**: `cause`/`effect` are the GTFS-RT enums in lowercase (`construction`, `detour`), `severity` is `info`,
+  `warning` or `severe`; unknown or unset is `null`. Each of `entities` is one place the alert applies, its fields
+  combined with AND (GTFS-RT): `{route, stop}` is that line at that stop only, `{route, direction_id}` one direction,
+  `{trip_key}` one dated trip, `{mode}` every line of the mode, all `null` the whole feed. `stop` is a stop, or a stop
+  group when the feed names a whole station, with coordinates for the map. Entities naming something not in today's
+  timetables are dropped (and counted as unmatched); an alert left with none applies nowhere. Boards and trips carry
+  alerts active now or starting within a day; `/alerts` returns all unless `active=true`.
 - **Health**: `ok` means Postgres and Redis answer. `fresh` is false while any feed has `problems`: no timetable,
   failed last import, static not checked for `HEALTH_STATIC_MAX_AGE` (3 h), or a realtime file not polled, failing
   (5 polls) or older than `HEALTH_REALTIME_MAX_AGE` (5 min; a larger `realtime_max_age` wins). Alerts files are

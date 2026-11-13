@@ -225,7 +225,12 @@ class RealtimeTask:
             alerts=len(res.alerts),
             unmatched_trips=len(res.unmatched_trips),
             unmatched_vehicles=len(res.unmatched_vehicles),
-            unmatched_sample=(res.unmatched_trips + [v["trip_id"] or v["vehicle_id"] for v in res.unmatched_vehicles])[:10],
+            unmatched_alert_entities=len(res.unmatched_alert_entities),
+            unmatched_sample=(
+                res.unmatched_trips
+                + [v["trip_id"] or v["vehicle_id"] for v in res.unmatched_vehicles]
+                + res.unmatched_alert_entities
+            )[:10],
             route_mismatches=res.mismatches,
             # ~0 normally; about +-3600 on a clock-change day would mean the feed's day_start is wrong
             median_delay_s=median_delay(res),

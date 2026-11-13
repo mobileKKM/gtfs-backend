@@ -6,7 +6,16 @@ from zoneinfo import ZoneInfo
 from google.transit import gtfs_realtime_pb2 as pb
 
 from gtfs_backend.servicetime import service_day_base
-from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, match_updates, merge_passed, process_message, resolve
+from gtfs_backend.worker.realtime.normalize import (
+    FeedRealtimeState,
+    Result,
+    build_alert,
+    match_updates,
+    merge_passed,
+    process_message,
+    resolve,
+    resolve_instance,
+)
 from gtfs_backend.worker.realtime.trip_index import ServiceDay, StopTime, TripIndex, TripInfo
 
 WAW = ZoneInfo("Europe/Warsaw")
@@ -259,3 +268,67 @@ async def test_feed_zeros_count_as_unknown():
     assert await poll(19.96, 10) == (None, 0.0)  # standing, heading still unknown
     assert await poll(east, 20) == (90.0, 10.0)  # driving east, not north at 0 km/h
     assert await poll(east, 30) == (90.0, 0.0)  # stopped: keeps its last heading
+
+
+# --------------------------------------------------------------------------------------------- alerts
+
+
+def alert_index():
+    idx = make_index()
+    idx.routes = {(1, "R1"), (2, "R1")}
+    idx.stations[(2, "STATION")] = ("grp", ("stopa", "stopb"))
+    return idx
+
+
+def test_alert_trip_is_one_instance():
+    idx = alert_index()
+    trip_id = "block_1_trip_9_service_4"
+    # the night trip of the 22nd is over at 05:00 on the 23rd: the morning one is meant
+    assert resolve_instance(idx, trip_id, epoch(D23, 5)).day.date == D23
+    assert resolve_instance(idx, trip_id, epoch(D22, 24)).day.date == D22  # still running
+    assert resolve_instance(idx, trip_id, epoch(D23, 12)).day.date == D23  # all over: the last one
+    assert resolve_instance(idx, trip_id, epoch(D23, 5), start_date=D22).day.date == D22
+    assert resolve_instance(idx, "block_1_trip_9_service_2", epoch(D23, 5)) is None
+    assert resolve_instance(idx, "block_1_trip_9_service_2", epoch(D23, 5), ignore_service_suffix=True).day.date == D23
+
+
+def test_alert_entities_are_resolved_to_ours_and_unknown_ones_dropped():
+    a = pb.Alert()
+    a.effect = pb.Alert.DETOUR
+    a.severity_level = pb.Alert.WARNING
+    a.header_text.translation.add(text="Utrudnienia", language="pl")
+    a.description_text.translation.add(text="Linia 1\r\nobjazd \n", language="pl")
+    a.informed_entity.add(route_id="R1", stop_id="A")  # line 1 at stop A
+    a.informed_entity.add(stop_id="STATION")
+    a.informed_entity.add(route_id="R1", direction_id=1)
+    a.informed_entity.add().trip.trip_id = "block_1_trip_9_service_4"
+    a.informed_entity.add(route_id="R9")
+    a.informed_entity.add(route_id="R1", stop_id="Z")  # AND: one unknown field and the entity means nothing
+    res = Result()
+    out = build_alert("kmk_t", "a1", a, alert_index(), FeedRealtimeState(), epoch(D23, 5), res)
+    assert (out["cause"], out["effect"], out["severity"]) == (None, "detour", "warning")
+    assert out["description"] == "Linia 1\nobjazd"
+    pick = lambda e: {k: v for k, v in e.items() if v not in (None, [])}  # noqa: E731
+    assert [pick(e) for e in out["entities"]] == [
+        {"route_id": "R1", "public_stop_ids": ["stopa"]},
+        {"public_stop_ids": ["stopa", "stopb"], "stop_group_id": "grp"},
+        {"route_id": "R1", "direction_id": 1},
+        {"trip_key": "kmk_t:20261023:block_1_trip_9_service_4"},
+    ]
+    assert res.unmatched_alert_entities == ["a1: route R9", "a1: stop Z"]
+
+
+def test_alert_without_entities_is_feed_wide():
+    a = pb.Alert()
+    a.header_text.translation.add(text="Komunikat")
+    out = build_alert("kmk_t", "a2", a, alert_index(), FeedRealtimeState(), epoch(D23, 5), Result())
+    assert len(out["entities"]) == 1 and not any(out["entities"][0].values())
+    assert out["header"] == "Komunikat" and out["severity"] is None
+
+
+def test_alert_enums_match_gtfs_rt():
+    """The API's enums list exactly what the worker stores: the protobuf names, lowercase, without the UNKNOWN_*."""
+    from gtfs_backend.api.schemas import AlertCause, AlertEffect, AlertSeverity
+
+    for api, proto in ((AlertCause, pb.Alert.Cause), (AlertEffect, pb.Alert.Effect), (AlertSeverity, pb.Alert.SeverityLevel)):
+        assert {m.value for m in api} == {n.lower() for n in proto.keys() if not n.startswith("UNKNOWN_")}  # noqa: SIM118 (not iterable)

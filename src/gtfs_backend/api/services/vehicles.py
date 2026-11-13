@@ -57,14 +57,17 @@ async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[st
     width, height = bbox.size_km()
     if max(width, height) > MAX_BBOX_KM:
         raise InvalidInput(f"bbox is larger than {MAX_BBOX_KM:g} km")
-    center = bbox.center
-    # GEOSEARCH boxes are approximate: search a little wider, then cut exactly
-    ids = await realtime.vehicles_near(ctx.redis, center.lat, center.lon, width * 1.02 + 0.01, height * 1.02 + 0.01)
+    # a few hundred vehicles in all: filtered here, on the coordinates as the response rounds them
+    raws = [
+        v
+        for v in await realtime.vehicles_on_map(ctx.redis, ctx.feed_ids)
+        if bbox.contains(round(v["lat"], COORD_DIGITS), round(v["lon"], COORD_DIGITS))
+    ]
+    raws.sort(key=lambda v: vehicle_key(v["feed_id"], v["vehicle_id"]))
     out = [
         v
-        for v in await by_ids(ctx, sorted(ids))
-        if bbox.contains(v.lat, v.lon)
-        and (not modes or (v.route is not None and v.route.mode in modes))
+        for v in await models(ctx, raws)
+        if (not modes or (v.route is not None and v.route.mode in modes))
         and (not route_names or (v.route is not None and v.route.name in route_names))
     ]
     return VehicleList(timestamp=realtime.newest(v.timestamp for v in out), vehicles=out)

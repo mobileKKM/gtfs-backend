@@ -33,14 +33,21 @@ async def test_vehicles_replace_per_feed_and_unmatched_never_reach_the_map(redis
         "kmk_t", Result(vehicles=[vehicle("735"), vehicle("302")], unmatched_vehicles=[{"vehicle_id": "999"}])
     )
     await store.write_vehicles("kmk_a", Result(vehicles=[vehicle("PA1", lon=19.95)]))
-    members = await r.geosearch("rt:veh:geo", longitude=19.9597, latitude=50.0658, radius=5, unit="km")
-    assert sorted(members) == ["kmk_a:PA1", "kmk_t:302", "kmk_t:735"]
+
+    async def on_map() -> list[str]:
+        out = []
+        for feed_id in ("kmk_a", "kmk_t"):
+            out += [f"{v['feed_id']}:{v['vehicle_id']}" for v in json.loads(await r.get(f"rt:veh:map:{feed_id}"))]
+        return sorted(out)
+
+    assert await on_map() == ["kmk_a:PA1", "kmk_t:302", "kmk_t:735"]
     assert json.loads(await r.get("rt:veh:kmk_t:735"))["vehicle_id"] == "735"
+    entry = json.loads(await r.get("rt:veh:map:kmk_t"))[0]  # the map fields, named as in the vehicle JSON
+    assert (entry["lat"], entry["lon"], entry["trip"]["key"]) == (50.066, 19.96, "kmk_t:735:20261025")
 
     # next tram poll: 302 is gone; the bus feed is untouched
     await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735")]))
-    members = await r.geosearch("rt:veh:geo", longitude=19.9597, latitude=50.0658, radius=5, unit="km")
-    assert sorted(members) == ["kmk_a:PA1", "kmk_t:735"]
+    assert await on_map() == ["kmk_a:PA1", "kmk_t:735"]
     assert await r.exists("rt:veh:kmk_t:999") == 0
     await r.aclose()
 
@@ -75,16 +82,16 @@ async def test_touch_refreshes_the_ttls_of_the_last_update(redis_url):
     await store.write_vehicles("km_kolej", res)
     await store.write_trips("km_kolej", res)
     await store.write_alerts("km_kolej", res)
-    keys = ["rt:veh:km_kolej:T1", "rt:veh:geo:km_kolej", "rt:veh:geo", "rt:trip:km_kolej:x:20261025", "rt:alerts:km_kolej"]
+    keys = ["rt:veh:km_kolej:T1", "rt:veh:map:km_kolej", "rt:trip:km_kolej:x:20261025", "rt:alerts:km_kolej"]
     for key in keys:
         await r.expire(key, 5)
 
     await store.touch("km_kolej", RealtimeKind.VEHICLE_POSITIONS)
-    assert [await r.ttl(k) for k in keys[:3]] == [100, 100, 100]
-    assert 0 < await r.ttl(keys[3]) <= 5 and 0 < await r.ttl(keys[4]) <= 5  # other kinds are untouched
+    assert [await r.ttl(k) for k in keys[:2]] == [100, 100]
+    assert 0 < await r.ttl(keys[2]) <= 5 and 0 < await r.ttl(keys[3]) <= 5  # other kinds are untouched
 
     await store.touch("km_kolej", RealtimeKind.COMBINED)
-    assert (await r.ttl(keys[3]), await r.ttl(keys[4])) == (200, 300)
+    assert (await r.ttl(keys[2]), await r.ttl(keys[3])) == (200, 300)
     await r.aclose()
 
 

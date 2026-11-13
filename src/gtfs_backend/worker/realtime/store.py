@@ -22,6 +22,24 @@ class TTLs:
     unmatched: int
 
 
+def map_entry(feed_id: str, v: dict) -> dict:
+    """The fields of a vehicle's JSON the map shows (api/services/vehicles.py), under the same names."""
+    trip = v.get("trip") or {}
+    return {
+        "feed_id": feed_id,
+        "vehicle_id": v["vehicle_id"],
+        "label": v.get("label"),
+        "lat": v["lat"],
+        "lon": v["lon"],
+        "bearing": v.get("bearing"),
+        "delay_s": v.get("delay_s"),
+        "current_stop_sequence": v.get("current_stop_sequence"),
+        "current_status": v.get("current_status"),
+        "timestamp": v.get("timestamp"),
+        "trip": {k: trip.get(k) for k in ("key", "version", "route_id", "headsign")},
+    }
+
+
 def _dumps(value) -> bytes:
     return orjson.dumps(value)  # compact UTF-8, as json.dumps(ensure_ascii=False, separators=(",", ":")), several times faster
 
@@ -30,30 +48,21 @@ class RealtimeStore:
     def __init__(self, redis: Redis, feed_ids: list[str], ttls: TTLs):
         self.redis = redis
         self.ttls = ttls
-        self.feed_ids = feed_ids  # all feeds, for the combined GEO set
+        self.feed_ids = feed_ids
         self._trip_keys: dict[str, set[str]] = {}  # per feed_id: trip keys written by the last update
         self._vehicle_keys: dict[str, list[str]] = {}  # per feed_id: vehicle keys written by the last update
 
     async def write_vehicles(self, feed_id: str, res: Result) -> None:
-        geo_key = live_layout.vehicles_geo(feed_id)
-        tmp = f"{geo_key}:tmp"
         pipe = self.redis.pipeline(transaction=True)
-        pipe.delete(tmp)
-        members = []
+        written = []
         for v in res.vehicles:
-            member = keys.vehicle_key(feed_id, v["vehicle_id"])
-            members.extend([v["lon"], v["lat"], member])
-            pipe.set(live_layout.vehicle(member), _dumps(v), ex=self.ttls.vehicle)
-        if members:
-            pipe.geoadd(tmp, members)
-            pipe.rename(tmp, geo_key)
-            pipe.expire(geo_key, self.ttls.vehicle)
-        else:
-            pipe.delete(geo_key)
-        pipe.zunionstore(live_layout.VEHICLES_GEO, [live_layout.vehicles_geo(k) for k in self.feed_ids])
-        pipe.expire(live_layout.VEHICLES_GEO, self.ttls.vehicle)
+            key = live_layout.vehicle(keys.vehicle_key(feed_id, v["vehicle_id"]))
+            written.append(key)
+            pipe.set(key, _dumps(v), ex=self.ttls.vehicle)
+        entries = [map_entry(feed_id, v) for v in res.vehicles]
+        pipe.set(live_layout.vehicles_map(feed_id), _dumps(entries), ex=self.ttls.vehicle)
         await pipe.execute()
-        self._vehicle_keys[feed_id] = [live_layout.vehicle(m) for m in members[2::3]]
+        self._vehicle_keys[feed_id] = written
 
     async def _stored_trip_keys(self, feed_id: str) -> set[str]:
         """Trip keys of this feed already in Redis (written before a restart)."""
@@ -104,8 +113,7 @@ class RealtimeStore:
         if combined or kind == RealtimeKind.VEHICLE_POSITIONS:
             for key in self._vehicle_keys.get(feed_id, []):
                 pipe.expire(key, self.ttls.vehicle)
-            pipe.expire(live_layout.vehicles_geo(feed_id), self.ttls.vehicle)
-            pipe.expire(live_layout.VEHICLES_GEO, self.ttls.vehicle)
+            pipe.expire(live_layout.vehicles_map(feed_id), self.ttls.vehicle)
         if combined or kind == RealtimeKind.TRIP_UPDATES:
             for key in self._trip_keys.get(feed_id, set()):
                 pipe.expire(live_layout.trip(key), self.ttls.trip)

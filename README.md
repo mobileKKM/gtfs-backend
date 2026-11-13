@@ -104,13 +104,13 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 
 | key | content |
 |---|---|
-| `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
+| `rt:veh:map:{feed_id}` | the feed's vehicles with only the fields the map shows, one JSON list (TTL `VEHICLE_TTL`); `/vehicles` filters the box from these |
 | `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times; removed when the trip leaves the feed |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
-| `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
+| `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, `lag_s` (feed timestamp to our write), `loop_lag_ms`, timings, counts, unmatched, route mismatches, `median_delay_s` |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
-| pub/sub `rt:updated`, `static:updated` | change notifications |
+| pub/sub `rt:updated`, `static:updated` | change notifications; the API caches live responses per realtime generation from `rt:updated` |
 | `api:resp:{hash}` | the API's response cache |
 
 Rules:

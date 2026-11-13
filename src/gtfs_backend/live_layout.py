@@ -2,8 +2,10 @@
 
 Every key carries the feed_id, because trip and vehicle ids are only unique within a feed (see keys.py).
 
-rt:veh:geo                          GEO set of all feeds' vehicles (member = vehicle key), the union of:
-rt:veh:geo:{feed_id}                GEO set per feed, replaced atomically on every vehicle poll
+rt:veh:map:{feed_id}                the feed's vehicles as the map shows them: a JSON list of their map fields (the
+                                    vehicle JSON's, same names), replaced on every vehicle poll (TTL VEHICLE_TTL).
+                                    The map reads these few keys and filters the box itself: a GEOSEARCH plus an MGET
+                                    of every full vehicle JSON cost twice as much
 rt:veh:{vehicle_key}                vehicle JSON (TTL VEHICLE_TTL)
 rt:trip:{trip_key}                  trip update JSON with per-stop predictions, incl. stops the feed has
                                     already dropped (their last known times); the JSON has the version.
@@ -17,13 +19,12 @@ pub/sub static:updated              feed_id, after a static import became ready
 
 from __future__ import annotations
 
-VEHICLES_GEO = "rt:veh:geo"
 REALTIME_UPDATED = "rt:updated"
 STATIC_UPDATED = "static:updated"
 
 
-def vehicles_geo(feed_id: str) -> str:
-    return f"{VEHICLES_GEO}:{feed_id}"
+def vehicles_map(feed_id: str) -> str:
+    return f"rt:veh:map:{feed_id}"
 
 
 def vehicle(vehicle_key: str) -> str:

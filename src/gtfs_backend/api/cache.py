@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 
 from fastapi import Request, Response
 from pydantic import BaseModel
@@ -30,9 +30,17 @@ NO_STORE = "no-store"
 LIVE = "no-cache"
 
 KEY_PREFIX = "api:resp:"
+FALLBACK_LIVE_S = 3  # live responses' cache time while realtime updates aren't followed (listener reconnecting)
 MAX_BODY = 512 * 1024  # bigger bodies aren't cached
 
 _query_names: dict[int, frozenset[str]] = {}  # id(route) -> its declared query parameters (aliases)
+
+
+def feeds_of(ctx: Context, key: str) -> list[str]:
+    """The feed a trip or vehicle key (`{feed_id}:...`) belongs to; every feed when the key names none (the request
+    then fails anyway)."""
+    feed_id = key.split(":", 1)[0]
+    return [feed_id] if feed_id in ctx.feed_ids else ctx.feed_ids
 
 
 def public(max_age: int) -> str:
@@ -119,13 +127,27 @@ def _done(ctx: Context, key: str, task: asyncio.Future) -> None:
 
 
 async def cached(
-    request: Request, ctx: Context, ttl: int, cache_control: str, compute: Callable[[], Awaitable[BaseModel]]
+    request: Request,
+    ctx: Context,
+    ttl: int,
+    cache_control: str,
+    compute: Callable[[], Awaitable[BaseModel]],
+    live_feeds: Iterable[str] | None = None,
 ) -> Response:
     """The response of `compute()`, from the shared cache when another request made it less than `ttl` s ago.
-    Errors (404, 422, ...) are raised as usual and never cached. ttl 0: no caching."""
+    Errors (404, 422, ...) are raised as usual and never cached. ttl 0: no caching.
+
+    `live_feeds`: the response shows these feeds' realtime data. It is cached under their current realtime generation,
+    so as soon as the worker stores newer data the next request computes afresh; `ttl` then only bounds how long
+    time alone (a departure's grace period) may go unnoticed."""
     if ttl <= 0:
         return json_response(request, await compute(), cache_control)
-    key = cache_key(request, ctx.catalog.fingerprint)
+    fingerprint = ctx.catalog.fingerprint
+    if live_feeds is not None:
+        # without the listener, updates could be missed: then a live response is cached FALLBACK_LIVE_S at most
+        generation = ctx.realtime_generation(live_feeds) if ctx.realtime_listening else f"t{ctx.now() // FALLBACK_LIVE_S}"
+        fingerprint += "/" + generation
+    key = cache_key(request, fingerprint)
     hit = await _get(ctx, key)
     setattr(request.state, CACHE_STATE, "miss" if hit is None else "hit")
     if hit is None:

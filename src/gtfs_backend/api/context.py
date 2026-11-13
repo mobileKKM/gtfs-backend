@@ -23,6 +23,10 @@ class Context:
     settings: ApiSettings
     # response cache key -> the computation in flight in this process (api/cache.py)
     inflight: dict[str, asyncio.Future] = field(default_factory=dict)
+    # "{feed_id}:{kind}" -> feed timestamp of the newest realtime data in Redis, kept by the `realtime:updated` listener
+    # (app.py); live responses are cached under it, so new data is never answered from the cache
+    realtime_gen: dict[str, int] = field(default_factory=dict)
+    realtime_listening: bool = False  # whether realtime_gen is followed now (else live responses use time buckets)
 
     @property
     def feed_ids(self) -> list[str]:
@@ -30,3 +34,8 @@ class Context:
 
     def now(self) -> int:
         return int(self.clock())
+
+    def realtime_generation(self, feed_ids) -> str:
+        """Changes whenever realtime data of one of these feeds does."""
+        wanted = set(feed_ids)
+        return "|".join(f"{k}={v}" for k, v in sorted(self.realtime_gen.items()) if k.split(":", 1)[0] in wanted)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from gtfs_backend.api.cache import LIVE, cached, public
+from gtfs_backend.api.cache import LIVE, cached, feeds_of, public
 from gtfs_backend.api.deps import Ctx
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import TripLive, TripView
@@ -16,7 +16,9 @@ router = APIRouter(prefix=PREFIX, tags=["trips"])
 async def get_trip_live(request: Request, ctx: Ctx, trip_key: str):
     """A trip's realtime state, to poll: every stop's predictions and whether it is skipped (match them to
     the trip view's `stops` by `stop_sequence`), the live vehicle (if any) and the alerts that apply."""
-    return await cached(request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: trips.live_by_key(ctx, trip_key))
+    return await cached(
+        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: trips.live_by_key(ctx, trip_key), feeds_of(ctx, trip_key)
+    )
 
 
 @router.get("/trips/{trip_key:path}", response_model=TripView)

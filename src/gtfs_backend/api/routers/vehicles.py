@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from gtfs_backend.api.cache import LIVE, cached, json_response
+from gtfs_backend.api.cache import LIVE, cached, feeds_of, json_response
 from gtfs_backend.api.deps import BboxQuery, Ctx, ModesQuery, RoutesQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import TripLive, VehicleList
@@ -24,4 +24,6 @@ async def vehicle_trip(request: Request, ctx: Ctx, vehicle_key: str):
     """The live state of the trip a vehicle (`key` from /vehicles, `{feed_id}:{vehicle_id}`) runs now, as
     /trips/{key}/live. Polling this follows the vehicle onto its next trip: when `key` changes, fetch /trips/{key}
     again. 404 once the vehicle has left the feed."""
-    return await cached(request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: trips.for_vehicle(ctx, vehicle_key))
+    return await cached(
+        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: trips.for_vehicle(ctx, vehicle_key), feeds_of(ctx, vehicle_key)
+    )

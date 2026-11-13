@@ -56,5 +56,10 @@ async def departure_board(
     names) narrow the board and its alerts. Canceled trips and skipped stops stay with their status.
     """
     return await cached(
-        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: departures.board(ctx, stop_key, time, feeds, routes, limit)
+        request,
+        ctx,
+        ctx.settings.cache_ttl_live,
+        LIVE,
+        lambda: departures.board(ctx, stop_key, time, feeds, routes, limit),
+        live_feeds=feeds or ctx.feed_ids,
     )

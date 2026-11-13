@@ -27,7 +27,9 @@ class ApiSettings(Settings):
 
     # Responses shared by all API processes through Redis (api/cache.py), also sent as Cache-Control max-age where
     # the response is public; 0 turns the shared cache off.
-    cache_ttl_live: int = Field(default=3, ge=0)  # boards and trips: below ZTP's ~5 s update rate
+    # boards and trips; they are also cached per realtime generation (new data is never answered from the cache), so
+    # this only bounds how long time alone (a departure's grace period passing) can go unnoticed
+    cache_ttl_live: int = Field(default=10, ge=0)
     cache_ttl_static: int = Field(default=300, ge=0)  # stops, route shapes
     cache_ttl_alerts: int = Field(default=15, ge=0)
 

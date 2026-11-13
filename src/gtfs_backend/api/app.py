@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from contextlib import asynccontextmanager
 
@@ -14,6 +15,7 @@ from redis.asyncio import BlockingConnectionPool, Redis
 from gtfs_backend import live_layout, procmem
 from gtfs_backend.api import errors
 from gtfs_backend.api.context import Context
+from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Catalog, Clock
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
 from gtfs_backend.api.settings import ApiSettings, get_api_settings
@@ -23,19 +25,37 @@ from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
 
 
-async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
-    """The worker publishes `static:updated` after an import; reload the catalog then."""
+async def _seed_realtime_gen(ctx: Context) -> None:
+    """The realtime generations as of now, from the worker's poll meta (messages sent while not subscribed are lost)."""
+    pairs = [(f.feed_id, kind.value) for f in ctx.feeds.enabled for kind, _ in f.realtime.items()]
+    for (feed_id, kind), meta in (await realtime.meta_json(ctx.redis, pairs)).items():
+        if meta and meta.get("feed_timestamp"):
+            ctx.realtime_gen[f"{feed_id}:{kind}"] = meta["feed_timestamp"]
+
+
+async def _listen_updates(ctx: Context, retry_delay: float, subscribed: asyncio.Event) -> None:
+    """The worker publishes `static:updated` after an import (reload the catalog) and `realtime:updated` after storing
+    a realtime file (a new generation for live responses, see api/cache.py)."""
     while True:
         try:
-            async with redis.pubsub() as ps:
-                await ps.subscribe(live_layout.STATIC_UPDATED)
+            async with ctx.redis.pubsub() as ps:
+                await ps.subscribe(live_layout.STATIC_UPDATED, live_layout.REALTIME_UPDATED)
+                await _seed_realtime_gen(ctx)
+                ctx.realtime_listening = True
+                subscribed.set()
                 async for msg in ps.listen():
-                    if msg["type"] == "message":
-                        catalog.invalidate()
+                    if msg["type"] != "message":
+                        continue
+                    if msg["channel"] == live_layout.STATIC_UPDATED:
+                        ctx.catalog.invalidate()
+                    else:
+                        update = json.loads(msg["data"])
+                        ctx.realtime_gen[f"{update['feed_id']}:{update['kind']}"] = update["ts"]
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            log.warning("static_updates_listener_failed", error=str(exc))
+            log.warning("updates_listener_failed", error=str(exc))
+            ctx.realtime_listening = False  # updates may be missed until resubscribed: api/cache.py falls back to time
             await asyncio.sleep(retry_delay)
 
 
@@ -91,7 +111,11 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         except Exception as exc:  # noqa: BLE001
             log.warning("catalog_warmup_failed", error=str(exc))
         app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings)
-        listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
+        subscribed = asyncio.Event()
+        listener = asyncio.create_task(_listen_updates(app.state.ctx, settings.static_listener_retry_delay, subscribed))
+        # the first requests should already follow realtime updates; without Redis, start anyway (time buckets)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(subscribed.wait(), settings.redis_pool_timeout)
         reporter = asyncio.create_task(_report_stats(timings, settings.stats_log_interval))
         try:
             yield

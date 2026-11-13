@@ -16,6 +16,7 @@ from conftest import FIXTURES, TEST_REDIS_URL, TTLS, do_import, message, reset_d
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
 
+from gtfs_backend import live_layout
 from gtfs_backend.api.app import create_app
 from gtfs_backend.api.settings import ApiSettings
 from gtfs_backend.db import async_pool
@@ -457,7 +458,6 @@ async def test_departure_board_etag(api, sql):
     assert again.status_code == 304 and again.content == b""
 
 
-
 async def test_server_timing_and_per_route_stats(loaded, sql):
     """Every response says how long the server took; stats are kept per route template, never per URL."""
     settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=60)
@@ -478,7 +478,6 @@ async def test_server_timing_and_per_route_stats(loaded, sql):
     assert app.state.timings.take() == []  # reset
 
 
-
 async def test_concurrent_boards_never_wait_for_a_second_connection(loaded, sql):
     """Boards on days the catalog hasn't loaded make it query them. It has its own pool: with requests' only connection
     held by the board, a shared pool would leave them waiting for each other until the 503."""
@@ -489,6 +488,43 @@ async def test_concurrent_boards_never_wait_for_a_second_connection(loaded, sql)
         later = [NOW + days * 86400 for days in (9, 10, 11, 12)]  # outside the loaded yesterday/today/tomorrow
         answers = await asyncio.gather(*(c.get(f"/stops/{group}/departures?time={t}") for t in later * 3))
     assert [r.status_code for r in answers] == [200] * len(answers)
+
+
+async def _until(condition, seconds: float = 2.0) -> None:
+    for _ in range(int(seconds / 0.01)):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met in time")
+
+
+async def test_live_responses_are_cached_until_their_feeds_realtime_changes(loaded, sql):
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=60)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        ctx = app.state.ctx
+        await _until(lambda: ctx.realtime_listening)
+        board = f"/stops/{group_id(sql, '802')}/departures?feeds=kmk_a"
+        tram = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"][0]
+        trip = f"/trips/{tram['trip_key']}/live"  # a kmk_t trip
+
+        def cache(r) -> str:
+            return r.headers["server-timing"].rsplit("cache;desc=", 1)[1]
+
+        await c.get(board), await c.get(trip)
+        assert cache(await c.get(board)) == "hit" and cache(await c.get(trip)) == "hit"
+
+        # the worker stored newer kmk_a trip updates: the kmk_a board is computed afresh, the kmk_t trip isn't
+        await ctx.redis.publish(
+            live_layout.REALTIME_UPDATED, json.dumps({"feed_id": "kmk_a", "kind": "trip_updates", "ts": NOW + 5})
+        )
+        await _until(lambda: ctx.realtime_gen.get("kmk_a:trip_updates") == NOW + 5)
+        assert cache(await c.get(board)) == "miss" and cache(await c.get(board)) == "hit"
+        assert cache(await c.get(trip)) == "hit"
+
+        # without the listener (e.g. reconnecting) updates could be missed: live responses fall back to time buckets
+        ctx.realtime_listening = False
+        assert cache(await c.get(board)) == "miss"
 
 
 # ------------------------------------------------------------------------------------------------- trips + shapes

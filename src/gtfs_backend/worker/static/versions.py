@@ -91,6 +91,6 @@ def _retire(conn: psycopg.Connection, feed_id: str, today: date) -> list[int]:
         drop_version_partitions(conn, fv)
         for table in ("service_day_version", "service_date", "shape_line", "stop_direction", "stop_link"):
             cur.execute(f"DELETE FROM core.{table} WHERE feed_version_id = %s", (fv.id,))
-        cur.execute("UPDATE core.feed_version SET status = 'retired' WHERE id = %s", (fv.id,))
+        cur.execute("UPDATE core.feed_version SET status = 'retired', retired_at = now() WHERE id = %s", (fv.id,))
         log.info("version_retired", feed=feed_id, version=fv.version, feed_version_id=fv.id)
     return [fv.version for fv in retired]

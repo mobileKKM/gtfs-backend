@@ -24,6 +24,7 @@ from gtfs_backend.worker.realtime.normalize import FeedRealtimeState
 from gtfs_backend.worker.realtime.poller import FeedRuntime, RealtimeTask
 from gtfs_backend.worker.realtime.store import RealtimeStore, TTLs
 from gtfs_backend.worker.settings import WorkerSettings
+from gtfs_backend.worker.static import archive
 from gtfs_backend.worker.static.fetch import PREVIOUSLY_FAILED, check_static, import_order
 from gtfs_backend.worker.static.stops.osm import fetch_osm_poles, file_age_s
 from gtfs_backend.worker.static.versions import RetirementBusy, retire_versions
@@ -273,6 +274,10 @@ class Worker:
                     busy.append(feed.feed_id)
         return retired, busy
 
+    def _prune_archive(self) -> tuple[int, int]:
+        with connect(self.settings.database_url) as conn, conn.transaction():
+            return archive.prune(conn, self.settings.archive_dir, self.settings.archive_retention_days)
+
     async def _retire_once(self) -> bool:
         """One daily retirement; False if it has to be tried again (failed, or some feed's tables were busy)."""
         try:
@@ -283,6 +288,12 @@ class Worker:
             log.error("daily_retirement_failed", error=str(exc))
             return False
         log.info("daily_retirement", retired=retired, busy=busy)
+        try:
+            files, size = await asyncio.to_thread(self._prune_archive)
+            if files:
+                log.info("archive_pruned", files=files, mb=round(size / 1048576, 1))
+        except Exception as exc:  # noqa: BLE001 - the zips stay until the next day
+            log.warning("archive_prune_failed", error=f"{type(exc).__name__}: {exc}")
         self._invalidate_runtimes(feed_id for feed_id, versions in retired.items() if versions)
         return not busy
 

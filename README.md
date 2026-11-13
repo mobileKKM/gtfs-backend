@@ -51,7 +51,7 @@ src/gtfs_backend/
   *.py       shared: settings, feeds.yml models, db, logging, service-day time, stop ids, keys,
              Redis layout (live_layout.py), route_type -> mode
   worker/    cli.py, runner.py (task loop), http.py (downloads)
-    static/  fetch -> archive -> read -> validate -> load (+ derive, integrity, partitions, versions)
+    static/  fetch -> archive -> source (zip rows) -> validate -> load (+ derive, integrity, partitions, versions)
       stops/ stop matching: plan.py and shared.py decide (no DB), apply.py writes, osm.py reads OSM poles
     realtime/ poller -> normalize (match to timetables) -> store (Redis)
   api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog cache, Redis, SQL/geo)
@@ -75,9 +75,9 @@ Static imports are CPU-heavy and run in a separate process.
   reused) and joined via `feed_version_id` (`kmk_t_v3`). Find the newest by `version`, not by id (`kmk_t_v10` sorts
   before `kmk_t_v9` as text). For each service date the newest ready version with service that day is
   authoritative (`core.service_day_version`), so night trips survive an overnight update. A version is retired
-  (rows dropped, zip kept in `ARCHIVE_DIR`) once it serves nothing from yesterday on. A failed import never
-  replaces anything. Dropping partitions needs an exclusive lock, so retirement never runs during a worker import
-  and gives up after 2 s of waiting (it is retried). A crashed import process is replaced.
+  (rows dropped, zip kept in `ARCHIVE_DIR` for `ARCHIVE_RETENTION_DAYS`, 30) once it serves nothing from yesterday on.
+  A failed import never replaces anything. Dropping partitions needs an exclusive lock, so retirement never runs
+  during a worker import and gives up after 2 s of waiting (it is retried). A crashed import process is replaced.
 - **Stops** (`core.stop_group` logical, `core.stop` physical poles, `core.stop_link` feed stop to our stop) have
   our own stable 5-letter ids and URL keys like `rondo-mogilskie01-qphdu`; only the part after the last dash counts.
   GTFS words keep their GTFS meaning: a *station* is a feed's `location_type=1` stop and `platform_code` is the

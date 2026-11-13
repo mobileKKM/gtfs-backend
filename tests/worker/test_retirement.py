@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import date, timedelta
 
 import psycopg
@@ -68,3 +70,39 @@ def test_import_succeeds_when_its_retirement_is_blocked(db, database_url, tmp_pa
         reader.rollback()
 
     assert retire_versions(db, "kmk_t") == [1]  # the daily retirement catches up
+
+
+def test_archived_zips_of_long_retired_and_failed_versions_are_removed(db, tmp_path):
+    from gtfs_backend.worker.static import archive
+
+    d = date.today()
+    _two_versions(db, tmp_path, [d - timedelta(days=60)], [d])  # the second import retires the first version
+    assert db.execute(STATUS).fetchone()[0] == "retired"
+    archive_dir = tmp_path / "archive"
+    rows = db.execute("SELECT id, version, sha256 FROM core.feed_version WHERE feed_id = 'kmk_t' ORDER BY version").fetchall()
+    for _, _, sha in rows:
+        path = archive.archive_path(archive_dir, "kmk_t", sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"zip")
+    # a failed version of another feed, downloaded long ago
+    db.execute(
+        "INSERT INTO core.feed_version (feed_id, version, sha256, status, archive_path, downloaded_at) "
+        "VALUES ('kmk_a', 1, 'f00d', 'failed', 'x', now() - interval '40 days')"
+    )
+    failed = archive.archive_path(archive_dir, "kmk_a", "f00d")
+    failed.parent.mkdir(parents=True)
+    failed.write_bytes(b"zip")
+    (archive_dir / "tmp").mkdir()
+    (archive_dir / "tmp" / "left.zip").write_bytes(b"partial")
+    os.utime(archive_dir / "tmp" / "left.zip", (time.time() - 2 * 86400,) * 2)
+    old, new = (archive.archive_path(archive_dir, "kmk_t", sha) for _, _, sha in rows)
+
+    # retired just now: kept for the retention time
+    assert archive.prune(db, archive_dir, days=30) == (2, len(b"zip") + len(b"partial"))
+    assert old.exists() and new.exists() and not failed.exists()
+    db.execute("UPDATE core.feed_version SET retired_at = now() - interval '31 days' WHERE id = %s", (rows[0][0],))
+    assert archive.prune(db, archive_dir, days=0) == (0, 0)  # 0: keep forever
+    assert archive.prune(db, archive_dir, days=30) == (1, 3)
+    assert not old.exists() and new.exists()  # the ready version's zip stays
+    paths = dict(db.execute("SELECT version, archive_path FROM core.feed_version WHERE feed_id = 'kmk_t'").fetchall())
+    assert paths[1] is None and paths[2] is not None

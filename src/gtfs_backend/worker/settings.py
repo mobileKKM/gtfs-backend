@@ -13,6 +13,8 @@ from gtfs_backend.settings import Settings
 
 class WorkerSettings(Settings):
     archive_dir: Path = Path("data/archive")
+    # zips of retired (and failed) versions are removed this many days later; 0 keeps them forever
+    archive_retention_days: int = Field(default=30, ge=0)
     # OSM stop poles for matching shared stops (`gtfs-worker fetch-osm` writes it; without it stops match by position
     # alone). The worker downloads it itself when it is missing or older than OSM_REFRESH_INTERVAL (0: never).
     osm_stops_file: Path = Path("data/osm/stops.json")

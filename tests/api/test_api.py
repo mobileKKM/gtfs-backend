@@ -444,9 +444,9 @@ async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
 
 
 async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch):
-    """A trip just past the first window, running early, still makes the page: a page only counts as full when it
-    ends EARLY_S before its window does."""
-    from gtfs_backend.api.data.realtime import StopUpdate, TripState
+    """A trip scheduled past the window but running early enough to come before the page's last departure still
+    makes the page, however early it runs (feeds allow any amount): the board finds it in its realtime index."""
+    from gtfs_backend.api.data.realtime import BoardRealtime
     from gtfs_backend.api.services import departures
 
     pid = stop_by_code(sql, "802-01")
@@ -457,30 +457,26 @@ async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch):
         return departures.Scheduled("kmk_t", "kmk_t_v1", 1, day, trip_id, 1, pid, at, "X", "r", False, key)
 
     timetable = [dep(f"every2min_{i}", NOW + 60 + 120 * i) for i in range(40)]
-    early = dep("early", NOW + departures.WINDOWS_S[0] + 240)  # 4 min past the first window
+    early = dep("early", NOW + departures.WINDOWS_S[0] + 15 * 60)  # 15 min past the first window
     timetable.append(early)
+    predicted = NOW + 16 * 60  # 29 min early
 
     async def scheduled(conn, days, pids, start, end, lookback=departures.LOOKBACK_S):
         return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
 
-    class Realtime:
-        @classmethod
-        async def read(cls, redis, feed_ids, public_stop_ids):
-            return cls()
-
-        def states(self, trip_keys):
-            state = TripState(1, False, None, NOW)
-            state._stops[1] = StopUpdate(None, early.scheduled_departure - 8 * 60, -8 * 60, False)  # 8 min early
-            return {early.trip_key: state} if early.trip_key in trip_keys else {}
+    async def read(redis, feed_ids, public_stop_ids):
+        delay = predicted - early.scheduled_departure
+        states = {"kmk_t": {early.trip_key: f"[1,false,null,{NOW}]"}}
+        return BoardRealtime(states, [{f"1|{early.trip_key}": f"[null,{predicted},{delay},false,1]"}])
 
     monkeypatch.setattr(departures, "scheduled", scheduled)
-    monkeypatch.setattr(departures.realtime, "BoardRealtime", Realtime)
+    monkeypatch.setattr(departures.realtime.BoardRealtime, "read", read)
     monkeypatch.setattr(departures, "expected_span", lambda *_: departures.WINDOWS_S[0])  # whatever the stop's profile
-    # 13 regular departures come before the early one (at +26 min), the 14th after it (+27 min)
-    board = (await api.get(f"/stops/{pid}/departures?limit=14")).json()
+    # the first window alone has 10 departures (+1 to +19 min); the early one comes after the 8th (+15 min)
+    board = (await api.get(f"/stops/{pid}/departures?limit=10")).json()
     trip_keys = [d["trip_key"] for d in board["departures"]]
-    assert trip_keys[-1] == early.trip_key and trip_keys[:13] == [s.trip_key for s in timetable[:13]]
-    assert board["departures"][-1]["time"] == NOW + 26 * 60 and board["departures"][-1]["status"] == "live"
+    assert trip_keys[8] == early.trip_key and trip_keys[:8] + trip_keys[9:] == [s.trip_key for s in timetable[:9]]
+    assert board["departures"][8]["time"] == predicted and board["departures"][8]["status"] == "live"
 
 
 async def test_departure_board_etag(api, sql):

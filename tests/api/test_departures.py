@@ -5,7 +5,6 @@ from datetime import date
 from gtfs_backend import keys
 from gtfs_backend.api.data.realtime import BoardRealtime, TripUpdate
 from gtfs_backend.api.services.departures import (
-    EARLY_S,
     GRACE_S,
     WINDOWS_S,
     Row,
@@ -176,15 +175,15 @@ def test_status_needs_the_stop_sequence():
 
 
 def test_expected_span_busy_stop():
-    """60 an hour: 1.5 pages of 20 within 30 min, then EARLY_S so the page counts as full."""
-    assert expected_span((60,) * 24, 8 * 3600, 20) == 30 * 60 + EARLY_S
+    """60 an hour: 1.5 pages of 20 within 30 min."""
+    assert expected_span((60,) * 24, 8 * 3600, 20) == 30 * 60
 
 
 def test_expected_span_reads_across_hours_and_midnight():
     hourly = [0] * 24
     hourly[23], hourly[5] = 10, 30  # 10 at 23:00, nothing at night, 30 from 05:00
     # from 23:30: 5 left before midnight, the other 25 of 30 by 05:50
-    assert expected_span(tuple(hourly), 23 * 3600 + 1800, 20) == (6 * 3600 + 1200) + EARLY_S
+    assert expected_span(tuple(hourly), 23 * 3600 + 1800, 20) == 6 * 3600 + 1200
 
 
 def test_expected_span_without_departures_reads_a_day():
@@ -202,3 +201,20 @@ def test_board_realtime_ignores_predictions_of_another_version():
     state = BoardRealtime(states, stops).state(key)
     assert state.version == 2 and state.stop(1) is None
     assert state.stop(2).predicted == 60 and state.stop(2).delay_s == 60
+
+
+def test_board_realtime_finds_trips_running_early():
+    """Trips scheduled after a time but predicted before the page ends: of the state's version, from `since` on."""
+    early, other_version, arrival_only = "kmk_t:20261025:early", "kmk_t:20261025:v1", "kmk_t:20261025:end"
+    states = {"kmk_t": {k: "[2,false,null,1000]" for k in (early, other_version, arrival_only)}}
+    stops = [
+        {
+            f"3|{early}": "[null,1600,-1100,false,2]",  # scheduled 2700, 1100 s early
+            f"3|{other_version}": "[null,1500,-1200,false,1]",
+            f"9|{arrival_only}": "[1400,null,0,false,2]",  # on time: its row is in the window, or not a departure
+        }
+    ]
+    rt = BoardRealtime(states, stops)
+    assert rt.earliest_early(after=1800, since=0) == 1600
+    assert rt.earliest_early(after=2700, since=0) is None  # its row is read
+    assert rt.earliest_early(after=1800, since=1700) is None  # before the board starts

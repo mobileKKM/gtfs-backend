@@ -117,7 +117,8 @@ class TripState:
 class BoardRealtime:
     """The realtime a departure board can show, read once (one pipelined call): every feed's rt:tripstate and the
     board's stops' rt:stop:* hashes, which hold every trip at the stop whatever its time, so a board widening its
-    window needs no second read. Decoded per trip on demand (a board shows few of the trips it reads)."""
+    window needs no second read. Decoded per trip on demand (a board shows few of the trips it reads), and all at once
+    only to find trips running early (earliest_early)."""
 
     def __init__(self, states: dict[str, dict[str, str]], stops: list[dict[str, str]]):
         self._states = states  # feed_id -> trip key -> TripState JSON
@@ -127,6 +128,7 @@ class BoardRealtime:
                 sequence, key = live_layout.parse_stop_prediction_field(field)
                 self._predictions.setdefault(key, []).append((sequence, value))
         self._decoded: dict[str, TripState | None] = {}
+        self._timed: list[tuple[int, int, str, int]] | None = None  # (scheduled, predicted, trip key, version)
 
     @classmethod
     async def read(cls, redis: Redis, feed_ids: list[str], public_stop_ids: list[str]) -> BoardRealtime:
@@ -159,3 +161,21 @@ class BoardRealtime:
 
     def states(self, trip_keys) -> dict[str, TripState]:
         return {k: state for k in trip_keys if (state := self.state(k)) is not None}
+
+    def earliest_early(self, after: int, since: int) -> int | None:
+        """The earliest predicted time, from `since` on, of a trip scheduled at one of the board's stops after `after`
+        (epochs): one running early, whose timetable row a board that read up to `after` doesn't have. Feeds allow
+        any amount early. None without one."""
+        if self._timed is None:
+            self._timed = []
+            for key, rows in self._predictions.items():
+                for _, value in rows:
+                    arrival, departure, delay, _, version = json.loads(value)
+                    if (predicted := departure or arrival) is not None and delay is not None:
+                        self._timed.append((predicted - delay, predicted, key, version))
+        early = [
+            predicted
+            for scheduled, predicted, key, version in self._timed
+            if scheduled > after and predicted >= since and (state := self.state(key)) is not None and state.version == version
+        ]
+        return min(early, default=None)

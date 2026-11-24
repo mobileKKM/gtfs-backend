@@ -225,7 +225,8 @@ Notes:
   (tell them apart by `trip_key` + `stop_sequence`). The first window is where the stop's hourly departures
   (today's timetables, counted once a day) expect 1.5 pages, so a board needs one query; if that isn't enough
   (filters, another day's timetable) it widens through 2 h, 6 h and 24 h, each step reading only the time it adds. A
-  page is full when it ends 10 min before its window does (an early trip from past it could come first).
+  page is full unless a trip scheduled past the window is predicted before its last departure (feeds allow any
+  amount early; the board finds such trips in its stops' `rt:stop:*` hashes).
 - **Filters**: `feeds` (feed ids) and `routes` (route names, `RouteRef.name`), comma separated or repeated; they
   narrow the board and its alerts, and an unknown feed is a 422. The board lists `routes`, every route departing from
   the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish

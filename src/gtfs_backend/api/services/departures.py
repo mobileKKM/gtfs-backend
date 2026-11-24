@@ -32,13 +32,10 @@ from gtfs_backend.api.services import alerts, stops, vehicles
 LOOKBACK_S = 60 * 60  # delayed departures stay this long past their time
 GRACE_S = 30  # keep a departure this long after it leaves
 # The first window is where the stop's hourly profile (today's timetables) expects PAGE_MARGIN pages; if that
-# isn't enough (filters, another day's timetable, realtime), it widens through these. Each step reads only the time
-# it adds.
+# isn't enough (filters, another day's timetable, a trip from past the window running early), it widens through
+# these. Each step reads only the time it adds.
 WINDOWS_S = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
 PAGE_MARGIN = 1.5
-# a page only counts as full if it ends this long before the window does: a trip just past the window's end,
-# running early, could still come before the page's last departure
-EARLY_S = 10 * 60
 MAX_GTFS_TIME_S = 48 * 3600  # GTFS times past 24:00 belong to night trips; none run longer than a second day
 
 SortKey = tuple[int, str, int]  # (time, trip_key, stop_sequence)
@@ -242,21 +239,22 @@ async def _page(
             Row(f, overlay(f, states.get(f.trip_key), now, by_vehicle.get(f.trip_key)), by_vehicle.get(f.trip_key)) for f in found
         ]
         page = select(rows, now, limit, lo, hi, live)
-        if len(page) >= limit and page[-1].time <= hi - EARLY_S:
+        # full, unless a trip scheduled after the window runs early enough to come before its last departure
+        if len(page) >= limit and ((early := live_data.earliest_early(hi, lo)) is None or early > page[-1].time):
             break
     return page, refs
 
 
 def expected_span(hourly: Hourly, second_of_day: int, limit: int, margin: float = PAGE_MARGIN) -> int:
-    """Seconds from `second_of_day` until `hourly` expects margin * limit departures, plus EARLY_S (a page is only
-    full that long before its window ends); the widest window at most (a stop without departures reads it at once)."""
+    """Seconds from `second_of_day` until `hourly` expects margin * limit departures; the widest window at most (a stop
+    without departures reads it at once)."""
     need = limit * margin
     t, end = second_of_day, second_of_day + WINDOWS_S[-1]
     while t < end:
         rate = hourly[t // 3600 % 24]  # departures in this hour
         hour_end = (t // 3600 + 1) * 3600
         if rate and rate * (hour_end - t) / 3600 >= need:
-            return min(t - second_of_day + int(need / rate * 3600) + EARLY_S, WINDOWS_S[-1])
+            return min(t - second_of_day + int(need / rate * 3600), WINDOWS_S[-1])
         need -= rate * (hour_end - t) / 3600
         t = hour_end
     return WINDOWS_S[-1]

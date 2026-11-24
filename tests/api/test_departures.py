@@ -2,26 +2,40 @@
 
 from datetime import date
 
-from gtfs_backend.api.services.departures import GRACE_S, Row, Scheduled, overlay, select, vehicle_state
+from gtfs_backend import keys
+from gtfs_backend.api.data.realtime import TripUpdate
+from gtfs_backend.api.services.departures import (
+    GRACE_S,
+    Row,
+    Scheduled,
+    overlay,
+    select,
+    vehicle_state,
+)
 from gtfs_backend.api.services.vehicles import stop_state
 
 NOW = 1_800_000_000
 
 
 def sched(trip="t1", seq=5, dep=NOW + 600, version=1) -> Scheduled:
-    return Scheduled("kmk_t", "kmk_t_v1", version, date(2027, 1, 15), trip, seq, "plat1", dep, "Bardosa", "r1")
+    day = date(2027, 1, 15)
+    key = keys.trip_key("kmk_t", day, trip)
+    return Scheduled("kmk_t", "kmk_t_v1", version, day, trip, seq, "plat1", dep, "Bardosa", "r1", False, key)
 
 
-def rt(*rows, version=1, relationship="SCHEDULED", vehicle="704") -> dict:
+def rt(*rows, version=1, relationship="SCHEDULED", vehicle="704") -> TripUpdate:
     """rows: (stop_sequence, predicted_departure, delay_s, extra)"""
-    return {
-        "version": version,
-        "vehicle_id": vehicle,
-        "schedule_relationship": relationship,
-        "stops": [
-            {"stop_sequence": q, "predicted_departure": p, "predicted_arrival": None, "delay_s": d, **x} for q, p, d, x in rows
-        ],
-    }
+    return TripUpdate(
+        {
+            "version": version,
+            "vehicle_id": vehicle,
+            "schedule_relationship": relationship,
+            "stops": [
+                {"stop_sequence": q, "predicted_departure": p, "predicted_arrival": None, "delay_s": d, **x}
+                for q, p, d, x in rows
+            ],
+        }
+    )
 
 
 def test_no_update_is_scheduled_only():
@@ -40,8 +54,7 @@ def test_prediction_for_the_stop():
 
 
 def test_arrival_only_prediction_is_used():
-    update = rt((5, None, 60, {}))
-    update["stops"][0]["predicted_arrival"] = NOW + 660
+    update = rt((5, None, 60, {"predicted_arrival": NOW + 660}))
     assert overlay(sched(), update, NOW).estimated == NOW + 660
 
 

@@ -64,6 +64,7 @@ class TripUpdate:
     """A trip's realtime state, used only for the timetable version it was computed for."""
 
     def __init__(self, raw: dict):
+        self.version: int | None = raw.get("version")
         self.vehicle_id: str | None = raw.get("vehicle_id")
         self.timestamp: int | None = raw.get("timestamp")  # when the feed measured it
         self.delay_s: int | None = raw.get("delay_s")
@@ -92,3 +93,69 @@ async def trip_updates(redis: Redis, keys: list[str]) -> dict[str, dict]:
     unique = list(dict.fromkeys(keys))
     values = await get_json_many(redis, [live_layout.trip(k) for k in unique])
     return {k: v for k, v in zip(unique, values, strict=True) if v}
+
+
+# ------------------------------------------------------------------------------------------------- departure boards
+
+
+class TripState:
+    """What a board needs of a trip's realtime (rt:tripstate), with its predictions at the board's stops (rt:stop:*)
+    only. Reads like a TripUpdate."""
+
+    __slots__ = ("version", "canceled", "vehicle_id", "timestamp", "_stops")
+
+    def __init__(self, version: int, canceled: bool, vehicle_id: str | None, timestamp: int | None):
+        self.version = version
+        self.canceled = canceled
+        self.vehicle_id = vehicle_id
+        self.timestamp = timestamp
+        self._stops: dict[int, StopUpdate] = {}
+
+    def stop(self, sequence: int) -> StopUpdate | None:
+        return self._stops.get(sequence)
+
+
+class BoardRealtime:
+    """The realtime a departure board can show, read once (one pipelined call): every feed's rt:tripstate and the
+    board's stops' rt:stop:* hashes, which hold every trip at the stop whatever its time, so a board widening its
+    window needs no second read. Decoded per trip on demand (a board shows few of the trips it reads)."""
+
+    def __init__(self, states: dict[str, dict[str, str]], stops: list[dict[str, str]]):
+        self._states = states  # feed_id -> trip key -> TripState JSON
+        self._predictions: dict[str, list[tuple[int, str]]] = {}  # trip key -> (stop_sequence, StopPrediction JSON)
+        for fields in stops:
+            for field, value in fields.items():
+                sequence, key = live_layout.parse_stop_prediction_field(field)
+                self._predictions.setdefault(key, []).append((sequence, value))
+        self._decoded: dict[str, TripState | None] = {}
+
+    @classmethod
+    async def read(cls, redis: Redis, feed_ids: list[str], public_stop_ids: list[str]) -> BoardRealtime:
+        if not feed_ids or not public_stop_ids:
+            return cls({}, [])
+        pipe = redis.pipeline(transaction=False)
+        for feed_id in feed_ids:
+            # the whole hash (a few hundred running trips): asking for a board's trips by name costs 4x as much, as
+            # most of them have no realtime
+            pipe.hgetall(live_layout.trip_states(feed_id))
+        for feed_id in feed_ids:
+            for pid in public_stop_ids:
+                pipe.hgetall(live_layout.stop_predictions(feed_id, pid))
+        results = await pipe.execute()
+        return cls(dict(zip(feed_ids, results[: len(feed_ids)], strict=True)), results[len(feed_ids) :])
+
+    def state(self, trip_key: str) -> TripState | None:
+        """The trip's state with its predictions at the board's stops; None without realtime."""
+        if trip_key in self._decoded:
+            return self._decoded[trip_key]
+        value = self._states.get(trip_key.split(":", 1)[0], {}).get(trip_key)
+        state = TripState(*json.loads(value)) if value else None
+        if state is not None:
+            for sequence, prediction in self._predictions.get(trip_key, []):
+                arrival, departure, delay, skipped = json.loads(prediction)
+                state._stops[sequence] = StopUpdate(arrival, departure, delay, skipped)
+        self._decoded[trip_key] = state
+        return state
+
+    def states(self, trip_keys) -> dict[str, TripState]:
+        return {k: state for k in trip_keys if (state := self.state(k)) is not None}

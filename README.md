@@ -215,7 +215,8 @@ Notes:
   headsigns, most served first; under 5 % of trips are left out. Precomputed per version (`core.stop_direction`).
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
-  delayed departures stay. Predictions are used only for the same version. `status`: `scheduled`, `live`,
+  delayed departures stay. The timetable comes from `core.stop_departure`, realtime from `rt:tripstate` and the
+  board's `rt:stop:*` hashes (one pipelined call). Predictions are used only for the same version. `status`: `scheduled`, `live`,
   `departed`, `canceled`, `skipped`; `time` is the estimate if known. `departed` is when the vehicle reports a later
   stop of the trip (VehiclePosition `current_stop_sequence`), else when the time is past; a TripUpdate not listing a
   stop doesn't count as passing it. `vehicle_state` (`at_stop`, `arriving`) is set when the vehicle reports this stop. Last stops and stops without pickup are not

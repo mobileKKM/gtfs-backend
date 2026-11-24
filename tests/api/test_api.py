@@ -16,6 +16,7 @@ from conftest import FIXTURES, TEST_REDIS_URL, TTLS, do_import, message, reset_d
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
 
+from gtfs_backend import keys
 from gtfs_backend.api.app import create_app
 from gtfs_backend.api.settings import ApiSettings
 from gtfs_backend.db import async_pool
@@ -444,6 +445,45 @@ async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
             assert again.status_code == 304, u
         # nothing realtime shown: no timestamp
         assert (await c.get("/vehicles?bbox=19.0,49.0,19.01,49.01")).json() == {"timestamp": None, "vehicles": []}
+
+
+async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch):
+    """A trip just past the first window, running early, still makes the page: a page only counts as full when it
+    ends EARLY_S before its window does."""
+    from gtfs_backend.api.data.realtime import StopUpdate, TripState
+    from gtfs_backend.api.services import departures
+
+    pid = stop_by_code(sql, "802-01")
+    day = date(2026, 10, 25)
+
+    def dep(trip_id, at):
+        key = keys.trip_key("kmk_t", day, trip_id)
+        return departures.Scheduled("kmk_t", "kmk_t_v1", 1, day, trip_id, 1, pid, at, "X", "r", False, key)
+
+    timetable = [dep(f"every2min_{i}", NOW + 60 + 120 * i) for i in range(40)]
+    early = dep("early", NOW + departures.WINDOWS_S[0] + 240)  # 4 min past the first window
+    timetable.append(early)
+
+    async def scheduled(conn, days, pids, start, end, lookback=departures.LOOKBACK_S):
+        return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
+
+    class Realtime:
+        @classmethod
+        async def read(cls, redis, feed_ids, public_stop_ids):
+            return cls()
+
+        def states(self, trip_keys):
+            state = TripState(1, False, None, NOW)
+            state._stops[1] = StopUpdate(None, early.scheduled_departure - 8 * 60, -8 * 60, False)  # 8 min early
+            return {early.trip_key: state} if early.trip_key in trip_keys else {}
+
+    monkeypatch.setattr(departures, "scheduled", scheduled)
+    monkeypatch.setattr(departures.realtime, "BoardRealtime", Realtime)
+    # 13 regular departures come before the early one (at +26 min), the 14th after it (+27 min)
+    board = (await api.get(f"/stops/{pid}/departures?limit=14")).json()
+    trip_keys = [d["trip_key"] for d in board["departures"]]
+    assert trip_keys[-1] == early.trip_key and trip_keys[:13] == [s.trip_key for s in timetable[:13]]
+    assert board["departures"][-1]["time"] == NOW + 26 * 60 and board["departures"][-1]["status"] == "live"
 
 
 async def test_departure_board_etag(api, sql):

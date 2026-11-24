@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Request
 
 from gtfs_backend.api import timing
-from gtfs_backend.api.cache import LIVE, cached, json_bytes_response, public
+from gtfs_backend.api.cache import LIVE, json_bytes_response, json_response, public
 from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, RoutesQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import DepartureBoard, SearchResult, StopList
@@ -36,9 +36,7 @@ async def search_stops(
     ("rondo mog" finds "Rondo Mogilskie"). Other feeds' stops are on the map and in departures, but not searched.
 
     Each result has its stops with directions (`towards` = the next stop group trips go to, with routes)."""
-    s = ctx.settings
-    cache_control = public(s.cache_ttl_static)
-    return await cached(request, ctx, s.cache_ttl_static, cache_control, lambda: stops.search(ctx, q, limit))
+    return json_response(request, await stops.search(ctx, q, limit), public(ctx.settings.cache_ttl_static))
 
 
 @router.get("/stops/{stop_key}/departures", response_model=DepartureBoard)
@@ -58,6 +56,4 @@ async def departure_board(
     in the same second can repeat: tell them apart by `trip_key` and `stop_sequence`). `feeds` and `routes` (route
     names) narrow the board and its alerts. Canceled trips and skipped stops stay with their status.
     """
-    return await cached(
-        request, ctx, ctx.settings.cache_ttl_live, LIVE, lambda: departures.board(ctx, stop_key, time, feeds, routes, limit)
-    )
+    return json_response(request, await departures.board(ctx, stop_key, time, feeds, routes, limit), LIVE)

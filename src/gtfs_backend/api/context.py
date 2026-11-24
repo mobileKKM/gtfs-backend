@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
@@ -21,8 +20,6 @@ class Context:
     catalog: Catalog
     clock: Clock
     settings: ApiSettings
-    # response cache key -> the computation in flight in this process (api/cache.py)
-    inflight: dict[str, asyncio.Future] = field(default_factory=dict)
 
     @property
     def feed_ids(self) -> list[str]:

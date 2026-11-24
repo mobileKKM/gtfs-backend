@@ -20,18 +20,20 @@ def api(**env) -> ApiSettings:
 def test_env_vars_override(monkeypatch):
     monkeypatch.setenv("VEHICLE_TTL", "30")
     monkeypatch.setenv("RETIRE_AT", "04:15")
-    monkeypatch.setenv("CACHE_TTL_LIVE", "0")
+    monkeypatch.setenv("CACHE_TTL_STATIC", "0")
     monkeypatch.setenv("REALTIME_POLL_INTERVAL", "20")
     assert worker().vehicle_ttl == 30 and worker().retire_at == time(4, 15)
     assert worker().realtime_poll_interval == 20
-    assert api().cache_ttl_live == 0
+    assert api().cache_ttl_static == 0
 
 
 def test_removed_settings_are_ignored(monkeypatch):
     # an old .env may still set them; they no longer do anything
     monkeypatch.setenv("HTTP_USER_AGENT", "x/1")
     monkeypatch.setenv("SEARCH_NAMESPACES", "ztp")
+    monkeypatch.setenv("CACHE_TTL_LIVE", "3")  # the response cache is gone
     assert not hasattr(worker(), "http_user_agent") and not hasattr(api(), "search_namespaces")
+    assert not hasattr(api(), "cache_ttl_live")
 
 
 @pytest.mark.parametrize(

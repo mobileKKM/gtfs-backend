@@ -1,42 +1,27 @@
-"""JSON responses with an ETag (304 when unchanged) and Cache-Control, and a response cache shared by all API processes.
+"""JSON responses with an ETag (304 when unchanged) and Cache-Control.
 
-The cache keeps finished bodies in Redis for a few seconds (boards, trips) or minutes (search, route shapes), so
-many people looking at the same stop cost one computation per TTL, not one per request, whichever process answers.
-Every process serves the same body (and ETag) for that time, so polling clients get 304s.
-
-Keys: the route template, its path parameters and only the query parameters the route declares (so made-up ones
-can't fill Redis), plus the catalog's fingerprint (a new import or a new day starts fresh), hashed. Concurrent
-misses in one process compute once. Redis trouble only turns the cache off for that request.
+Every response is computed when it is asked for: there is no response cache. The ETag is the body's hash, so a
+client polling unchanged data gets a 304 (the body is computed, compared and not sent). Polled responses carry the
+time of the newest realtime data they show, not of the request, so their ETag only changes with the data.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import json
-from collections.abc import Awaitable, Callable
 
 from fastapi import Request, Response
 from pydantic import BaseModel
-from redis.exceptions import RedisError
 
 from gtfs_backend.api import timing
-from gtfs_backend.api.context import Context
-from gtfs_backend.logs import log
 
 NO_STORE = "no-store"
-# Vehicles, boards, trips: change every few seconds. Clients poll (or follow SSE later) and always revalidate,
-# getting a 304 via the ETag while nothing changed.
+# Vehicles, boards, trips: change every few seconds. Clients poll and always revalidate, getting a 304 via the ETag
+# while nothing changed.
 LIVE = "no-cache"
-
-KEY_PREFIX = "api:resp:"
-MAX_BODY = 512 * 1024  # bigger bodies aren't cached
-
-_query_names: dict[int, frozenset[str]] = {}  # id(route) -> its declared query parameters (aliases)
 
 
 def public(max_age: int) -> str:
-    """Stops, routes, route shapes and alerts (max-age from settings)."""
+    """Stops, trips, route shapes, search and alerts (max-age from settings)."""
     return f"public, max-age={max_age}"
 
 
@@ -63,88 +48,4 @@ def json_bytes_response(request: Request, body: bytes, cache_control: str) -> Re
     """An already serialized body; answer 304 if the client already has it."""
     with timing.serializing():
         etag = _etag(body)
-    return _respond(request, body, etag, cache_control)
-
-
-def _query_aliases(dependant) -> set[str]:
-    """Query parameters of a route, including those of its dependencies (BboxQuery etc.)."""
-    return {p.alias for p in dependant.query_params} | {a for d in dependant.dependencies for a in _query_aliases(d)}
-
-
-def _declared_query(request: Request) -> frozenset[str]:
-    route = request.scope["route"]
-    names = _query_names.get(id(route))
-    if names is None:
-        names = _query_names[id(route)] = frozenset(_query_aliases(route.dependant))
-    return names
-
-
-def cache_key(request: Request, fingerprint: str) -> str:
-    names = _declared_query(request)
-    raw = json.dumps(
-        [
-            fingerprint,
-            request.scope["route"].path,
-            sorted(request.path_params.items()),
-            sorted((k, v) for k, v in request.query_params.multi_items() if k in names),
-        ],
-        separators=(",", ":"),
-    )
-    return KEY_PREFIX + hashlib.blake2b(raw.encode(), digest_size=16).hexdigest()
-
-
-async def _get(ctx: Context, key: str) -> tuple[str, bytes] | None:
-    try:
-        value = await ctx.redis.get(key)
-    except RedisError as exc:
-        log.warning("response_cache_unavailable", error=str(exc))
-        return None
-    if not value:
-        return None
-    etag, _, body = value.partition("\n")
-    return etag, body.encode()
-
-
-async def _set(ctx: Context, key: str, etag: str, body: bytes, ttl: int) -> None:
-    if len(body) > MAX_BODY:
-        return
-    try:
-        await ctx.redis.set(key, etag + "\n" + body.decode(), ex=ttl)
-    except RedisError as exc:
-        log.warning("response_cache_unavailable", error=str(exc))
-
-
-async def _compute(ctx: Context, key: str, ttl: int, compute: Callable[[], Awaitable[BaseModel]]) -> tuple[str, bytes]:
-    model = await compute()
-    with timing.serializing():
-        body = model.model_dump_json().encode()
-        etag = _etag(body)
-    await _set(ctx, key, etag, body, ttl)
-    return etag, body
-
-
-def _done(ctx: Context, key: str, task: asyncio.Future) -> None:
-    ctx.inflight.pop(key, None)
-    if not task.cancelled():
-        task.exception()  # retrieved here too, in case every waiter went away
-
-
-async def cached(
-    request: Request, ctx: Context, ttl: int, cache_control: str, compute: Callable[[], Awaitable[BaseModel]]
-) -> Response:
-    """The response of `compute()`, from the shared cache when another request made it less than `ttl` s ago.
-    Errors (404, 422, ...) are raised as usual and never cached. ttl 0: no caching."""
-    if ttl <= 0:
-        return json_response(request, await compute(), cache_control)
-    key = cache_key(request, ctx.catalog.fingerprint)
-    hit = await _get(ctx, key)
-    if hit is None:
-        task = ctx.inflight.get(key)
-        if task is None:
-            task = asyncio.ensure_future(_compute(ctx, key, ttl, compute))
-            ctx.inflight[key] = task
-            task.add_done_callback(lambda t: _done(ctx, key, t))
-        # shield: one waiter going away (client disconnected) mustn't cancel the others' result
-        hit = await asyncio.shield(task)
-    etag, body = hit
     return _respond(request, body, etag, cache_control)

@@ -120,7 +120,6 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
 | pub/sub `rt:updated`, `static:updated` | change notifications |
-| `api:resp:{hash}` | the API's response cache |
 
 Rules:
 
@@ -183,7 +182,7 @@ of the request, so their ETag only changes with the data.
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_key` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
 | `GET /stops/{stop_key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
-| `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
+| `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (`Cache-Control` like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
@@ -200,10 +199,10 @@ before the first request and refreshed in the background on `static:updated`, a 
 `CATALOG_REFRESH_INTERVAL` while requests keep using the loaded one. `DB_POOL_MAX_SIZE` is the same for the
 worker and every API process: keep `(API_WORKERS + 1) × DB_POOL_MAX_SIZE` below Postgres' `max_connections` (100).
 
-**Response cache.** Boards and live trips (`CACHE_TTL_LIVE`, 3 s), search, trips and shapes (`CACHE_TTL_STATIC`, 300 s) and
-alerts (`CACHE_TTL_ALERTS`, 15 s) are cached in Redis for all processes, so clients share bodies and ETags and
-polling gets 304s. Keys include the loaded versions; only declared query parameters count; errors aren't cached.
-`/vehicles` and `/stops` bbox queries aren't cached.
+**No response cache.** Every response is computed when asked for (a busy departure board took about 12 ms on a
+laptop with the full ZTP timetables; `Server-Timing` shows it in production), so live data is as fresh as Redis. The ETag is the body's hash: polling clients get a 304 while
+nothing changed. Public responses carry `Cache-Control: public, max-age=…` for clients and proxies:
+`CACHE_TTL_STATIC` (300 s: stops, search, trips, shapes) and `CACHE_TTL_ALERTS` (15 s).
 
 **Privacy.** No accounts, cookies, identifiers or client addresses; requests aren't logged (uvicorn's access log is
 off) and `X-Forwarded-For` is ignored. A reverse proxy or CDN in front should do the same (no IPs or query strings
@@ -223,7 +222,9 @@ Notes:
   departures; `on_demand` marks GTFS pickup type 2/3.
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
   show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
-  (tell them apart by `trip_key` + `stop_sequence`). The window widens (2 h, 6 h, 24 h) until a page is full.
+  (tell them apart by `trip_key` + `stop_sequence`). The window widens (30 min, 2 h, 6 h, 24 h) until a page is
+  full and ends 10 min before the window does (an early trip from past it could come first); each step reads only
+  the time it adds.
 - **Filters**: `feeds` (feed ids) and `routes` (route names, `RouteRef.name`), comma separated or repeated; they
   narrow the board and its alerts, and an unknown feed is a 422. The board lists `routes`, every route departing from
   the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish

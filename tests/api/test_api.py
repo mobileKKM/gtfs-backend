@@ -90,13 +90,9 @@ def loaded(database_url):
     return database_url
 
 
-# Most tests change Redis between requests and want to see it at once: the response cache is off for them.
-NO_CACHE = {"cache_ttl_live": 0, "cache_ttl_static": 0, "cache_ttl_alerts": 0}
-
-
 @pytest.fixture
 async def api(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c
@@ -281,7 +277,7 @@ async def test_stops_without_trips_are_never_returned(api_ctx, sql, loaded):
 
 async def test_stop_search_covers_only_search_namespaces(loaded, sql):
     """Search is limited to feeds.yml `search_namespaces` (ZTP); the map and the stop itself are not."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     feeds = FEEDS.model_copy(update={"search_namespaces": ["km_kolej"]})  # no stops loaded there; skips validation
     app = create_app(settings, feeds=feeds, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
@@ -426,7 +422,7 @@ async def test_departure_board_stop_and_other_days(api, sql):
 async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
     """Responses carry the time of their data, not of the request: a later poll of unchanged data is a 304."""
     clock = [NOW]
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: clock[0])
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         vehicles = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()
@@ -783,6 +779,27 @@ async def test_openapi_lists_every_endpoint(api):
     } == set(paths)
 
 
+# ------------------------------------------------------------------------------------------------- revalidation
+
+
+async def test_polls_revalidate_without_a_response_cache(api, sql):
+    """Nothing is cached: every request computes, the ETag (the body's hash) gives polling clients a 304."""
+    url = f"/stops/{group_id(sql, '802')}/departures"
+    first = await api.get(url)
+    second = await api.get(url)
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content and first.headers["etag"] == second.headers["etag"]
+    assert first.headers["cache-control"] == "no-cache"
+    again = await api.get(url, headers={"If-None-Match": first.headers["etag"]})
+    assert again.status_code == 304 and again.content == b"" and again.headers["etag"] == first.headers["etag"]
+    for path in (f"/stops?bbox={RONDO_BBOX}", "/stops/search?q=rondo", "/alerts"):
+        r = await api.get(path)
+        assert (await api.get(path, headers={"If-None-Match": r.headers["etag"]})).status_code == 304
+    r = redis.Redis.from_url(TEST_REDIS_URL)
+    assert list(r.scan_iter("api:*")) == []  # the API writes nothing to Redis
+    r.close()
+
+
 async def test_map_stops_are_serialized_like_the_model(api):
     """/stops joins precomputed JSON pieces: byte for byte what the model serializes to (so ETags stay the same)."""
     from gtfs_backend.api.schemas import StopList
@@ -790,107 +807,6 @@ async def test_map_stops_are_serialized_like_the_model(api):
     for query in (f"bbox={CITY_BBOX}", f"bbox={CITY_BBOX}&kind=group", f"bbox={RONDO_BBOX}&modes=tram", "bbox=0,0,1,1"):
         body = (await api.get(f"/stops?{query}")).content
         assert body == StopList.model_validate_json(body).model_dump_json().encode(), query
-
-
-# ------------------------------------------------------------------------------------------------- response cache
-
-
-@pytest.fixture
-async def cached_api(loaded, monkeypatch):
-    """An API with the response cache on, and a count of the boards it computed."""
-    from gtfs_backend.api.services import departures
-
-    r = redis.Redis.from_url(TEST_REDIS_URL)
-    for key in r.scan_iter("api:resp:*"):
-        r.delete(key)
-    r.close()
-    calls = []
-    real = departures.board
-
-    async def counted(*args, **kwargs):
-        calls.append(args[1])
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(departures, "board", counted)
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=60)
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        yield c, app.state.ctx, calls
-
-
-async def test_board_is_computed_once_and_revalidates(cached_api, sql):
-    api, _, calls = cached_api
-    url = f"/stops/{group_id(sql, '802')}/departures"
-    first = await api.get(url)
-    second = await api.get(url)
-    assert first.status_code == second.status_code == 200 and len(calls) == 1
-    assert first.content == second.content and first.headers["etag"] == second.headers["etag"]
-    assert first.headers["cache-control"] == "no-cache"
-    again = await api.get(url, headers={"If-None-Match": first.headers["etag"]})
-    assert again.status_code == 304 and len(calls) == 1
-
-
-async def test_concurrent_misses_compute_once(cached_api, sql):
-    api, _, calls = cached_api
-    url = f"/stops/{group_id(sql, '802')}/departures?limit=7"
-    responses = await asyncio.gather(*(api.get(url) for _ in range(5)))
-    assert {r.status_code for r in responses} == {200} and len({r.content for r in responses}) == 1
-    assert len(calls) == 1
-
-
-async def test_cache_key(cached_api, sql):
-    api, ctx, calls = cached_api
-    url = f"/stops/{group_id(sql, '802')}/departures?limit=5"
-    await api.get(url + "&_=1")
-    await api.get(url + "&_=2")  # parameters the route doesn't declare don't count
-    assert len(calls) == 1
-    await api.get(url.replace("limit=5", "limit=6"))
-    assert len(calls) == 2
-    ctx.catalog.fingerprint = "other"  # another timetable version (import, new day)
-    await api.get(url)
-    assert len(calls) == 3
-
-
-async def test_errors_are_not_cached(cached_api):
-    api, _, calls = cached_api
-    assert (await api.get("/stops/nowhere-zzzzz/departures")).status_code == 404
-    assert (await api.get("/stops/nowhere-zzzzz/departures")).status_code == 404
-    assert len(calls) == 2
-
-
-async def test_cache_trouble_only_skips_the_cache(cached_api, sql, monkeypatch):
-    from redis.exceptions import ConnectionError as RedisConnectionError
-
-    api, ctx, calls = cached_api
-
-    async def broken(*args, **kwargs):
-        raise RedisConnectionError("down")
-
-    monkeypatch.setattr(ctx.redis, "get", broken)
-    monkeypatch.setattr(ctx.redis, "set", broken)
-    url = f"/stops/{group_id(sql, '802')}/departures"
-    assert (await api.get(url)).status_code == 200 and (await api.get(url)).status_code == 200
-    assert len(calls) == 2
-
-
-async def test_cache_off_with_ttl_zero(loaded, sql, monkeypatch):
-    from gtfs_backend.api.services import departures
-
-    calls = []
-    real = departures.board
-
-    async def counted(*args, **kwargs):
-        calls.append(1)
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(departures, "board", counted)
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=0)
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        url = f"/stops/{group_id(sql, '802')}/departures"
-        await c.get(url)
-        await c.get(url)
-    assert len(calls) == 2
 
 
 async def test_boards_and_trips_only_carry_current_alerts(api, sql):
@@ -931,7 +847,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
 @pytest.fixture
 async def api_no_raise(loaded):
     """Like `api`, but app exceptions become responses (as in production) instead of reaching the test."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     transport = ASGITransport(app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app), AsyncClient(transport=transport, base_url="http://test/api/v1") as c:
@@ -963,7 +879,7 @@ async def test_unexpected_errors_keep_the_error_body(api_no_raise, monkeypatch):
 @pytest.fixture
 async def api_ctx(loaded):
     """Like `api`, with the app's context."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c, app.state.ctx

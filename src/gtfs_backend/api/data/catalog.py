@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -116,7 +115,6 @@ class Catalog:
         self._refresh: asyncio.Task | None = None
         self._retry_at = 0.0  # time.monotonic()
         self.stops = StopData.empty()  # stops, groups, today's directions (api/data/stopdata.py)
-        self.fingerprint = ""  # changes with the versions loaded (new import, new day); part of response cache keys
 
     @property
     def loaded(self) -> bool:
@@ -204,8 +202,6 @@ class Catalog:
             info.covered = frozenset(wanted[feed_id])
         self.feeds = feeds
         self.stops = stops
-        versions = sorted(f"{d.feed_id}/{d.date}/{d.feed_version_id}" for info in feeds.values() for d in info.days)
-        self.fingerprint = hashlib.blake2b("|".join(versions).encode(), digest_size=6).hexdigest()
         self._loaded_for = {f: local_date(now, info.tz) for f, info in feeds.items()}
         self._routes = {v: routes for v, routes in self._routes.items() if v in ready}  # retired ones go
         self._loaded_at = now

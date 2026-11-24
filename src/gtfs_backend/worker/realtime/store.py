@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 
 from gtfs_backend import keys, live_layout
 from gtfs_backend.feeds import RealtimeKind
+from gtfs_backend.live_layout import LiveTrip
 from gtfs_backend.worker.realtime.normalize import Result
 from gtfs_backend.worker.realtime.trip_updates import merge_stops
 
@@ -32,8 +33,11 @@ class RealtimeStore:
         self.redis = redis
         self.ttls = ttls
         self.feed_ids = feed_ids  # all feeds, for the combined GEO set
-        self._trip_keys: dict[str, set[str]] = {}  # per feed_id: trip keys written by the last update
-        self._vehicle_keys: dict[str, list[str]] = {}  # per feed_id: vehicle keys written by the last update
+        # per feed_id, what its last update wrote: trips (as merged, by trip key) and vehicle keys. The worker is the
+        # only writer, so the last trips are taken from here instead of being read back (only after a restart).
+        self._trips: dict[str, dict[str, LiveTrip]] = {}
+        self._trip_keys: dict[str, set[str]] = {}  # the trip keys in Redis (incl. ones written before a restart)
+        self._vehicle_keys: dict[str, list[str]] = {}
 
     async def write_vehicles(self, feed_id: str, res: Result) -> None:
         geo_key = live_layout.vehicles_geo(feed_id)
@@ -64,22 +68,32 @@ class RealtimeStore:
             found.add((key.decode() if isinstance(key, bytes) else key).removeprefix(prefix))
         return found
 
+    async def _restore_trips(self, feed_id: str, current: set[str]) -> None:
+        """First update since the worker started: the trips it wrote before are in Redis only."""
+        stored = await self._stored_trip_keys(feed_id)
+        wanted = sorted(stored & current)
+        values = await self.redis.mget([live_layout.trip(k) for k in wanted]) if wanted else []
+        self._trip_keys[feed_id] = stored
+        self._trips[feed_id] = {k: json.loads(v) for k, v in zip(wanted, values, strict=True) if v}
+
     async def write_trips(self, feed_id: str, res: Result) -> None:
-        if feed_id not in self._trip_keys:  # first update since the worker started: earlier trips count as written
-            self._trip_keys[feed_id] = await self._stored_trip_keys(feed_id)
         current = {trip["key"] for trip in res.trips}
-        # the feed drops stops it is past; read the previous JSON back so their last times (and restarts) survive
-        prevs = await self.redis.mget([live_layout.trip(trip["key"]) for trip in res.trips]) if res.trips else []
-        pipe = self.redis.pipeline(transaction=True)
-        for trip, prev in zip(res.trips, prevs, strict=True):
-            merged = merge_stops(json.loads(prev) if prev else None, trip)
-            pipe.set(live_layout.trip(trip["key"]), _dumps(merged), ex=self.ttls.trip)
+        if feed_id not in self._trip_keys:
+            await self._restore_trips(feed_id, current)
+        # the feed drops stops it is past: their last times are kept from the previous update
+        last = self._trips[feed_id]
+        merged = {trip["key"]: merge_stops(last.get(trip["key"]), trip) for trip in res.trips}
+        # no MULTI: readers want each trip whole, not all of them at once, and a transaction would hold them back
+        # for the whole write (MBs for the big feeds)
+        pipe = self.redis.pipeline(transaction=False)
+        for key, trip in merged.items():
+            pipe.set(live_layout.trip(key), _dumps(trip), ex=self.ttls.trip)
         # FULL_DATASET: trips missing from this update are gone
-        stale = self._trip_keys.get(feed_id, set()) - current
-        if stale:
+        if stale := self._trip_keys[feed_id] - current:
             pipe.delete(*(live_layout.trip(key) for key in stale))
         await pipe.execute()
-        self._trip_keys[feed_id] = current
+        # only once written: a failed write is retried with the same update (the poller doesn't mark it as seen)
+        self._trip_keys[feed_id], self._trips[feed_id] = current, merged
 
     async def write_alerts(self, feed_id: str, res: Result) -> None:
         await self.redis.set(live_layout.alerts(feed_id), _dumps(res.alerts), ex=self.ttls.alert)

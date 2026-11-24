@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+import redis
 from conftest import TTLS
 from redis.asyncio import Redis
 
@@ -101,4 +103,32 @@ async def test_trips_left_from_before_a_restart_are_removed(redis_url):
     assert await r.exists("rt:trip:kmk_t:20261025:gone") == 0
     assert await r.exists("rt:trip:kmk_t:20261025:on") == 1
     assert await r.exists("rt:trip:kmk_a:20261025:other_feed") == 1  # other feeds are theirs to clean
+    await r.aclose()
+
+
+async def test_stops_dropped_before_a_restart_are_kept(redis_url):
+    r = Redis.from_url(redis_url, decode_responses=True)
+    before = RealtimeStore(r, ["kmk_t"], TTLS)
+    await before.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (1, "pa", 1), (2, "pb", 2))]))
+
+    after = RealtimeStore(r, ["kmk_t"], TTLS)  # restarted: the last update is only in Redis
+    await after.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (2, "pb", 3))]))
+    await after.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (3, "pc", 4))]))
+    stops = json.loads(await r.get("rt:trip:kmk_t:20261025:a"))["stops"]
+    assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3), ("pc", 4)]
+    await r.aclose()
+
+
+async def test_a_failed_trip_write_is_merged_again_from_the_last_written_one(redis_url):
+    r = Redis.from_url(redis_url, decode_responses=True)
+    store = RealtimeStore(r, ["kmk_t"], TTLS)
+    await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (1, "pa", 1), (2, "pb", 2))]))
+    store.redis = Redis.from_url("redis://localhost:1/0", socket_connect_timeout=0.2)  # Redis unreachable
+    with pytest.raises(redis.exceptions.ConnectionError):  # the poller records it and processes the update again
+        await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (2, "pb", 3))]))
+    await store.redis.aclose()
+    store.redis = r
+    await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (2, "pb", 3))]))
+    stops = json.loads(await r.get("rt:trip:kmk_t:20261025:a"))["stops"]
+    assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3)]
     await r.aclose()

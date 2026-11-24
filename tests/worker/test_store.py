@@ -106,6 +106,18 @@ async def test_trips_left_from_before_a_restart_are_removed(redis_url):
     await r.aclose()
 
 
+async def test_vehicles_that_left_the_feed_are_removed(redis_url):
+    r = Redis.from_url(redis_url, decode_responses=True)
+    store = RealtimeStore(r, ["kmk_t"], TTLS)
+    await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735"), vehicle("302")]))
+    await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735")]))
+    assert await r.exists("rt:veh:kmk_t:302") == 0  # not shown until its TTL runs out
+    assert await r.exists("rt:veh:kmk_t:735") == 1
+    await store.write_vehicles("kmk_t", Result())
+    assert await r.exists("rt:veh:kmk_t:735") == 0 and await r.exists("rt:veh:geo:kmk_t") == 0
+    await r.aclose()
+
+
 async def test_stops_dropped_before_a_restart_are_kept(redis_url):
     r = Redis.from_url(redis_url, decode_responses=True)
     before = RealtimeStore(r, ["kmk_t"], TTLS)

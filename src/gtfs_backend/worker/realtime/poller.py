@@ -53,6 +53,9 @@ class RealtimeTask:
     Polls every `interval` seconds. A poll that finds the file unchanged keeps the last data alive in Redis (TTLs
     refreshed) for up to `max_age` seconds after it last changed: slow feeds (km_kolej: every ~5 min) would
     otherwise expire between updates.
+
+    A download attempt gives up after `attempt_timeout`, so a hanging server delays a fast feed by a few polls at
+    most (retries x timeout), not by minutes.
     """
 
     def __init__(
@@ -67,6 +70,7 @@ class RealtimeTask:
         max_age: float,
         retries: int,
         retry_delay: float,
+        attempt_timeout: float | None = None,
     ):
         self.runtime = runtime
         self.kind = kind
@@ -77,6 +81,7 @@ class RealtimeTask:
         self.max_age = max_age
         self.last_change: float | None = None  # time.monotonic() of the last stored update
         self.retries, self.retry_delay = retries, retry_delay
+        self.attempt_timeout = attempt_timeout  # per download attempt; None: the client's
         self.etag: str | None = None
         self.last_modified: str | None = None
         self.last_ts = 0
@@ -140,6 +145,7 @@ class RealtimeTask:
             last_modified=self.last_modified,
             retries=self.retries,
             retry_delay=self.retry_delay,
+            timeout=self.attempt_timeout,
         )
         self.meta.update(fetch_seconds=_secs(time.perf_counter() - t0), fetch_attempts=fetched.attempts)
         if fetched.not_modified:
@@ -148,6 +154,9 @@ class RealtimeTask:
         msg = fetched.value
         ts = int(msg.header.timestamp)
         if ts and ts <= self.last_ts:
+            # data we have, under a new ETag (ZTP rewrites its files between timestamp changes): asking with this one
+            # gets a 304 next time instead of the whole file
+            self.etag, self.last_modified = fetched.etag, fetched.last_modified
             await self._unchanged()
             return None
         now = time.time()

@@ -37,6 +37,7 @@ MAINTENANCE_CHECK_INTERVAL_S = 60
 OSM_CHECK_INTERVAL_S = 3600  # how often the OSM file's age is looked at
 OSM_FIRST_ATTEMPTS = 3  # the first fetch is tried this often before feeds that need the file start without it
 OSM_RETRY_DELAY_S = 30
+MIN_FETCH_ATTEMPT_S = 5  # a realtime download attempt may take its poll interval, but at least this long
 
 
 def _import_executor() -> ProcessPoolExecutor:
@@ -115,16 +116,18 @@ class Worker:
         tasks = [asyncio.create_task(self._static_loop(f), name=f"static:{f.feed_id}") for f in import_order(self.feeds)]
         for feed in self.enabled:
             for kind, url in feed.realtime.items():
+                interval = feed.realtime_poll_interval or s.realtime_poll_interval
                 task = RealtimeTask(
                     self.runtimes[feed.feed_id],
                     kind,
                     url,
                     self.store,
                     self.rt_client,
-                    interval=feed.realtime_poll_interval or s.realtime_poll_interval,
+                    interval=interval,
                     max_age=feed.realtime_max_age or s.realtime_max_age,
                     retries=s.http_retries,
                     retry_delay=s.http_retry_delay,
+                    attempt_timeout=min(s.realtime_fetch_timeout, max(interval, MIN_FETCH_ATTEMPT_S)),
                 )
                 self.realtime_tasks.append(task)
                 tasks.append(asyncio.create_task(task.run(), name=f"realtime:{task.name}"))

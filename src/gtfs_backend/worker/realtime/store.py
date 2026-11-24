@@ -37,7 +37,7 @@ class RealtimeStore:
         # only writer, so the last trips are taken from here instead of being read back (only after a restart).
         self._trips: dict[str, dict[str, LiveTrip]] = {}
         self._trip_keys: dict[str, set[str]] = {}  # the trip keys in Redis (incl. ones written before a restart)
-        self._vehicle_keys: dict[str, list[str]] = {}
+        self._vehicle_keys: dict[str, set[str]] = {}
 
     async def write_vehicles(self, feed_id: str, res: Result) -> None:
         geo_key = live_layout.vehicles_geo(feed_id)
@@ -49,6 +49,10 @@ class RealtimeStore:
             member = keys.vehicle_key(feed_id, v["vehicle_id"])
             members.extend([v["lon"], v["lat"], member])
             pipe.set(live_layout.vehicle(member), _dumps(v), ex=self.ttls.vehicle)
+        current = {live_layout.vehicle(m) for m in members[2::3]}
+        # vehicles that left the feed (after a restart: unknown, they expire by TTL)
+        if gone := self._vehicle_keys.get(feed_id, set()) - current:
+            pipe.delete(*gone)
         if members:
             pipe.geoadd(tmp, members)
             pipe.rename(tmp, geo_key)
@@ -58,7 +62,7 @@ class RealtimeStore:
         pipe.zunionstore(live_layout.VEHICLES_GEO, [live_layout.vehicles_geo(k) for k in self.feed_ids])
         pipe.expire(live_layout.VEHICLES_GEO, self.ttls.vehicle)
         await pipe.execute()
-        self._vehicle_keys[feed_id] = [live_layout.vehicle(m) for m in members[2::3]]
+        self._vehicle_keys[feed_id] = current
 
     async def _stored_trip_keys(self, feed_id: str) -> set[str]:
         """Trip keys of this feed already in Redis (written before a restart)."""

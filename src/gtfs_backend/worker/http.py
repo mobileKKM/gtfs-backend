@@ -97,11 +97,14 @@ async def fetch_bytes[T](
     last_modified: str | None = None,
     retries: int,
     retry_delay: float,
+    timeout: float | None = None,
 ) -> Fetched[T]:
-    """GET a small file into memory and parse it; retries on truncation, parse errors and RETRY_STATUSES / 5xx."""
+    """GET a small file into memory and parse it; retries on truncation, parse errors and RETRY_STATUSES / 5xx.
+    `timeout` (seconds) replaces the client's read/write/pool timeouts for each attempt."""
+    per_attempt = httpx.USE_CLIENT_DEFAULT if timeout is None else httpx.Timeout(timeout, connect=client.timeout.connect)
 
     async def attempt(n: int) -> Fetched[T]:
-        resp = await client.get(url, headers=_conditional_headers(etag, last_modified))
+        resp = await client.get(url, headers=_conditional_headers(etag, last_modified), timeout=per_attempt)
         if resp.status_code == 304:
             return Fetched(not_modified=True, etag=etag, last_modified=last_modified, attempts=n)
         resp.raise_for_status()

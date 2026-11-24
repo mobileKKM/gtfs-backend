@@ -131,6 +131,11 @@ Rules:
 - **Service suffix**: after midnight ZTP's trams name a still-running trip of yesterday's timetable with today's
   `_service_N` (seen 2026-10-31, when a new timetable started), an id that exists in no version. `kmk_t` has
   `ignore_service_suffix: true`: an id not found as is is retried without the suffix and the time window picks the trip.
+- **Timetables in memory**: per feed, the trips running yesterday/today/tomorrow (`trip_index.py`). It is reloaded
+  after an import and on a new day **in the background**, while the previous index keeps serving: a slow or
+  unreachable Postgres never stops the live data (a failed reload is retried after 10 s). Unchanged versions are
+  reused, so only an import of the feed itself reads its trips again. Stop times are loaded per trip when it first
+  appears; if that fails, its update goes out without per-stop times and the load is retried after 30 s.
 - Downloads are checked against `Content-Length` and parsed before use. ZTP briefly serves empty or partial files
   while replacing them; those, 5xx and 429 are retried and never overwrite good data. Requests send `USER_AGENT`
   (`worker/http.py`); put a contact for the feed operators in it.

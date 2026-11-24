@@ -1,11 +1,12 @@
 """In-memory view of the static data the realtime normalizer needs, per feed.
 
-Loaded for the service days yesterday/today/tomorrow (only their authoritative versions). Stop times
-are fetched lazily for trips that appear in realtime data and cached until the next reload.
+Loaded for the service days yesterday/today/tomorrow (only their authoritative versions, and only the trips that
+run on them). Stop times are fetched lazily for trips that appear in realtime data, and kept across reloads.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -69,6 +70,7 @@ class TripIndex:
     routes: set[tuple[int, str]] = field(default_factory=set)  # (version, route_id)
     stop_times: dict[tuple[int, str], list[StopTime]] = field(default_factory=dict)
     version_ids: dict[int, str] = field(default_factory=dict)  # version number -> core.feed_version.id
+    services: dict[int, frozenset[str]] = field(default_factory=dict)  # version -> its services on `days`
     loaded_for: date | None = None
 
     def add_trip(self, info: TripInfo) -> None:
@@ -83,10 +85,48 @@ class TripIndex:
         return self.stop_links.get((version, stop_id)) if stop_id else None
 
 
+YIELD_EVERY_ROWS = 5000  # building the index yields to the event loop this often, so polls of other feeds keep going
+
+_TRIPS_SQL = """
+    SELECT t.trip_id, t.service_id, t.route_id, t.direction_id, t.shape_id, t.trip_headsign, t.block_id,
+           r.route_short_name, r.route_type,
+           extract(epoch FROM min(coalesce(st.departure_time, st.arrival_time)))::int,
+           extract(epoch FROM max(coalesce(st.arrival_time, st.departure_time)))::int
+    FROM gtfs.trips t
+    JOIN gtfs.routes r ON r.feed_version_id = t.feed_version_id AND r.route_id = t.route_id
+    JOIN gtfs.stop_times st ON st.feed_version_id = t.feed_version_id AND st.trip_id = t.trip_id
+    -- one literal version on every table, so only its partitions are read
+    WHERE t.feed_version_id = %(v)s AND r.feed_version_id = %(v)s AND st.feed_version_id = %(v)s
+      AND t.service_id = ANY(%(services)s)
+    GROUP BY t.feed_version_id, t.trip_id, r.route_short_name, r.route_type
+"""
+
+# a station's stops can be split over groups: it is shown as the group most of them are in
+_STATIONS_SQL = """
+    SELECT p.feed_version_id, p.stop_id, mode() WITHIN GROUP (ORDER BY s.stop_group_id),
+           array_agg(DISTINCT l.public_stop_id ORDER BY l.public_stop_id)
+    FROM gtfs.stops p
+    JOIN gtfs.stops c ON c.feed_version_id = p.feed_version_id AND c.parent_station = p.stop_id
+    JOIN core.stop_link l ON l.feed_version_id = c.feed_version_id AND l.stop_id = c.stop_id
+    JOIN core.stop s ON s.id = l.public_stop_id
+    WHERE p.feed_version_id = ANY(%s) AND p.location_type = 1
+    GROUP BY p.feed_version_id, p.stop_id
+"""
+
+
 async def load_index(
-    pool: AsyncConnectionPool, feed_id: str, now: float, day_start: DayStart = "noon_minus_12h"
+    pool: AsyncConnectionPool,
+    feed_id: str,
+    now: float,
+    day_start: DayStart = "noon_minus_12h",
+    previous: TripIndex | None = None,
 ) -> TripIndex | None:
-    """Build the index for the service days around `now`. None if the feed has no ready version."""
+    """Build the index for the service days around `now`. None if the feed has no ready version.
+
+    Only trips whose service runs on one of those days are loaded: no other trip can match. A version's trips, stop
+    links, routes and stop times never change, so when the versions and their services are those of `previous`, its
+    data is reused and only the service days and the stations (their stop groups can change) are read again.
+    """
     async with pool.connection() as conn:
         cur = await conn.execute(
             "SELECT timezone FROM core.feed_version WHERE feed_id = %s AND status = 'ready' ORDER BY version DESC LIMIT 1",
@@ -111,59 +151,56 @@ async def load_index(
             """,
             (feed_id, dates),
         )
-        for d, v, fv_id, services in await cur.fetchall():
-            index.days.append(ServiceDay(d, v, day_base(d, tz, day_start), frozenset(services)))
+        services: dict[int, set[str]] = defaultdict(set)
+        for d, v, fv_id, day_services in await cur.fetchall():
+            index.days.append(ServiceDay(d, v, day_base(d, tz, day_start), frozenset(day_services)))
             index.version_ids[v] = fv_id
+            services[v].update(day_services)
+        index.services = {v: frozenset(s) for v, s in services.items()}
         if not index.version_ids:
             return index
         number = {fv_id: v for v, fv_id in index.version_ids.items()}
         ids = sorted(number)
 
-        cur = await conn.execute(
-            """
-            SELECT t.feed_version_id, t.trip_id, t.service_id, t.route_id, t.direction_id, t.shape_id,
-                   t.trip_headsign, t.block_id,
-                   r.route_short_name, r.route_type,
-                   extract(epoch FROM min(coalesce(st.departure_time, st.arrival_time)))::int,
-                   extract(epoch FROM max(coalesce(st.arrival_time, st.departure_time)))::int
-            FROM gtfs.trips t
-            JOIN gtfs.routes r ON r.feed_version_id = t.feed_version_id AND r.route_id = t.route_id
-            JOIN gtfs.stop_times st ON st.feed_version_id = t.feed_version_id AND st.trip_id = t.trip_id
-            WHERE t.feed_version_id = ANY(%s)
-            GROUP BY t.feed_version_id, t.trip_id, r.route_short_name, r.route_type
-            """,
-            (ids,),
-        )
-        for row in await cur.fetchall():
-            if row[10] is not None:
-                index.add_trip(TripInfo(number[row[0]], *row[1:]))
+        if previous is not None and (previous.version_ids, previous.services) == (index.version_ids, index.services):
+            index.trips, index.by_trip_id, index.by_base_id = previous.trips, previous.by_trip_id, previous.by_base_id
+            index.stop_links, index.routes, index.stop_times = previous.stop_links, previous.routes, previous.stop_times
+        else:
+            await _load_version_data(conn, index, previous)
 
-        cur = await conn.execute(
-            "SELECT feed_version_id, stop_id, public_stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (ids,)
-        )
-        for fv_id, stop_id, pid in await cur.fetchall():
-            index.stop_links[(number[fv_id], stop_id)] = pid
-
-        # a station's stops can be split over groups: it is shown as the group most of them are in
-        cur = await conn.execute(
-            """
-            SELECT p.feed_version_id, p.stop_id, mode() WITHIN GROUP (ORDER BY s.stop_group_id),
-                   array_agg(DISTINCT l.public_stop_id ORDER BY l.public_stop_id)
-            FROM gtfs.stops p
-            JOIN gtfs.stops c ON c.feed_version_id = p.feed_version_id AND c.parent_station = p.stop_id
-            JOIN core.stop_link l ON l.feed_version_id = c.feed_version_id AND l.stop_id = c.stop_id
-            JOIN core.stop s ON s.id = l.public_stop_id
-            WHERE p.feed_version_id = ANY(%s) AND p.location_type = 1
-            GROUP BY p.feed_version_id, p.stop_id
-            """,
-            (ids,),
-        )
+        cur = await conn.execute(_STATIONS_SQL, (ids,))
         for fv_id, stop_id, group_id, pids in await cur.fetchall():
             index.stations[(number[fv_id], stop_id)] = (group_id, tuple(pids))
-
-        cur = await conn.execute("SELECT feed_version_id, route_id FROM gtfs.routes WHERE feed_version_id = ANY(%s)", (ids,))
-        index.routes = {(number[fv_id], route_id) for fv_id, route_id in await cur.fetchall()}
     return index
+
+
+async def _load_version_data(conn, index: TripIndex, previous: TripIndex | None) -> None:
+    """Trips (of the services on the index's days), stop links and routes of the index's versions; stop times
+    already loaded into `previous` are kept."""
+    number = {fv_id: v for v, fv_id in index.version_ids.items()}
+    ids = sorted(number)
+    for v, fv_id in sorted(index.version_ids.items()):
+        if not index.services.get(v):
+            continue
+        cur = await conn.execute(_TRIPS_SQL, {"v": fv_id, "services": sorted(index.services[v])})
+        for i, row in enumerate(await cur.fetchall()):
+            if row[9] is not None:
+                index.add_trip(TripInfo(v, *row))
+            if i % YIELD_EVERY_ROWS == YIELD_EVERY_ROWS - 1:
+                await asyncio.sleep(0)
+
+    cur = await conn.execute(
+        "SELECT feed_version_id, stop_id, public_stop_id FROM core.stop_link WHERE feed_version_id = ANY(%s)", (ids,)
+    )
+    for fv_id, stop_id, pid in await cur.fetchall():
+        index.stop_links[(number[fv_id], stop_id)] = pid
+
+    cur = await conn.execute("SELECT feed_version_id, route_id FROM gtfs.routes WHERE feed_version_id = ANY(%s)", (ids,))
+    index.routes = {(number[fv_id], route_id) for fv_id, route_id in await cur.fetchall()}
+
+    if previous is not None:
+        same = {v for v, fv_id in index.version_ids.items() if previous.version_ids.get(v) == fv_id}
+        index.stop_times = {k: st for k, st in previous.stop_times.items() if k[0] in same and k in index.trips}
 
 
 async def ensure_stop_times(pool: AsyncConnectionPool, index: TripIndex, keys: set[tuple[int, str]]) -> None:

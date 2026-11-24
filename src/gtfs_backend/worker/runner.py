@@ -102,6 +102,8 @@ class Worker:
         self.store = RealtimeStore(self.redis, [f.feed_id for f in self.enabled], ttls)
 
     async def _close(self) -> None:
+        for rt in self.runtimes.values():
+            await rt.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         await self.static_client.aclose()
         await self.rt_client.aclose()

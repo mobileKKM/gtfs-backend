@@ -13,7 +13,7 @@ the last departure's time. `feeds` and `routes` (route names) narrow the board, 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 from psycopg import AsyncConnection
 
@@ -23,6 +23,7 @@ from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Catalog, Day, RouteInfo
 from gtfs_backend.api.data.realtime import TripState, TripUpdate
 from gtfs_backend.api.data.sql import union_per_version
+from gtfs_backend.api.data.stopdata import Hourly
 from gtfs_backend.api.errors import InvalidInput
 from gtfs_backend.api.schemas import Departure, DepartureBoard, DepartureStatus, RouteRef
 from gtfs_backend.api.schemas.departures import VehicleState
@@ -30,9 +31,11 @@ from gtfs_backend.api.services import alerts, stops, vehicles
 
 LOOKBACK_S = 60 * 60  # delayed departures stay this long past their time
 GRACE_S = 30  # keep a departure this long after it leaves
-# widened until a page is full: a busy stop fills a page within half an hour, a quiet one reads on (each step reads
-# only the time it adds)
+# The first window is where the stop's hourly profile (today's timetables) expects PAGE_MARGIN pages; if that
+# isn't enough (filters, another day's timetable, realtime), it widens through these. Each step reads only the time
+# it adds.
 WINDOWS_S = (30 * 60, 2 * 3600, 6 * 3600, 24 * 3600)
+PAGE_MARGIN = 1.5
 # a page only counts as full if it ends this long before the window does: a trip just past the window's end,
 # running early, could still come before the page's last departure
 EARLY_S = 10 * 60
@@ -214,7 +217,8 @@ async def _page(
     fetched_to: int | None = None  # departures are read up to here (from lo - LOOKBACK_S)
     board_feeds = [f for f in ctx.feed_ids if not feeds or f in feeds]
     live_data = await realtime.BoardRealtime.read(ctx.redis, board_feeds, pids)
-    for span in WINDOWS_S:
+    first_span = expected_span(ctx.catalog.stops.hourly(pids), _second_of_day(ctx.catalog, start), limit)
+    for span in [first_span, *(w for w in WINDOWS_S if w > first_span)]:
         hi = start + span
         if fetched_to is None:
             first, lookback = lo, LOOKBACK_S
@@ -241,6 +245,28 @@ async def _page(
         if len(page) >= limit and page[-1].time <= hi - EARLY_S:
             break
     return page, refs
+
+
+def expected_span(hourly: Hourly, second_of_day: int, limit: int, margin: float = PAGE_MARGIN) -> int:
+    """Seconds from `second_of_day` until `hourly` expects margin * limit departures, plus EARLY_S (a page is only
+    full that long before its window ends); the widest window at most (a stop without departures reads it at once)."""
+    need = limit * margin
+    t, end = second_of_day, second_of_day + WINDOWS_S[-1]
+    while t < end:
+        rate = hourly[t // 3600 % 24]  # departures in this hour
+        hour_end = (t // 3600 + 1) * 3600
+        if rate and rate * (hour_end - t) / 3600 >= need:
+            return min(t - second_of_day + int(need / rate * 3600) + EARLY_S, WINDOWS_S[-1])
+        need -= rate * (hour_end - t) / 3600
+        t = hour_end
+    return WINDOWS_S[-1]
+
+
+def _second_of_day(catalog: Catalog, epoch: int) -> int:
+    """Local time of day at `epoch` (the feeds' timezone), what hourly profiles count in."""
+    tz = next((info.tz for info in catalog.feeds.values()), None)
+    t = datetime.fromtimestamp(epoch, tz)
+    return t.hour * 3600 + t.minute * 60 + t.second
 
 
 def _realtime_of(states: dict[str, TripState], s: Scheduled) -> bool:

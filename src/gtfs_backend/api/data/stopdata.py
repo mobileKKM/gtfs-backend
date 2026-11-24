@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date
 
 from psycopg import AsyncConnection
 
@@ -19,6 +20,11 @@ from gtfs_backend.ids import parse_url_key
 
 # (public_stop_id, next group id, its name, its key, feed_version_id, route_id, headsign, trips)
 DirectionRow = tuple[str, str, str, str, str, str, str, int]
+# departures per hour of the day (0-23, times past 24:00 folded onto the morning) in today's timetables
+Hourly = tuple[int, ...]
+# what an Hourly profile was counted for: today's (feed_version_id, date) per feed
+HourlyKey = tuple[tuple[str, date], ...]
+NO_DEPARTURES: Hourly = (0,) * 24
 
 
 @dataclass(frozen=True)
@@ -36,10 +42,19 @@ class _Group:
 
 
 class StopData:
-    def __init__(self, poles: dict[str, _Pole], groups: dict[str, _Group], directions: dict[str, list[DirectionRow]]):
+    def __init__(
+        self,
+        poles: dict[str, _Pole],
+        groups: dict[str, _Group],
+        directions: dict[str, list[DirectionRow]],
+        hourly: dict[str, Hourly] | None = None,
+        hourly_for: HourlyKey = (),
+    ):
         self._poles = poles
         self._groups = groups
         self._directions = directions
+        self._hourly = hourly or {}
+        self.hourly_for = hourly_for
         self._members: dict[str, list[str]] = defaultdict(list)  # group id -> all its stops (active or not)
         for pid, pole in poles.items():
             if pole.group_id is not None:
@@ -109,6 +124,11 @@ class StopData:
         """Where trips from these stops go next, in the timetable versions serving today."""
         return [row for pid in stops for row in self._directions.get(pid, [])]
 
+    def hourly(self, stops: list[str]) -> Hourly:
+        """Departures per hour of the day from these stops together, in today's timetables."""
+        profiles = [h for pid in stops if (h := self._hourly.get(pid)) is not None]
+        return tuple(map(sum, zip(*profiles, strict=True))) if profiles else NO_DEPARTURES
+
     # ------------------------------------------------------------------------------------------- map
 
     def in_bbox_json(self, bbox: Bbox, modes: set[str], kind: str, limit: int) -> list[bytes]:
@@ -124,7 +144,30 @@ class StopData:
         return out
 
 
-async def load_stop_data(conn: AsyncConnection, today_versions: list[str]) -> StopData:
+async def load_hourly(conn: AsyncConnection, today: HourlyKey) -> dict[str, Hourly]:
+    """Each stop's departures per hour in today's timetables (a few hundred ms: counted once a day, see load_stop_data)."""
+    if not today:
+        return {}
+    cur = await conn.execute(
+        """
+        SELECT d.public_stop_id, d.departure_s / 3600 %% 24, count(*)
+        FROM unnest(%s::text[], %s::date[]) AS t (fv, day)
+        JOIN core.service_date sd ON sd.feed_version_id = t.fv AND sd.date = t.day
+        JOIN core.stop_departure d ON d.feed_version_id = t.fv AND d.service_id = sd.service_id
+        GROUP BY 1, 2
+        """,
+        ([fv for fv, _ in today], [d for _, d in today]),
+    )
+    counts: dict[str, list[int]] = defaultdict(lambda: [0] * 24)
+    for pid, hour, n in await cur.fetchall():
+        counts[pid][hour] += n
+    return {pid: tuple(c) for pid, c in counts.items()}
+
+
+async def load_stop_data(conn: AsyncConnection, today: HourlyKey, previous: StopData | None = None) -> StopData:
+    """`today`: the (feed_version_id, date) serving today per feed. The hourly profiles of `previous` are kept while
+    they were counted for the same."""
+    today_versions = [fv for fv, _ in today]
     cur = await conn.execute("SELECT id, url_key, name, ST_Y(geom), ST_X(geom), active, code_namespace FROM core.stop_group")
     group_rows = await cur.fetchall()
     group_keys = {gid: key for gid, key, *_ in group_rows}
@@ -170,4 +213,8 @@ async def load_stop_data(conn: AsyncConnection, today_versions: list[str]) -> St
         )
         for row in await cur.fetchall():
             directions[row[0]].append(tuple(row))
-    return StopData(poles, groups, dict(directions))
+    if previous is not None and previous.hourly_for == today:
+        hourly = previous._hourly
+    else:
+        hourly = await load_hourly(conn, today)
+    return StopData(poles, groups, dict(directions), hourly, today)

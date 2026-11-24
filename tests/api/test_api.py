@@ -475,6 +475,7 @@ async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch):
 
     monkeypatch.setattr(departures, "scheduled", scheduled)
     monkeypatch.setattr(departures.realtime, "BoardRealtime", Realtime)
+    monkeypatch.setattr(departures, "expected_span", lambda *_: departures.WINDOWS_S[0])  # whatever the stop's profile
     # 13 regular departures come before the early one (at +26 min), the 14th after it (+27 min)
     board = (await api.get(f"/stops/{pid}/departures?limit=14")).json()
     trip_keys = [d["trip_key"] for d in board["departures"]]

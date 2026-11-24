@@ -199,9 +199,9 @@ before the first request and refreshed in the background on `static:updated`, a 
 `CATALOG_REFRESH_INTERVAL` while requests keep using the loaded one. `DB_POOL_MAX_SIZE` is the same for the
 worker and every API process: keep `(API_WORKERS + 1) × DB_POOL_MAX_SIZE` below Postgres' `max_connections` (100).
 
-**No response cache.** Every response is computed when asked for (a busy departure board took about 12 ms on a
-laptop with the full ZTP timetables; `Server-Timing` shows it in production), so live data is as fresh as Redis. The ETag is the body's hash: polling clients get a 304 while
-nothing changed. Public responses carry `Cache-Control: public, max-age=…` for clients and proxies:
+**No response cache.** Every response is computed when asked for (a departure board takes about 4 ms, p95 6 ms, on
+a laptop with the full ZTP timetables; `Server-Timing` shows it in production), so live data is as fresh as Redis.
+The ETag is the body's hash: polling clients get a 304 while nothing changed. Public responses carry `Cache-Control: public, max-age=…` for clients and proxies:
 `CACHE_TTL_STATIC` (300 s: stops, search, trips, shapes) and `CACHE_TTL_ALERTS` (15 s).
 
 **Privacy.** No accounts, cookies, identifiers or client addresses; requests aren't logged (uvicorn's access log is
@@ -222,9 +222,10 @@ Notes:
   departures; `on_demand` marks GTFS pickup type 2/3.
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
   show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
-  (tell them apart by `trip_key` + `stop_sequence`). The window widens (30 min, 2 h, 6 h, 24 h) until a page is
-  full and ends 10 min before the window does (an early trip from past it could come first); each step reads only
-  the time it adds.
+  (tell them apart by `trip_key` + `stop_sequence`). The first window is where the stop's hourly departures
+  (today's timetables, counted once a day) expect 1.5 pages, so a board needs one query; if that isn't enough
+  (filters, another day's timetable) it widens through 2 h, 6 h and 24 h, each step reading only the time it adds. A
+  page is full when it ends 10 min before its window does (an early trip from past it could come first).
 - **Filters**: `feeds` (feed ids) and `routes` (route names, `RouteRef.name`), comma separated or repeated; they
   narrow the board and its alerts, and an unknown feed is a 422. The board lists `routes`, every route departing from
   the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish

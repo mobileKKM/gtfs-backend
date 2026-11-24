@@ -5,9 +5,12 @@ from datetime import date
 from gtfs_backend import keys
 from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.services.departures import (
+    EARLY_S,
     GRACE_S,
+    WINDOWS_S,
     Row,
     Scheduled,
+    expected_span,
     overlay,
     select,
     vehicle_state,
@@ -167,3 +170,24 @@ def test_status_needs_the_stop_sequence():
     assert stop_state({"current_status": "STOPPED_AT"}) == (None, None)
     assert stop_state({"current_stop_sequence": 5}) == (5, None)
     assert stop_state({}) == (None, None)
+
+
+# ------------------------------------------------------------------------------------------------- first window
+
+
+def test_expected_span_busy_stop():
+    """60 an hour: 1.5 pages of 20 within 30 min, then EARLY_S so the page counts as full."""
+    assert expected_span((60,) * 24, 8 * 3600, 20) == 30 * 60 + EARLY_S
+
+
+def test_expected_span_reads_across_hours_and_midnight():
+    hourly = [0] * 24
+    hourly[23], hourly[5] = 10, 30  # 10 at 23:00, nothing at night, 30 from 05:00
+    # from 23:30: 5 left before midnight, the other 25 of 30 by 05:50
+    assert expected_span(tuple(hourly), 23 * 3600 + 1800, 20) == (6 * 3600 + 1200) + EARLY_S
+
+
+def test_expected_span_without_departures_reads_a_day():
+    assert expected_span((0,) * 24, 12 * 3600, 20) == WINDOWS_S[-1]
+    few = (1,) * 24
+    assert expected_span(few, 0, 20) == WINDOWS_S[-1]  # 24 a day: 30 aren't expected within it

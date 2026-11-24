@@ -196,8 +196,11 @@ class Catalog:
                     info = feeds[feed_id]
                     if d in wanted[feed_id]:
                         info.days.append(Day(feed_id, d, fv_id, v, day_base(d, info.tz, info.day_start)))
-            today = [d.feed_version_id for info in feeds.values() for d in info.days if d.date == local_date(now, info.tz)]
-            stops = await load_stop_data(conn, today)
+            dates = {f: local_date(now, info.tz) for f, info in feeds.items()}
+            # today's (version, date) per feed: what the stops' hourly profiles count
+            today_days = [d for info in feeds.values() for d in info.days if d.date == dates[d.feed_id]]
+            today = tuple(sorted((d.feed_version_id, d.date) for d in today_days))
+            stops = await load_stop_data(conn, today, self.stops)
         for feed_id, info in feeds.items():
             info.covered = frozenset(wanted[feed_id])
         self.feeds = feeds

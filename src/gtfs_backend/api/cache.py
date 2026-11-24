@@ -59,6 +59,13 @@ def json_response(request: Request, model: BaseModel, cache_control: str, status
     return _respond(request, body, etag, cache_control, status_code)
 
 
+def json_bytes_response(request: Request, body: bytes, cache_control: str) -> Response:
+    """An already serialized body; answer 304 if the client already has it."""
+    with timing.serializing():
+        etag = _etag(body)
+    return _respond(request, body, etag, cache_control)
+
+
 def _query_aliases(dependant) -> set[str]:
     """Query parameters of a route, including those of its dependencies (BboxQuery etc.)."""
     return {p.alias for p in dependant.query_params} | {a for d in dependant.dependencies for a in _query_aliases(d)}

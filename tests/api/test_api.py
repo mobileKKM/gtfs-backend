@@ -246,27 +246,29 @@ async def test_stop_search(api, sql):
     assert (await api.get("/stops/search?q=%_%")).json()["results"] == []  # LIKE wildcards are literal
 
 
-async def test_stops_without_trips_are_never_returned(api, sql, loaded):
+async def test_stops_without_trips_are_never_returned(api_ctx, sql, loaded):
     """A stop with no trips in the current feeds (empty modes) is hidden, and so is a group made only of them."""
+    api, ctx = api_ctx
     gid = group_id(sql, "802")
     pid = stop_by_code(sql, "802-01")
     saved = sql("SELECT id, modes FROM core.stop")
 
-    def clear_modes(where: str, param: str):
+    async def clear_modes(where: str, param: str):
         with psycopg.connect(loaded) as conn:
             conn.execute(f"UPDATE core.stop SET modes = '{{}}' WHERE {where} = %s", (param,))
+        await ctx.catalog.reload()  # stops change with imports, which publish `static:updated`
 
     async def map_ids():
         return {ident(s) for s in (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]}
 
     try:
         # one stop without trips: gone from the map and from its group, which is still found
-        clear_modes("id", pid)
+        await clear_modes("id", pid)
         assert pid not in await map_ids()
         found = (await api.get("/stops/search?q=rondo mog")).json()["results"][0]
         assert ident(found) == gid and found["stops"] and pid not in {ident(p) for p in found["stops"]}
         # all of its stops without trips: the group disappears from search too
-        clear_modes("stop_group_id", gid)
+        await clear_modes("stop_group_id", gid)
         assert gid not in {ident(r) for r in (await api.get("/stops/search?q=rondo mog")).json()["results"]}
         on_map = (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]
         assert not {ident(s) for s in on_map if ident(s, "group_key") == gid}
@@ -741,6 +743,15 @@ async def test_openapi_lists_every_endpoint(api):
     } == set(paths)
 
 
+async def test_map_stops_are_serialized_like_the_model(api):
+    """/stops joins precomputed JSON pieces: byte for byte what the model serializes to (so ETags stay the same)."""
+    from gtfs_backend.api.schemas import StopList
+
+    for query in (f"bbox={CITY_BBOX}", f"bbox={CITY_BBOX}&kind=group", f"bbox={RONDO_BBOX}&modes=tram", "bbox=0,0,1,1"):
+        body = (await api.get(f"/stops?{query}")).content
+        assert body == StopList.model_validate_json(body).model_dump_json().encode(), query
+
+
 # ------------------------------------------------------------------------------------------------- response cache
 
 
@@ -945,3 +956,75 @@ async def test_server_timing_off(loaded):
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         assert "server-timing" not in (await c.get(f"/vehicles?bbox={CITY_BBOX}")).headers
+
+
+async def test_catalog_refreshes_in_the_background(api_ctx, sql, monkeypatch):
+    api, ctx = api_ctx
+    catalog = ctx.catalog
+    url = f"/stops/{group_id(sql, '802')}/departures"
+    await api.get(url)  # loads the routes it shows
+    feeds, routes = catalog.feeds, dict(catalog._routes)
+    assert routes
+
+    # the refresh waits for its connection until released; requests don't wait for the refresh
+    release = asyncio.Event()
+    real_getconn = catalog.pool.getconn
+
+    async def getconn(timeout=None):
+        if asyncio.current_task() is catalog._refresh:
+            await release.wait()
+        return await real_getconn(timeout)
+
+    monkeypatch.setattr(catalog.pool, "getconn", getconn)
+    catalog.invalidate()  # as on `static:updated`
+    assert (await api.get(url)).status_code == 200
+    assert catalog.feeds is feeds and not catalog._refresh.done()
+    catalog.invalidate()  # another import while the refresh runs
+    release.set()
+    await catalog._refresh
+    assert catalog.feeds is not feeds  # reloaded
+    assert all(catalog._routes[v] is r for v, r in routes.items())  # the versions are still ready: routes kept
+    assert catalog._stale(catalog.clock())  # the second invalidation isn't lost: the next request refreshes again
+    assert (await api.get(url)).status_code == 200
+    await catalog._refresh
+    assert not catalog._stale(catalog.clock())
+
+
+async def test_catalog_refresh_failure_keeps_serving(api_ctx, sql, monkeypatch):
+    api, ctx = api_ctx
+    catalog = ctx.catalog
+    feeds = catalog.feeds
+
+    async def broken(now):
+        raise psycopg.OperationalError("down")
+
+    monkeypatch.setattr(catalog, "_load", broken)
+    catalog.invalidate()
+    url = f"/stops/{group_id(sql, '802')}/departures"
+    assert (await api.get(url)).status_code == 200
+    await catalog._refresh
+    assert catalog.feeds is feeds
+    failed = catalog._refresh
+    assert (await api.get(url)).status_code == 200
+    assert catalog._refresh is failed  # not retried at once (RETRY_S)
+
+
+async def test_catalog_days_need_no_query(api_ctx, monkeypatch):
+    from gtfs_backend.api.data.catalog import PRELOAD_DAYS
+
+    _, ctx = api_ctx
+    catalog = ctx.catalog
+    queries = []
+    real_getconn = catalog.pool.getconn
+
+    async def getconn(timeout=None):
+        queries.append(1)
+        return await real_getconn(timeout)
+
+    monkeypatch.setattr(catalog.pool, "getconn", getconn)
+    today = catalog.today("kmk_t")
+    days = [await catalog.day("kmk_t", today + timedelta(days=i)) for i in range(-1, PRELOAD_DAYS + 1)]
+    assert queries == [] and days[1] is not None and days[1].date == today
+    far = today + timedelta(days=60)
+    assert await catalog.day("kmk_t", far) is not None
+    assert len(queries) == 1  # outside the preloaded days: one indexed lookup

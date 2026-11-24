@@ -90,6 +90,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             listener.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await listener
+            await catalog.close()
             await redis.aclose()
             await pool.close()
 

@@ -56,7 +56,7 @@ src/gtfs_backend/
     realtime/ poller (one task per file) -> normalize -> store (Redis)
              runtime.py: per feed, the trip index (trip_index.py) and recent delays/fixes;
              normalize: resolve.py (trip_id -> timetable trip), trip_updates.py, vehicles.py, alerts.py
-  api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog cache, Redis, SQL/geo)
+  api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog + stops in memory, Redis, SQL/geo)
 ```
 
 Shared modules import neither `worker` nor `api`, and those don't import each other; `tests/test_boundaries.py`
@@ -194,7 +194,10 @@ unknown things, 422 malformed keys/dates/boxes/times, unknown feeds, 503 `unavai
 busy or a store is down, 500 `internal` without details.
 
 **Several processes.** `API_WORKERS` processes share one port, each with bounded pools (`DB_POOL_MAX_SIZE`,
-`REDIS_POOL_MAX_SIZE`) and its own catalog copy, reloaded on `static:updated`. `DB_POOL_MAX_SIZE` is the same for the
+`REDIS_POOL_MAX_SIZE`) and its own catalog copy (feed versions of yesterday to a week ahead, routes, and all stops,
+stop groups and today's directions, so boards, the map, search and alerts look up stops without Postgres), loaded
+before the first request and refreshed in the background on `static:updated`, a new day and every
+`CATALOG_REFRESH_INTERVAL` while requests keep using the loaded one. `DB_POOL_MAX_SIZE` is the same for the
 worker and every API process: keep `(API_WORKERS + 1) × DB_POOL_MAX_SIZE` below Postgres' `max_connections` (100).
 
 **Response cache.** Boards and live trips (`CACHE_TTL_LIVE`, 3 s), search, trips and shapes (`CACHE_TTL_STATIC`, 300 s) and

@@ -4,7 +4,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
 
-from gtfs_backend.api.cache import LIVE, cached, json_response, public
+from gtfs_backend.api import timing
+from gtfs_backend.api.cache import LIVE, cached, json_bytes_response, public
 from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, RoutesQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import DepartureBoard, SearchResult, StopList
@@ -19,7 +20,9 @@ async def stops_in_bbox(request: Request, ctx: Ctx, bbox: BboxQuery, modes: Mode
     (`kind=group`, one marker per logical stop at its stops' centroid) for far zoom levels.
 
     `modes` keeps stops served by any of them, e.g. `kind=group&modes=rail` for train stations."""
-    return json_response(request, await stops.in_bbox(ctx, bbox, modes, kind), public(ctx.settings.cache_ttl_static))
+    with timing.serializing():
+        body = stops.in_bbox_json(ctx, bbox, modes, kind)
+    return json_bytes_response(request, body, public(ctx.settings.cache_ttl_static))
 
 
 @router.get("/stops/search", response_model=SearchResult)

@@ -260,9 +260,9 @@ def _departure(row: Row, route: RouteRef | None, stop, state: VehicleState | Non
     )
 
 
-async def _served(conn: AsyncConnection, catalog: Catalog, pids: list[str]) -> list[RouteInfo]:
+async def _served(catalog: Catalog, pids: list[str]) -> list[RouteInfo]:
     """The routes departing from these stops in today's timetables (on any day), by feed and name."""
-    served = await stops.served_routes(conn, catalog, pids)
+    served = stops.served_routes(catalog, pids)
     infos = await catalog.routes({fv for fv, _ in served})
     return sorted((infos[k] for k in served if k in infos), key=lambda i: (i.feed_id, i.ref().name, i.route_id))
 
@@ -291,17 +291,16 @@ async def board(ctx: Context, key: str, time: int | None, feeds: set[str], route
     if unknown := feeds - set(ctx.feed_ids):
         raise InvalidInput(f"unknown feed: {', '.join(sorted(unknown))}")
     now = ctx.now()
+    stop = stops.get(ctx.catalog, key)
+    pids = ctx.catalog.stops.public_stop_ids(stop)
     async with ctx.pool.connection() as conn:
-        stop = await stops.get(conn, key)
-        pids = await stops.public_stop_ids(conn, stop)
         page, refs = await _page(ctx, conn, pids, now if time is None else time, time is None, feeds, route_names, now, limit)
-
-        by_id = await stops.stops_by_id(conn, {r.s.public_stop_id for r in page})
-        out = [
-            _departure(r, refs.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.public_stop_id], vehicle_state(r, r.vehicle))
-            for r in page
-        ]
-        served = await _served(conn, ctx.catalog, pids)
+    by_id = ctx.catalog.stops.stops_by_id({r.s.public_stop_id for r in page})
+    out = [
+        _departure(r, refs.get((r.s.feed_version_id, r.s.route_id)), by_id[r.s.public_stop_id], vehicle_state(r, r.vehicle))
+        for r in page
+    ]
+    served = await _served(ctx.catalog, pids)
     board_alerts = await _alerts(ctx, pids, page, served, feeds, route_names)
 
     timestamp = realtime.newest(r.live.timestamp for r in page)

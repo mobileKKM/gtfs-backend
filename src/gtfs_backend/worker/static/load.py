@@ -116,9 +116,7 @@ def import_zip(
     feed_id: str,
     zip_path: Path,
     meta: SourceMeta,
-    namespace: str | None = None,
-    share_with: list[str] | None = None,
-    stop_code_pattern: str | None = None,
+    rules: stops.StopRules | None = None,
 ) -> ImportResult:
     started = time.monotonic()
     zip_path = Path(zip_path)
@@ -176,7 +174,7 @@ def import_zip(
 
             services, first, last = derive.build_service_dates(conn, v)
             shapes = derive.build_shape_lines(conn, v)
-            stop_stats = stops.apply_matches(conn, feed_id, v, namespace or feed_id, share_with, stop_code_pattern)
+            stop_stats = stops.apply_matches(conn, feed_id, v, rules or stops.StopRules())
             for msg in stop_stats["errors"]:
                 warnings.append(f"stop matching: {msg}")
             directions = derive.build_stop_directions(conn, v)

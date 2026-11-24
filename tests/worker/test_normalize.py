@@ -6,17 +6,11 @@ from zoneinfo import ZoneInfo
 from google.transit import gtfs_realtime_pb2 as pb
 
 from gtfs_backend.servicetime import service_day_base
-from gtfs_backend.worker.realtime.normalize import (
-    FeedRealtimeState,
-    Result,
-    build_alert,
-    match_updates,
-    merge_stops,
-    process_message,
-    resolve,
-    resolve_instance,
-)
+from gtfs_backend.worker.realtime.alerts import build_alert
+from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, process_message
+from gtfs_backend.worker.realtime.resolve import resolve, resolve_instance
 from gtfs_backend.worker.realtime.trip_index import ServiceDay, StopTime, TripIndex, TripInfo
+from gtfs_backend.worker.realtime.trip_updates import match_updates, merge_stops
 
 WAW = ZoneInfo("Europe/Warsaw")
 D22, D23 = date(2026, 10, 22), date(2026, 10, 23)
@@ -305,8 +299,7 @@ def test_alert_entities_are_resolved_to_ours_and_unknown_ones_dropped():
     a.informed_entity.add().trip.trip_id = "block_1_trip_9_service_4"
     a.informed_entity.add(route_id="R9")
     a.informed_entity.add(route_id="R1", stop_id="Z")  # AND: one unknown field and the entity means nothing
-    res = Result()
-    out = build_alert("kmk_t", "a1", a, alert_index(), FeedRealtimeState(), epoch(D23, 5), res)
+    out, unmatched = build_alert("kmk_t", "a1", a, alert_index(), epoch(D23, 5))
     assert (out["cause"], out["effect"], out["severity"]) == (None, "detour", "warning")
     assert out["description"] == "Linia 1\nobjazd"
     pick = lambda e: {k: v for k, v in e.items() if v not in (None, [])}  # noqa: E731
@@ -316,14 +309,14 @@ def test_alert_entities_are_resolved_to_ours_and_unknown_ones_dropped():
         {"route_id": "R1", "direction_id": 1},
         {"trip_key": "kmk_t:20261023:block_1_trip_9_service_4"},
     ]
-    assert res.unmatched_alert_entities == ["a1: route R9", "a1: stop Z"]
+    assert unmatched == ["a1: route R9", "a1: stop Z"]
 
 
 def test_alert_without_entities_is_feed_wide():
     a = pb.Alert()
     a.header_text.translation.add(text="Komunikat")
-    out = build_alert("kmk_t", "a2", a, alert_index(), FeedRealtimeState(), epoch(D23, 5), Result())
-    assert len(out["entities"]) == 1 and not any(out["entities"][0].values())
+    out, unmatched = build_alert("kmk_t", "a2", a, alert_index(), epoch(D23, 5))
+    assert len(out["entities"]) == 1 and not any(out["entities"][0].values()) and unmatched == []
     assert out["header"] == "Komunikat" and out["severity"] is None
 
 

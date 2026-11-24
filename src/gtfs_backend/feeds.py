@@ -18,6 +18,10 @@ class RealtimeKind(StrEnum):
     SERVICE_ALERTS = "service_alerts"
     COMBINED = "combined"  # one file with any mix of vehicles, trip updates and alerts (Koleje Małopolskie)
 
+    def carries(self, part: RealtimeKind) -> bool:
+        """Whether a file of this kind holds `part` (vehicles, trip updates or alerts): its own, or all if combined."""
+        return self is RealtimeKind.COMBINED or self is part
+
 
 class RealtimeUrls(BaseModel):
     model_config = ConfigDict(extra="forbid")

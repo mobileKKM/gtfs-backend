@@ -115,3 +115,13 @@ async def test_static_download_retries_a_missing_file(tmp_path):
 
 def test_user_agent_is_sent():
     assert http_mod.make_client(30, 10).headers["User-Agent"] == http_mod.USER_AGENT
+
+
+async def test_each_attempt_has_its_own_timeout():
+    client, calls = client_serving(good)
+    async with client:
+        await fetch_bytes(client, "https://x.test/vp.pb", parse_feed, timeout=4, **RETRY)
+        await fetch_bytes(client, "https://x.test/vp.pb", parse_feed, **RETRY)
+    assert calls[0].extensions["timeout"]["read"] == 4
+    assert calls[0].extensions["timeout"]["connect"] == client.timeout.connect  # connecting keeps its own
+    assert calls[1].extensions["timeout"]["read"] == client.timeout.read

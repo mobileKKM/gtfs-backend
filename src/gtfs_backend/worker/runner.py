@@ -20,8 +20,8 @@ from gtfs_backend.feeds import FeedConfig, load_feeds
 from gtfs_backend.logs import log
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.http import make_client
-from gtfs_backend.worker.realtime.normalize import FeedRealtimeState
-from gtfs_backend.worker.realtime.poller import FeedRuntime, RealtimeTask
+from gtfs_backend.worker.realtime.poller import RealtimeTask
+from gtfs_backend.worker.realtime.runtime import FeedRuntime
 from gtfs_backend.worker.realtime.store import RealtimeStore, TTLs
 from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static.fetch import PREVIOUSLY_FAILED, check_static, import_order
@@ -37,6 +37,7 @@ MAINTENANCE_CHECK_INTERVAL_S = 60
 OSM_CHECK_INTERVAL_S = 3600  # how often the OSM file's age is looked at
 OSM_FIRST_ATTEMPTS = 3  # the first fetch is tried this often before feeds that need the file start without it
 OSM_RETRY_DELAY_S = 30
+MIN_FETCH_ATTEMPT_S = 5  # a realtime download attempt may take its poll interval, but at least this long
 
 
 def _import_executor() -> ProcessPoolExecutor:
@@ -97,14 +98,13 @@ class Worker:
         self.static_client = make_client(s.static_download_timeout, s.http_connect_timeout)
         self.rt_client = make_client(s.realtime_fetch_timeout, s.http_connect_timeout)
         self.executor = _import_executor()
-        self.runtimes = {
-            f.feed_id: FeedRuntime(f, self.pool, FeedRealtimeState(ignore_service_suffix=f.ignore_service_suffix))
-            for f in self.enabled
-        }
+        self.runtimes = {f.feed_id: FeedRuntime(f, self.pool) for f in self.enabled}
         ttls = TTLs(vehicle=s.vehicle_ttl, trip=s.trip_ttl, alert=s.alert_ttl, unmatched=s.unmatched_ttl)
         self.store = RealtimeStore(self.redis, [f.feed_id for f in self.enabled], ttls)
 
     async def _close(self) -> None:
+        for rt in self.runtimes.values():
+            await rt.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         await self.static_client.aclose()
         await self.rt_client.aclose()
@@ -116,16 +116,18 @@ class Worker:
         tasks = [asyncio.create_task(self._static_loop(f), name=f"static:{f.feed_id}") for f in import_order(self.feeds)]
         for feed in self.enabled:
             for kind, url in feed.realtime.items():
+                interval = feed.realtime_poll_interval or s.realtime_poll_interval
                 task = RealtimeTask(
                     self.runtimes[feed.feed_id],
                     kind,
                     url,
                     self.store,
                     self.rt_client,
-                    interval=feed.realtime_poll_interval or s.realtime_poll_interval,
+                    interval=interval,
                     max_age=feed.realtime_max_age or s.realtime_max_age,
                     retries=s.http_retries,
                     retry_delay=s.http_retry_delay,
+                    attempt_timeout=min(s.realtime_fetch_timeout, max(interval, MIN_FETCH_ATTEMPT_S)),
                 )
                 self.realtime_tasks.append(task)
                 tasks.append(asyncio.create_task(task.run(), name=f"realtime:{task.name}"))

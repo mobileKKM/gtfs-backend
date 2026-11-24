@@ -9,8 +9,7 @@ import psycopg
 from gtfs_backend.ids import new_public_id, slugify, stop_slug
 from gtfs_backend.logs import log
 from gtfs_backend.modes import MODE_SQL
-from gtfs_backend.worker.settings import get_worker_settings
-from gtfs_backend.worker.static.stops.model import Group, NewStop, PublicStop, normalize_stop
+from gtfs_backend.worker.static.stops.model import Group, NewStop, PublicStop, StopRules, normalize_stop
 from gtfs_backend.worker.static.stops.osm import load_osm_poles
 from gtfs_backend.worker.static.stops.plan import plan_matches
 from gtfs_backend.worker.static.stops.queries import (
@@ -35,21 +34,16 @@ def _allocate_id(cur: psycopg.Cursor, kind: str, taken: set[str]) -> str:
             return pid
 
 
-def apply_matches(
-    conn: psycopg.Connection,
-    feed_id: str,
-    feed_version_id: str,
-    namespace: str | None = None,
-    share_with: list[str] | None = None,
-    stop_code_pattern: str | None = None,
-) -> dict:
+def apply_matches(conn: psycopg.Connection, feed_id: str, feed_version_id: str, rules: StopRules) -> dict:
     """Match the stops of `feed_version_id`, write stop_link and refresh stops/groups. Returns stats.
 
     Stops are first put into GTFS shape (normalize_stop, with the feed's `stop_code_pattern`). They then try to
     attach to stops of the `share_with` namespaces (never modified by this feed); the rest are matched within the
     feed's own stop-code namespace.
     """
-    namespace = namespace or feed_id
+    namespace = rules.namespace or feed_id
+    share_with = list(rules.share_with)
+    stop_code_pattern = rules.stop_code_pattern
     cur = conn.cursor()
     cur.execute(
         """
@@ -99,7 +93,7 @@ def apply_matches(
             feed_modes,
             stop_next_stops(cur, feed_version_id),
             public_stop_next_groups(cur, shared_versions),
-            load_osm_poles(get_worker_settings().osm_stops_file),
+            load_osm_poles(rules.osm_stops_file) if rules.osm_stops_file else [],
         )
         for w in shared_plan.warnings:
             log.info("stop_share", feed=feed_id, msg=w)

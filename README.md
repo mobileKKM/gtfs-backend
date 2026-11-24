@@ -53,7 +53,9 @@ src/gtfs_backend/
   worker/    cli.py, runner.py (task loop), http.py (downloads)
     static/  fetch -> archive -> read -> validate -> load (+ derive, integrity, partitions, versions)
       stops/ stop matching: plan.py and shared.py decide (no DB), apply.py writes, osm.py reads OSM poles
-    realtime/ poller -> normalize (match to timetables) -> store (Redis)
+    realtime/ poller (one task per file) -> normalize -> store (Redis)
+             runtime.py: per feed, the trip index (trip_index.py) and recent delays/fixes;
+             normalize: resolve.py (trip_id -> timetable trip), trip_updates.py, vehicles.py, alerts.py
   api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog cache, Redis, SQL/geo)
 ```
 
@@ -105,7 +107,7 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | key | content |
 |---|---|
 | `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
-| `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
+| `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop; removed when the vehicle leaves the feed (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times; removed when the trip leaves the feed |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
@@ -129,8 +131,14 @@ Rules:
 - **Service suffix**: after midnight ZTP's trams name a still-running trip of yesterday's timetable with today's
   `_service_N` (seen 2026-10-31, when a new timetable started), an id that exists in no version. `kmk_t` has
   `ignore_service_suffix: true`: an id not found as is is retried without the suffix and the time window picks the trip.
+- **Timetables in memory**: per feed, the trips running yesterday/today/tomorrow (`trip_index.py`). It is reloaded
+  after an import and on a new day **in the background**, while the previous index keeps serving: a slow or
+  unreachable Postgres never stops the live data (a failed reload is retried after 10 s). Unchanged versions are
+  reused, so only an import of the feed itself reads its trips again. Stop times are loaded per trip when it first
+  appears; if that fails, its update goes out without per-stop times and the load is retried after 30 s.
 - Downloads are checked against `Content-Length` and parsed before use. ZTP briefly serves empty or partial files
-  while replacing them; those, 5xx and 429 are retried and never overwrite good data. Requests send `USER_AGENT`
+  while replacing them; those, 5xx and 429 are retried and never overwrite good data. Each attempt gives up after
+  the feed's poll interval (at least 5 s, at most `REALTIME_FETCH_TIMEOUT`). Requests send `USER_AGENT`
   (`worker/http.py`); put a contact for the feed operators in it.
 - **Liveness**: the worker touches `/tmp/gtfs-worker.alive` every 30 s while all realtime tasks keep polling (the
   compose healthcheck reads it). A task without a finished poll for `WATCHDOG_TIMEOUT` (10 min) stops the worker

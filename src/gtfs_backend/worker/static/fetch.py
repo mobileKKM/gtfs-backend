@@ -19,6 +19,7 @@ from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static import archive
 from gtfs_backend.worker.static.archive import sha256_file, validate_zip
 from gtfs_backend.worker.static.load import ImportResult, SourceMeta
+from gtfs_backend.worker.static.stops import StopRules
 
 PREVIOUSLY_FAILED = "previously_failed"  # ImportResult.status of a zip that is known to fail
 
@@ -29,16 +30,7 @@ def import_order(feeds: FeedsFile) -> list[FeedConfig]:
     return sorted(feeds.enabled, key=lambda f: (f.namespace not in shared, bool(f.share_stops_with), f.feed_id))
 
 
-def run_import_job(
-    feed_id: str,
-    namespace: str,
-    share_with: list[str],
-    stop_code_pattern: str | None,
-    zip_path: str,
-    meta: dict,
-    database_url: str,
-    log_level: str = "INFO",
-) -> dict:
+def run_import_job(feed_id: str, rules: StopRules, zip_path: str, meta: dict, database_url: str, log_level: str = "INFO") -> dict:
     """Entry point for the import process (must be top-level for ProcessPoolExecutor)."""
     from gtfs_backend.db import connect
     from gtfs_backend.logs import setup_logging
@@ -46,7 +38,7 @@ def run_import_job(
 
     setup_logging(log_level)
     with connect(database_url) as conn:
-        result = import_zip(conn, feed_id, Path(zip_path), SourceMeta(**meta), namespace, share_with, stop_code_pattern)
+        result = import_zip(conn, feed_id, Path(zip_path), SourceMeta(**meta), rules)
     return asdict(result)
 
 
@@ -130,9 +122,7 @@ async def check_static(
             executor,
             run_import_job,
             feed.feed_id,
-            feed.namespace,
-            feed.share_stops_with,
-            feed.stop_code_pattern,
+            StopRules.of(feed, settings.osm_stops_file),
             str(stored),
             asdict(meta),
             settings.database_url,

@@ -5,7 +5,8 @@ from datetime import date
 from google.transit import gtfs_realtime_pb2 as pb
 from test_normalize import D22, D23, day, epoch, feed, hms, make_index, noop, trip
 
-from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, process_message, resolve
+from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, process_message
+from gtfs_backend.worker.realtime.resolve import resolve
 from gtfs_backend.worker.realtime.trip_index import TripIndex
 
 TRIP = "block_1_trip_9_service_4"  # v1 on the 22nd: A 23:50, B 24:30, A 25:00, C 25:20

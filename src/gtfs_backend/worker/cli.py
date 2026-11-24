@@ -36,6 +36,7 @@ def _report(feed_id: str, result) -> int:
 def _import_file(settings: WorkerSettings, feed: FeedConfig, path: Path) -> int:
     from gtfs_backend.worker.static import archive
     from gtfs_backend.worker.static.load import SourceMeta, import_zip
+    from gtfs_backend.worker.static.stops import StopRules
 
     archive.validate_zip(path)
     sha = archive.sha256_file(path)
@@ -52,15 +53,8 @@ def _import_file(settings: WorkerSettings, feed: FeedConfig, path: Path) -> int:
                 (feed.feed_id, known[0]),
             )
             conn.commit()
-        result = import_zip(
-            conn,
-            feed.feed_id,
-            stored,
-            SourceMeta(sha, archive_path=str(stored)),
-            feed.namespace,
-            feed.share_stops_with,
-            feed.stop_code_pattern,
-        )
+        meta = SourceMeta(sha, archive_path=str(stored))
+        result = import_zip(conn, feed.feed_id, stored, meta, StopRules.of(feed, settings.osm_stops_file))
     return _report(feed.feed_id, result)
 
 

@@ -6,7 +6,8 @@ from gtfs_backend.feeds import FeedConfig, RealtimeKind
 from gtfs_backend.worker.http import Fetched
 from gtfs_backend.worker.realtime import poller
 from gtfs_backend.worker.realtime.normalize import Result
-from gtfs_backend.worker.realtime.poller import FeedRuntime, RealtimeTask, parse_feed
+from gtfs_backend.worker.realtime.poller import RealtimeTask, parse_feed
+from gtfs_backend.worker.realtime.runtime import FeedRuntime
 
 MSG = parse_feed((FIXTURES / "dst_2026-10-25" / "TripUpdates_T.pb").read_bytes())
 
@@ -134,3 +135,15 @@ async def test_unchanged_polls_keep_the_data_alive_until_max_age(monkeypatch):
     task.last_change -= 601
     await task.cycle()
     assert store.touched == 2
+
+
+async def test_a_new_etag_for_data_already_stored_is_remembered(monkeypatch):
+    task, store = make_task(
+        monkeypatch,
+        Fetched(False, MSG, etag='"v1"'),
+        Fetched(False, MSG, etag='"v2"'),  # the same feed timestamp, rewritten under a new ETag
+    )
+    await task.cycle()
+    await task.cycle()
+    assert task.etag == '"v2"'  # the next poll asks with it and gets a 304
+    assert store.published == 1  # the rewrite isn't an update

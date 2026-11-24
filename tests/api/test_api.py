@@ -904,3 +904,44 @@ async def test_unexpected_errors_keep_the_error_body(api_no_raise, monkeypatch):
     r = await api_no_raise.get("/trips/kmk_t:20261025:x")
     assert r.status_code == 503 and r.headers["retry-after"] == "1"
     assert r.json()["error"]["code"] == "unavailable" and "10.0.0.5" not in r.text
+
+
+# ------------------------------------------------------------------------------------------------- catalog, timing
+
+
+@pytest.fixture
+async def api_ctx(loaded):
+    """Like `api`, with the app's context."""
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        yield c, app.state.ctx
+
+
+def server_timing(response) -> dict[str, dict[str, str]]:
+    """`db;dur=1.2;desc="3 queries", total;dur=4.0` -> {"db": {"dur": "1.2", "desc": "3 queries"}, "total": {...}}"""
+    out = {}
+    for metric in response.headers["server-timing"].split(", "):
+        name, *params = metric.split(";")
+        out[name] = {k: v.strip('"') for k, v in (p.split("=", 1) for p in params)}
+    return out
+
+
+async def test_server_timing(api_ctx, sql):
+    api, _ = api_ctx
+    r = await api.get(f"/stops/{group_id(sql, '802')}/departures")
+    timing = server_timing(r)
+    assert set(timing) == {"db", "db-wait", "redis", "serialize", "total"}
+    assert int(timing["db"]["desc"].split()[0]) > 0 and int(timing["redis"]["desc"].split()[0]) > 0
+    assert all(float(m["dur"]) >= 0 for m in timing.values())
+    assert float(timing["total"]["dur"]) >= float(timing["serialize"]["dur"])
+    # an answer without the database: none counted, and nothing left over from the request before
+    timing = server_timing(await api.get(f"/vehicles?bbox={CITY_BBOX}"))
+    assert timing["db"]["desc"] == "0 queries" and timing["redis"]["desc"] != "0 calls"
+
+
+async def test_server_timing_off(loaded):
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, server_timing=False)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        assert "server-timing" not in (await c.get(f"/vehicles?bbox={CITY_BBOX}")).headers

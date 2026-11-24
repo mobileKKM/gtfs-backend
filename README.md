@@ -241,6 +241,9 @@ Notes:
   (5 polls) or older than `HEALTH_REALTIME_MAX_AGE` (5 min; a larger `realtime_max_age` wins). Alerts files are
   exempt from the age check.
 - Responses carry `ETag` and `Cache-Control` (static data 5 min, alerts 15 s); bodies over 1 kB are gzipped.
+- **`Server-Timing`** on every response (`SERVER_TIMING`, on by default) says where the time went: `db` (queries),
+  `db-wait` (waiting for a pooled connection), `redis` (commands; a pipeline is one), `serialize` and `total`;
+  browser dev tools show it. Concurrent work adds up, so the parts can exceed `total`.
 - Queries name one feed version per block: joining `feed_version_id` across tables defeats partition pruning
   (a 20 ms board became 1.5 s).
 

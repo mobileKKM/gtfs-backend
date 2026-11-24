@@ -21,6 +21,9 @@ class ApiSettings(Settings):
     catalog_refresh_interval: float = Field(default=300, gt=0)  # also reloaded on `static:updated` and day change
     static_listener_retry_delay: float = Field(default=5, gt=0)
 
+    # `Server-Timing` header on every response: time in Postgres, Redis, serializing (api/timing.py)
+    server_timing: bool = True
+
     # Responses shared by all API processes through Redis (api/cache.py), also sent as Cache-Control max-age where
     # the response is public; 0 turns the shared cache off.
     cache_ttl_live: int = Field(default=3, ge=0)  # boards and trips: below ZTP's ~5 s update rate

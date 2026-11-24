@@ -20,6 +20,7 @@ from fastapi import Request, Response
 from pydantic import BaseModel
 from redis.exceptions import RedisError
 
+from gtfs_backend.api import timing
 from gtfs_backend.api.context import Context
 from gtfs_backend.logs import log
 
@@ -52,8 +53,10 @@ def _respond(request: Request, body: bytes, etag: str, cache_control: str, statu
 
 def json_response(request: Request, model: BaseModel, cache_control: str, status_code: int = 200) -> Response:
     """Serialize `model`; answer 304 if the client already has this body."""
-    body = model.model_dump_json().encode()
-    return _respond(request, body, _etag(body), cache_control, status_code)
+    with timing.serializing():
+        body = model.model_dump_json().encode()
+        etag = _etag(body)
+    return _respond(request, body, etag, cache_control, status_code)
 
 
 def _query_aliases(dependant) -> set[str]:
@@ -105,8 +108,10 @@ async def _set(ctx: Context, key: str, etag: str, body: bytes, ttl: int) -> None
 
 
 async def _compute(ctx: Context, key: str, ttl: int, compute: Callable[[], Awaitable[BaseModel]]) -> tuple[str, bytes]:
-    body = (await compute()).model_dump_json().encode()
-    etag = _etag(body)
+    model = await compute()
+    with timing.serializing():
+        body = model.model_dump_json().encode()
+        etag = _etag(body)
     await _set(ctx, key, etag, body, ttl)
     return etag, body
 

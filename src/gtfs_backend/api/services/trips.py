@@ -4,6 +4,8 @@ the same while the trip runs, and its live state (every stop's predictions, the 
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable
 from datetime import date
 
 from gtfs_backend import keys
@@ -19,32 +21,43 @@ from gtfs_backend.api.services.routes import POLYLINE_SQL
 
 ON_DEMAND = (2, 3)  # GTFS pickup/drop_off_type: phone the agency, coordinate with the driver
 
-TRIP_SQL = """
-    SELECT t.route_id, t.trip_headsign, t.direction_id, t.shape_id
+# the trip runs on that service date (a trip key names a date it may not run on)
+RUNS_SQL = """EXISTS (SELECT 1 FROM core.service_date sd
+                     WHERE sd.feed_version_id = %(fv)s AND sd.date = %(date)s AND sd.service_id = t.service_id)"""
+
+# One round trip each. The view: the trip, its shape and every stop (as JSON rows, in stop order).
+VIEW_SQL = f"""
+    SELECT t.route_id, t.trip_headsign, t.direction_id, sh.polyline, sh.bbox, st.stops
     FROM gtfs.trips t
-    WHERE t.feed_version_id = %(fv)s AND t.trip_id = %(trip)s
-      AND EXISTS (SELECT 1 FROM core.service_date sd
-                  WHERE sd.feed_version_id = t.feed_version_id AND sd.date = %(date)s AND sd.service_id = t.service_id)
+    LEFT JOIN LATERAL (
+        SELECT {POLYLINE_SQL} FROM core.shape_line s WHERE s.feed_version_id = %(fv)s AND s.shape_id = t.shape_id
+    ) sh (polyline, bbox) ON true
+    CROSS JOIN LATERAL (
+        SELECT json_agg(json_build_array(
+                   st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
+                   st.pickup_type, st.drop_off_type,
+                   p.url_key, p.name, g.url_key, p.platform_code, ST_Y(p.geom), ST_X(p.geom)
+               ) ORDER BY st.stop_sequence) AS stops
+        FROM gtfs.stop_times st
+        LEFT JOIN core.stop_link l ON l.feed_version_id = %(fv)s AND l.stop_id = st.stop_id
+        LEFT JOIN core.stop p ON p.id = l.public_stop_id
+        LEFT JOIN core.stop_group g ON g.id = p.stop_group_id
+        WHERE st.feed_version_id = %(fv)s AND st.trip_id = t.trip_id
+    ) st
+    WHERE t.feed_version_id = %(fv)s AND t.trip_id = %(trip)s AND {RUNS_SQL}
 """
-SHAPE_SQL = f"SELECT {POLYLINE_SQL} FROM core.shape_line s WHERE s.feed_version_id = %(fv)s AND s.shape_id = %(shape)s"
-STOPS_SQL = """
-    SELECT st.stop_sequence, extract(epoch FROM st.arrival_time)::int, extract(epoch FROM st.departure_time)::int,
-           st.pickup_type, st.drop_off_type,
-           p.url_key, p.name, g.url_key, p.platform_code, ST_Y(p.geom), ST_X(p.geom)
-    FROM gtfs.stop_times st
-    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
-    LEFT JOIN core.stop p ON p.id = l.public_stop_id
-    LEFT JOIN core.stop_group g ON g.id = p.stop_group_id
-    WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
-    ORDER BY st.stop_sequence
-"""
-# the live state needs only the stop sequences, and the stops alerts can name
-STOPS_LIVE_SQL = """
-    SELECT st.stop_sequence, l.public_stop_id
-    FROM gtfs.stop_times st
-    LEFT JOIN core.stop_link l ON l.feed_version_id = st.feed_version_id AND l.stop_id = st.stop_id
-    WHERE st.feed_version_id = %(fv)s AND st.trip_id = %(trip)s
-    ORDER BY st.stop_sequence
+# The live state needs only the stop sequences, and the stops alerts can name.
+LIVE_SQL = f"""
+    SELECT t.route_id, t.direction_id, st.seqs, st.pids
+    FROM gtfs.trips t
+    CROSS JOIN LATERAL (
+        SELECT array_agg(st.stop_sequence ORDER BY st.stop_sequence) AS seqs,
+               array_agg(l.public_stop_id ORDER BY st.stop_sequence) AS pids
+        FROM gtfs.stop_times st
+        LEFT JOIN core.stop_link l ON l.feed_version_id = %(fv)s AND l.stop_id = st.stop_id
+        WHERE st.feed_version_id = %(fv)s AND st.trip_id = t.trip_id
+    ) st
+    WHERE t.feed_version_id = %(fv)s AND t.trip_id = %(trip)s AND {RUNS_SQL}
 """
 
 
@@ -55,12 +68,22 @@ async def _day(ctx: Context, feed_id: str, service_date: date) -> Day:
     return day
 
 
-async def _trip(conn, params: dict) -> tuple:
-    """(route_id, headsign, direction_id, shape_id) of a trip running that day."""
-    trip = await (await conn.execute(TRIP_SQL, params)).fetchone()
-    if trip is None:
+async def _row(ctx: Context, sql: str, params: dict) -> tuple:
+    """The trip's row, if it runs that day."""
+    async with ctx.pool.connection() as conn:
+        row = await (await conn.execute(sql, params)).fetchone()
+    if row is None:
         raise NotFound("trip")
-    return trip
+    return row
+
+
+async def _both[A, B](first: Awaitable[A], second: Awaitable[B]) -> tuple[A, B]:
+    """Both at once; the first one's error wins (a missing trip is a 404 even while Redis is down)."""
+    a, b = await asyncio.gather(first, second, return_exceptions=True)
+    for result in (a, b):
+        if isinstance(result, BaseException):
+            raise result
+    return a, b
 
 
 def _stop(row, day: Day) -> TripStop:
@@ -88,13 +111,9 @@ def _shape(polyline: str | None, bbox: list[float] | None, stops: list[TripStop]
 
 async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> TripView:
     day = await _day(ctx, feed_id, service_date)
-    params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date, "shape": None}
-    async with ctx.pool.connection() as conn:
-        route_id, headsign, direction_id, params["shape"] = await _trip(conn, params)
-        stops = [_stop(r, day) for r in await (await conn.execute(STOPS_SQL, params)).fetchall()]
-        polyline = bbox = None
-        if params["shape"] is not None and (row := await (await conn.execute(SHAPE_SQL, params)).fetchone()):
-            polyline, bbox = row
+    params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
+    route_id, headsign, direction_id, polyline, bbox, rows = await _row(ctx, VIEW_SQL, params)
+    stops = [_stop(r, day) for r in rows or []]
     info = await ctx.catalog.route(day.feed_version_id, route_id)
     return TripView(
         key=keys.trip_key(feed_id, service_date, trip_id),
@@ -124,11 +143,12 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     day = await _day(ctx, feed_id, service_date)
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     key = keys.trip_key(feed_id, service_date, trip_id)
-    async with ctx.pool.connection() as conn:
-        route_id, _, direction_id, _ = await _trip(conn, params)
-        rows = await (await conn.execute(STOPS_LIVE_SQL, params)).fetchall()
-
-    update = TripUpdate.for_version((await realtime.trip_updates(ctx.redis, [key])).get(key), day.version)
+    # independent: the timetable from Postgres, the trip update and alerts from Redis (one call)
+    (route_id, direction_id, seqs, pids), (raw, alert_raws) = await _both(
+        _row(ctx, LIVE_SQL, params), realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
+    )
+    rows = list(zip(seqs or [], pids or [], strict=True))
+    update = TripUpdate.for_version(raw, day.version)
     stops = [_live_stop(r, update) for r in rows]
 
     if vehicle is None and update and update.vehicle_id:
@@ -156,7 +176,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
         timestamp=realtime.newest([update.timestamp if update else None, vehicle.timestamp if vehicle else None]),
         vehicle=vehicle,
         stops=stops,
-        alerts=await alerts.in_scope(ctx, scope),
+        alerts=await alerts.in_scope(ctx, scope, alert_raws),
     )
 
 

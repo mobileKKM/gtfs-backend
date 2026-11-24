@@ -32,6 +32,12 @@ async def alerts_json(redis: Redis, feed_ids: list[str]) -> list[dict]:
     return [a for feed in await get_json_many(redis, [live_layout.alerts(f) for f in feed_ids]) if feed for a in feed]
 
 
+async def trip_and_alerts(redis: Redis, trip_key: str, feed_ids: list[str]) -> tuple[dict | None, list[dict]]:
+    """A trip's raw update (None without one) and all alerts of these feeds, in one call."""
+    values = await get_json_many(redis, [live_layout.trip(trip_key)] + [live_layout.alerts(f) for f in feed_ids])
+    return values[0], [a for feed in values[1:] if feed for a in feed]
+
+
 async def meta_json(redis: Redis, keys: list[tuple[str, str]]) -> dict[tuple[str, str], dict | None]:
     """Poll stats per (feed_id, kind)."""
     values = await get_json_many(redis, [live_layout.meta(f, k) for f, k in keys])
@@ -86,13 +92,6 @@ class TripUpdate:
 
     def stop(self, sequence: int) -> StopUpdate | None:
         return self._stops.get(sequence)
-
-
-async def trip_updates(redis: Redis, keys: list[str]) -> dict[str, dict]:
-    """trip key -> raw trip update JSON, for the keys that have one."""
-    unique = list(dict.fromkeys(keys))
-    values = await get_json_many(redis, [live_layout.trip(k) for k in unique])
-    return {k: v for k, v in zip(unique, values, strict=True) if v}
 
 
 # ------------------------------------------------------------------------------------------------- departure boards

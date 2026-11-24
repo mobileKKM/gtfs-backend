@@ -146,9 +146,12 @@ async def to_models(ctx: Context, raws: list[dict]) -> list[Alert]:
     ]
 
 
-async def in_scope(ctx: Context, scope: Scope) -> list[AlertRef]:
-    """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them."""
-    raws = current(ctx, await realtime.alerts_json(ctx.redis, ctx.feed_ids))
+async def in_scope(ctx: Context, scope: Scope, raws: list[dict] | None = None) -> list[AlertRef]:
+    """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them.
+    `raws`: all feeds' alerts, if already read from Redis."""
+    if raws is None:
+        raws = await realtime.alerts_json(ctx.redis, ctx.feed_ids)
+    raws = current(ctx, raws)
     return [ref(a) for a in sorted(raws, key=_order) if matches(a, scope)]
 
 

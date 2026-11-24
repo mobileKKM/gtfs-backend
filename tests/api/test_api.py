@@ -1068,3 +1068,18 @@ async def test_catalog_days_need_no_query(api_ctx, monkeypatch):
     far = today + timedelta(days=60)
     assert await catalog.day("kmk_t", far) is not None
     assert len(queries) == 1  # outside the preloaded days: one indexed lookup
+
+
+async def test_trip_live_reads_postgres_and_redis_at_once(api_ctx, monkeypatch):
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    api, ctx = api_ctx
+    v = (await api.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"][0]
+    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 200
+
+    async def down(*args, **kwargs):
+        raise RedisConnectionError("down")
+
+    monkeypatch.setattr(ctx.redis, "mget", down)
+    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 503
+    assert (await api.get("/trips/kmk_t:20261025:nope/live")).status_code == 404  # a missing trip still is a 404

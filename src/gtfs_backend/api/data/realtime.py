@@ -151,8 +151,9 @@ class BoardRealtime:
         state = TripState(*json.loads(value)) if value else None
         if state is not None:
             for sequence, prediction in self._predictions.get(trip_key, []):
-                arrival, departure, delay, skipped = json.loads(prediction)
-                state._stops[sequence] = StopUpdate(arrival, departure, delay, skipped)
+                arrival, departure, delay, skipped, version = json.loads(prediction)
+                if version == state.version:  # else of another update than the state, with other stop sequences
+                    state._stops[sequence] = StopUpdate(arrival, departure, delay, skipped)
         self._decoded[trip_key] = state
         return state
 

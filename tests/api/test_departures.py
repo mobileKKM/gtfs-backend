@@ -3,7 +3,7 @@
 from datetime import date
 
 from gtfs_backend import keys
-from gtfs_backend.api.data.realtime import TripUpdate
+from gtfs_backend.api.data.realtime import BoardRealtime, TripUpdate
 from gtfs_backend.api.services.departures import (
     EARLY_S,
     GRACE_S,
@@ -191,3 +191,14 @@ def test_expected_span_without_departures_reads_a_day():
     assert expected_span((0,) * 24, 12 * 3600, 20) == WINDOWS_S[-1]
     few = (1,) * 24
     assert expected_span(few, 0, 20) == WINDOWS_S[-1]  # 24 a day: 30 aren't expected within it
+
+
+def test_board_realtime_ignores_predictions_of_another_version():
+    """A board can read a trip's state and its predictions from different updates (neither write nor read is atomic):
+    after a timetable change, predictions of the old version have other stop sequences."""
+    key = "kmk_t:20261025:a"
+    states = {"kmk_t": {key: "[2,false,null,1000]"}}
+    stops = [{f"1|{key}": "[null,50,60,false,1]", f"2|{key}": "[null,60,60,false,2]"}]
+    state = BoardRealtime(states, stops).state(key)
+    assert state.version == 2 and state.stop(1) is None
+    assert state.stop(2).predicted == 60 and state.stop(2).delay_s == 60

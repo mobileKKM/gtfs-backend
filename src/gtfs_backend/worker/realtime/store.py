@@ -35,8 +35,9 @@ def _int_json(value: int | None) -> str:
 def _prediction_json(p: live_layout.StopPrediction) -> str:
     """json.dumps of a StopPrediction (ints, None, a bool), written directly: thousands per poll, a third of the
     write's time with json.dumps."""
-    arrival, departure, delay, skipped = p
-    return f"[{_int_json(arrival)},{_int_json(departure)},{_int_json(delay)},{'true' if skipped else 'false'}]"
+    arrival, departure, delay, skipped, version = p
+    flag = "true" if skipped else "false"
+    return f"[{_int_json(arrival)},{_int_json(departure)},{_int_json(delay)},{flag},{_int_json(version)}]"
 
 
 def _departure_index(trips: dict[str, LiveTrip]) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
@@ -47,17 +48,17 @@ def _departure_index(trips: dict[str, LiveTrip]) -> tuple[dict[str, str], dict[s
         for row in trip["stops"]:
             if (pid := row["public_stop_id"]) is not None:
                 field = live_layout.stop_prediction_field(row["stop_sequence"], key)
-                stops.setdefault(pid, {})[field] = _prediction_json(live_layout.stop_prediction(row))
+                stops.setdefault(pid, {})[field] = _prediction_json(live_layout.stop_prediction(row, trip["version"]))
     return states, stops
 
 
-def _write_hash(pipe, key: str, last: dict[str, str], new: dict[str, str]) -> None:
-    """Make the hash at `key` (last written as `last`) hold `new`: only changed fields are sent."""
+def _write_hash(pipe, key: str, last: dict[str, str], new: dict[str, str], *, full: bool = False) -> None:
+    """Make the hash at `key` (last written as `last`) hold `new`: only changed fields are sent, or all (`full`)."""
     if not new:
         if last:
             pipe.delete(key)
         return
-    if changed := {f: v for f, v in new.items() if last.get(f) != v}:
+    if changed := (new if full else {f: v for f, v in new.items() if last.get(f) != v}):
         pipe.hset(key, mapping=changed)
     if gone := last.keys() - new.keys():
         pipe.hdel(key, *gone)
@@ -127,6 +128,12 @@ class RealtimeStore:
         last = self._trips[feed_id]
         merged = {trip["key"]: merge_stops(last.get(trip["key"]), trip) for trip in res.trips}
         states, stop_fields = _departure_index(merged)
+        state_key = live_layout.trip_states(feed_id)
+        # rt:tripstate gone although written (it expired in an outage or with a file older than its TTL, or Redis lost
+        # its data): the rt:stop hashes may be gone too, so the index is rewritten as after a start
+        if self._states.get(feed_id) and not await self.redis.exists(state_key):
+            self._states.pop(feed_id)
+            self._stop_fields.pop(feed_id, None)
         known = feed_id in self._states
         old_index = [] if known else await self._stored_index_keys(feed_id)
         # no MULTI: readers want each trip whole, not all of them at once, and a transaction would hold them back
@@ -139,9 +146,11 @@ class RealtimeStore:
             pipe.delete(*(live_layout.trip(key) for key in stale))
         if old_index:
             pipe.delete(*old_index)
-        # trip states first: a board ignores predictions of trips without one
-        _write_hash(pipe, live_layout.trip_states(feed_id), self._states.get(feed_id, {}), states)
-        pipe.expire(live_layout.trip_states(feed_id), self.ttls.trip)
+        # trip states first: a board ignores predictions of trips without one. All of them, not only changed ones:
+        # a few hundred, and the hash can expire after the check above (a canceled trip's state can stay the same for
+        # hours, and would be missing until it changed)
+        _write_hash(pipe, state_key, self._states.get(feed_id, {}), states, full=True)
+        pipe.expire(state_key, self.ttls.trip)
         last = self._stop_fields.get(feed_id, {})
         for pid in last.keys() | stop_fields.keys():
             _write_hash(pipe, live_layout.stop_predictions(feed_id, pid), last.get(pid, {}), stop_fields.get(pid, {}))

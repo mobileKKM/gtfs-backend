@@ -88,9 +88,9 @@ async def test_trips_mirror_the_latest_update(redis_url):
     # the departure index: every trip's state, and at each stop its trips' rows (the dropped stop pa included)
     assert await departure_index(r, "kmk_t") == (
         {"kmk_t:a:20261025": [1, False, "V1", 1000]},
-        {"pa": {"1|kmk_t:a:20261025": [None, 1, 60, False]}, "pb": {"2|kmk_t:a:20261025": [None, 3, 60, False]}},
+        {"pa": {"1|kmk_t:a:20261025": [None, 1, 60, False, 1]}, "pb": {"2|kmk_t:a:20261025": [None, 3, 60, False, 1]}},
     )
-    assert (await departure_index(r, "kmk_a"))[1] == {"pc": {"1|kmk_a:a:20261025": [None, 1, 60, False]}}
+    assert (await departure_index(r, "kmk_a"))[1] == {"pc": {"1|kmk_a:a:20261025": [None, 1, 60, False, 1]}}
     await r.aclose()
 
 
@@ -104,12 +104,12 @@ async def test_the_departure_index_follows_the_trips(redis_url):
     states, stops = await departure_index(r, "kmk_t")
     assert states == {a: [1, False, "V1", 1000], b: [1, True, "V1", 1000]}
     assert stops == {
-        "pa": {f"1|{a}": [None, 10, 60, False]},
-        "pb": {f"2|{a}": [None, 25, 60, False], f"1|{b}": [None, 30, 60, False]},
+        "pa": {f"1|{a}": [None, 10, 60, False, 1]},
+        "pb": {f"2|{a}": [None, 25, 60, False, 1], f"1|{b}": [None, 30, 60, False, 1]},
     }
     # b left the feed; a new version of a: a whole new set of rows
     await store.write_trips("kmk_t", Result(trips=[trip(a, (5, "pc", 50), version=2)]))
-    assert await departure_index(r, "kmk_t") == ({a: [2, False, "V1", 1000]}, {"pc": {f"5|{a}": [None, 50, 60, False]}})
+    assert await departure_index(r, "kmk_t") == ({a: [2, False, "V1", 1000]}, {"pc": {f"5|{a}": [None, 50, 60, False, 2]}})
     await store.write_trips("kmk_t", Result())  # nothing running
     assert await departure_index(r, "kmk_t") == ({}, {})
     await r.aclose()
@@ -126,10 +126,40 @@ async def test_the_departure_index_is_rewritten_after_a_restart(redis_url):
     await after.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:on", (1, "pb", 3))]))
     assert await departure_index(r, "kmk_t") == (
         {"kmk_t:20261025:on": [1, False, "V1", 1000]},
-        {"pb": {"1|kmk_t:20261025:on": [None, 3, 60, False]}},
+        {"pb": {"1|kmk_t:20261025:on": [None, 3, 60, False, 1]}},
     )
     assert await r.exists("rt:stop:kmk_a:pa") == 1  # other feeds are theirs to clean
     await r.aclose()
+
+
+async def test_the_departure_index_comes_back_when_redis_lost_it(redis_url, monkeypatch):
+    """rt:tripstate expires in an outage (or with a file older than its TTL), and Redis can lose everything: the next
+    update writes the index again, unchanged trips (a canceled one) included."""
+    r = Redis.from_url(redis_url, decode_responses=True)
+    store = RealtimeStore(r, ["kmk_t"], TTLS)
+    update = Result(trips=[trip("kmk_t:20261025:a", (1, "pa", 1)), trip("kmk_t:20261025:c", relationship="CANCELED")])
+    await store.write_trips("kmk_t", update)
+    written = await departure_index(r, "kmk_t")
+    assert written[0]["kmk_t:20261025:c"] == [1, True, "V1", 1000]
+
+    await r.delete("rt:tripstate:kmk_t")  # expired
+    await store.write_trips("kmk_t", update)
+    assert await departure_index(r, "kmk_t") == written
+
+    await r.delete("rt:tripstate:kmk_t", *await r.keys("rt:stop:kmk_t:*"))  # Redis restarted without its data
+    await store.write_trips("kmk_t", update)
+    assert await departure_index(r, "kmk_t") == written
+
+    # expired right after the check: the states are written in full anyway
+    await r.delete("rt:tripstate:kmk_t")
+    monkeypatch.setattr(r, "exists", lambda *keys: _one())
+    await store.write_trips("kmk_t", update)
+    assert await departure_index(r, "kmk_t") == written
+    await r.aclose()
+
+
+async def _one() -> int:
+    return 1
 
 
 async def test_touch_refreshes_the_ttls_of_the_last_update(redis_url):
@@ -209,7 +239,7 @@ async def test_a_failed_trip_write_is_merged_again_from_the_last_written_one(red
     assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3)]
     # the index too, although the failed write may have changed part of it
     assert (await departure_index(r, "kmk_t"))[1] == {
-        "pa": {"1|kmk_t:20261025:a": [None, 1, 60, False]},
-        "pb": {"2|kmk_t:20261025:a": [None, 3, 60, False]},
+        "pa": {"1|kmk_t:20261025:a": [None, 1, 60, False, 1]},
+        "pb": {"2|kmk_t:20261025:a": [None, 3, 60, False, 1]},
     }
     await r.aclose()

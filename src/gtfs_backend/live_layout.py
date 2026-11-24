@@ -11,7 +11,8 @@ rt:trip:{trip_key}                  trip update JSON with per-stop predictions, 
 rt:tripstate:{feed_id}              HASH trip key -> TripState of every trip in rt:trip (TTL TRIP_TTL)
 rt:stop:{feed_id}:{public_stop_id}  HASH "{stop_sequence}|{trip key}" -> StopPrediction: the trips' rows of rt:trip at
                                     this stop, for departure boards (which read only their stops' hashes, not whole
-                                    trips). Only valid for trips in rt:tripstate; no TTL, cleared when the worker starts
+                                    trips). Only valid for trips in rt:tripstate, with the same version; no TTL,
+                                    rewritten in full when the worker starts or finds rt:tripstate gone
 rt:alerts:{feed_id}                 alerts JSON (TTL ALERT_TTL)
 rt:unmatched:{feed_id}:{kind}       unmatched trip ids / vehicles for debugging (TTL UNMATCHED_TTL), never shown
 rt:meta:{feed_id}:{kind}            poll stats: last poll, last data change, timings, counters
@@ -120,16 +121,19 @@ class LiveTrip(TripFields):
 # JSON arrays, not objects: boards read thousands of them.
 # rt:tripstate value: [version, canceled, vehicle_id, timestamp], from the LiveTrip
 TripState = tuple[int, bool, str | None, int]
-# rt:stop value: [predicted_arrival, predicted_departure, delay_s, skipped], from the LiveTrip's StopRow
-StopPrediction = tuple[int | None, int | None, int | None, bool]
+# rt:stop value: [predicted_arrival, predicted_departure, delay_s, skipped, version], from the LiveTrip's StopRow.
+# The version too: writes and reads aren't atomic, so a board may read a trip state and predictions of different
+# updates, and stop sequences are only comparable within one version.
+StopPrediction = tuple[int | None, int | None, int | None, bool, int]
 
 
 def trip_state(trip: LiveTrip) -> TripState:
     return trip["version"], trip["schedule_relationship"] == "CANCELED", trip["vehicle_id"], trip["timestamp"]
 
 
-def stop_prediction(row: StopRow) -> StopPrediction:
-    return row["predicted_arrival"], row["predicted_departure"], row["delay_s"], row["schedule_relationship"] == "SKIPPED"
+def stop_prediction(row: StopRow, version: int) -> StopPrediction:
+    skipped = row["schedule_relationship"] == "SKIPPED"
+    return row["predicted_arrival"], row["predicted_departure"], row["delay_s"], skipped, version
 
 
 class LiveVehicle(TypedDict):

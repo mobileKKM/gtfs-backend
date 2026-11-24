@@ -53,7 +53,9 @@ src/gtfs_backend/
   worker/    cli.py, runner.py (task loop), http.py (downloads)
     static/  fetch -> archive -> read -> validate -> load (+ derive, integrity, partitions, versions)
       stops/ stop matching: plan.py and shared.py decide (no DB), apply.py writes, osm.py reads OSM poles
-    realtime/ poller -> normalize (match to timetables) -> store (Redis)
+    realtime/ poller (one task per file) -> normalize -> store (Redis)
+             runtime.py: per feed, the trip index (trip_index.py) and recent delays/fixes;
+             normalize: resolve.py (trip_id -> timetable trip), trip_updates.py, vehicles.py, alerts.py
   api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog cache, Redis, SQL/geo)
 ```
 

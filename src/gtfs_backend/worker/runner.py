@@ -20,8 +20,8 @@ from gtfs_backend.feeds import FeedConfig, load_feeds
 from gtfs_backend.logs import log
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.http import make_client
-from gtfs_backend.worker.realtime.normalize import FeedRealtimeState
-from gtfs_backend.worker.realtime.poller import FeedRuntime, RealtimeTask
+from gtfs_backend.worker.realtime.poller import RealtimeTask
+from gtfs_backend.worker.realtime.runtime import FeedRuntime
 from gtfs_backend.worker.realtime.store import RealtimeStore, TTLs
 from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static.fetch import PREVIOUSLY_FAILED, check_static, import_order
@@ -97,10 +97,7 @@ class Worker:
         self.static_client = make_client(s.static_download_timeout, s.http_connect_timeout)
         self.rt_client = make_client(s.realtime_fetch_timeout, s.http_connect_timeout)
         self.executor = _import_executor()
-        self.runtimes = {
-            f.feed_id: FeedRuntime(f, self.pool, FeedRealtimeState(ignore_service_suffix=f.ignore_service_suffix))
-            for f in self.enabled
-        }
+        self.runtimes = {f.feed_id: FeedRuntime(f, self.pool) for f in self.enabled}
         ttls = TTLs(vehicle=s.vehicle_ttl, trip=s.trip_ttl, alert=s.alert_ttl, unmatched=s.unmatched_ttl)
         self.store = RealtimeStore(self.redis, [f.feed_id for f in self.enabled], ttls)
 

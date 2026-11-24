@@ -8,7 +8,7 @@ failure is retried a few times before giving up.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +64,30 @@ def _check_length(resp: httpx.Response, received: int) -> None:
         raise TruncatedResponse(f"received {received} of {expected} bytes")
 
 
+async def _retrying[T](
+    url: str, attempt: Callable[[int], Awaitable[T]], *, retries: int, retry_delay: float, error_level: str
+) -> T:
+    """Run `attempt(n)` for n = 1..retries until it returns. HTTP errors are retried only for RETRY_STATUSES / 5xx;
+    any other error (truncation, validation, transport) is retried and logged at `error_level`."""
+    last_exc: Exception | None = None
+    for n in range(1, retries + 1):
+        try:
+            return await attempt(n)
+        except httpx.HTTPStatusError as exc:
+            if not _retryable(exc) or n == retries:
+                raise
+            last_exc = exc
+            log.info("fetch_retry", url=url, attempt=n, status=exc.response.status_code)
+        except Exception as exc:  # noqa: BLE001 - truncation, parse and transport errors are retried
+            last_exc = exc
+            if n == retries:
+                break
+            getattr(log, error_level)("fetch_retry", url=url, attempt=n, error=f"{type(exc).__name__}: {exc}")
+        await asyncio.sleep(retry_delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def fetch_bytes[T](
     client: httpx.AsyncClient,
     url: str,
@@ -75,30 +99,18 @@ async def fetch_bytes[T](
     retry_delay: float,
 ) -> Fetched[T]:
     """GET a small file into memory and parse it; retries on truncation, parse errors and RETRY_STATUSES / 5xx."""
-    last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = await client.get(url, headers=_conditional_headers(etag, last_modified))
-            if resp.status_code == 304:
-                return Fetched(not_modified=True, etag=etag, last_modified=last_modified, attempts=attempt)
-            resp.raise_for_status()
-            body = resp.content
-            _check_length(resp, len(body))
-            value = parse(body)
-            return Fetched(False, value, resp.headers.get("ETag"), resp.headers.get("Last-Modified"), len(body), attempt)
-        except httpx.HTTPStatusError as exc:
-            if not _retryable(exc) or attempt == retries:
-                raise
-            last_exc = exc
-            log.info("fetch_retry", url=url, attempt=attempt, status=exc.response.status_code)
-            await asyncio.sleep(retry_delay)
-        except Exception as exc:  # noqa: BLE001 - truncation, parse and transport errors are retried
-            last_exc = exc
-            if attempt < retries:
-                log.info("fetch_retry", url=url, attempt=attempt, error=f"{type(exc).__name__}: {exc}")
-                await asyncio.sleep(retry_delay)
-    assert last_exc is not None
-    raise last_exc
+
+    async def attempt(n: int) -> Fetched[T]:
+        resp = await client.get(url, headers=_conditional_headers(etag, last_modified))
+        if resp.status_code == 304:
+            return Fetched(not_modified=True, etag=etag, last_modified=last_modified, attempts=n)
+        resp.raise_for_status()
+        body = resp.content
+        _check_length(resp, len(body))
+        value = parse(body)
+        return Fetched(False, value, resp.headers.get("ETag"), resp.headers.get("Last-Modified"), len(body), n)
+
+    return await _retrying(url, attempt, retries=retries, retry_delay=retry_delay, error_level="info")
 
 
 async def fetch_to_file(
@@ -112,36 +124,30 @@ async def fetch_to_file(
     retries: int,
     retry_delay: float,
 ) -> Fetched[Path]:
-    """Stream a (large) file to `dest` and validate it; retries on truncation, validation errors and RETRY_STATUSES / 5xx."""
+    """Stream a (large) file to `dest` and validate it; retries on truncation, validation errors and RETRY_STATUSES / 5xx.
+    A download that keeps failing that way leaves no file behind."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            async with client.stream("GET", url, headers=_conditional_headers(etag, last_modified)) as resp:
-                if resp.status_code == 304:
-                    return Fetched(not_modified=True, etag=etag, last_modified=last_modified, attempts=attempt)
-                resp.raise_for_status()
-                received = 0
-                with dest.open("wb") as fh:
-                    async for chunk in resp.aiter_bytes():
-                        fh.write(chunk)
-                        received += len(chunk)
-                if resp.headers.get("Content-Encoding"):
-                    raise TruncatedResponse("compressed static downloads are not supported")
-                _check_length(resp, received)
-            await asyncio.to_thread(validate, dest)
-            return Fetched(False, dest, resp.headers.get("ETag"), resp.headers.get("Last-Modified"), received, attempt)
-        except httpx.HTTPStatusError as exc:
-            if not _retryable(exc) or attempt == retries:
-                raise
-            last_exc = exc
-            log.info("fetch_retry", url=url, attempt=attempt, status=exc.response.status_code)
-            await asyncio.sleep(retry_delay)
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt < retries:
-                log.warning("fetch_retry", url=url, attempt=attempt, error=f"{type(exc).__name__}: {exc}")
-                await asyncio.sleep(retry_delay)
-    dest.unlink(missing_ok=True)
-    assert last_exc is not None
-    raise last_exc
+
+    async def attempt(n: int) -> Fetched[Path]:
+        async with client.stream("GET", url, headers=_conditional_headers(etag, last_modified)) as resp:
+            if resp.status_code == 304:
+                return Fetched(not_modified=True, etag=etag, last_modified=last_modified, attempts=n)
+            resp.raise_for_status()
+            received = 0
+            with dest.open("wb") as fh:
+                async for chunk in resp.aiter_bytes():
+                    fh.write(chunk)
+                    received += len(chunk)
+            if resp.headers.get("Content-Encoding"):
+                raise TruncatedResponse("compressed static downloads are not supported")
+            _check_length(resp, received)
+        await asyncio.to_thread(validate, dest)
+        return Fetched(False, dest, resp.headers.get("ETag"), resp.headers.get("Last-Modified"), received, n)
+
+    try:
+        return await _retrying(url, attempt, retries=retries, retry_delay=retry_delay, error_level="warning")
+    except httpx.HTTPStatusError:
+        raise
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise

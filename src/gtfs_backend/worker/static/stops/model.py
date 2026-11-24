@@ -5,8 +5,24 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from functools import cache
+from pathlib import Path
 
+from gtfs_backend.feeds import FeedConfig
 from gtfs_backend.ids import normalize_name
+
+
+@dataclass(frozen=True)
+class StopRules:
+    """How a feed's stops are matched (from feeds.yml), and where the OSM stop poles are for matching shared stops."""
+
+    namespace: str | None = None  # the stop-code namespace; None: the feed's own id
+    share_with: tuple[str, ...] = ()  # namespaces whose stops this feed attaches to (never modifies)
+    stop_code_pattern: str | None = None  # see normalize_stop
+    osm_stops_file: Path | None = None  # `fetch-osm` file; None (or no file): shared stops match by position alone
+
+    @classmethod
+    def of(cls, feed: FeedConfig, osm_stops_file: Path | None) -> StopRules:
+        return cls(feed.namespace, tuple(feed.share_stops_with), feed.stop_code_pattern, osm_stops_file)
 
 
 @dataclass(frozen=True)

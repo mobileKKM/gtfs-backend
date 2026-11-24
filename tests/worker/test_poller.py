@@ -6,7 +6,8 @@ from gtfs_backend.feeds import FeedConfig, RealtimeKind
 from gtfs_backend.worker.http import Fetched
 from gtfs_backend.worker.realtime import poller
 from gtfs_backend.worker.realtime.normalize import Result
-from gtfs_backend.worker.realtime.poller import FeedRuntime, RealtimeTask, parse_feed
+from gtfs_backend.worker.realtime.poller import RealtimeTask, parse_feed
+from gtfs_backend.worker.realtime.runtime import FeedRuntime
 
 MSG = parse_feed((FIXTURES / "dst_2026-10-25" / "TripUpdates_T.pb").read_bytes())
 

@@ -24,6 +24,7 @@ from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.realtime.store import TTLs
 from gtfs_backend.worker.static.load import SourceMeta, import_zip
 from gtfs_backend.worker.static.spec import TABLES
+from gtfs_backend.worker.static.stops import StopRules
 
 ROOT = Path(__file__).parent.parent
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -67,6 +68,7 @@ FEEDS = FeedsFile(
     ],
     search_namespaces=["ztp"],
 )
+ZTP_RULES = StopRules("ztp", stop_code_pattern=ZTP_STOP_CODES)
 TTLS = TTLs(vehicle=120, trip=600, alert=600, unmatched=120)  # the WorkerSettings defaults
 
 
@@ -133,7 +135,8 @@ def meta(path: Path) -> SourceMeta:
 
 
 def do_import(db, key: str, path: Path, namespace: str | None = "ztp", share=None):
-    result = import_zip(db, key, path, meta(path), namespace, share, ZTP_STOP_CODES if namespace == "ztp" else None)
+    rules = StopRules(namespace, tuple(share or ()), ZTP_STOP_CODES if namespace == "ztp" else None)
+    result = import_zip(db, key, path, meta(path), rules)
     assert result.status == "ready", result.error
     return result
 

@@ -9,7 +9,8 @@ from redis.asyncio import Redis
 
 from gtfs_backend import keys, live_layout
 from gtfs_backend.feeds import RealtimeKind
-from gtfs_backend.worker.realtime.normalize import Result, merge_stops
+from gtfs_backend.worker.realtime.normalize import Result
+from gtfs_backend.worker.realtime.trip_updates import merge_stops
 
 
 @dataclass(frozen=True)
@@ -85,35 +86,29 @@ class RealtimeStore:
 
     async def write_unmatched(self, feed_id: str, kind: str, res: Result) -> None:
         if res.unmatched_trips or res.unmatched_vehicles or res.unmatched_alert_entities:
-            await self.redis.set(
-                live_layout.unmatched(feed_id, kind),
-                _dumps(
-                    {
-                        "trips": res.unmatched_trips,
-                        "vehicles": res.unmatched_vehicles,
-                        "alert_entities": res.unmatched_alert_entities,
-                    }
-                ),
-                ex=self.ttls.unmatched,
-            )
+            value: live_layout.Unmatched = {
+                "trips": res.unmatched_trips,
+                "vehicles": res.unmatched_vehicles,
+                "alert_entities": res.unmatched_alert_entities,
+            }
+            await self.redis.set(live_layout.unmatched(feed_id, kind), _dumps(value), ex=self.ttls.unmatched)
 
     async def touch(self, feed_id: str, kind: RealtimeKind) -> None:
         """Refresh the TTLs of what the last update of this file wrote (the file hasn't changed since)."""
-        combined = kind == RealtimeKind.COMBINED
         pipe = self.redis.pipeline(transaction=False)
-        if combined or kind == RealtimeKind.VEHICLE_POSITIONS:
+        if kind.carries(RealtimeKind.VEHICLE_POSITIONS):
             for key in self._vehicle_keys.get(feed_id, []):
                 pipe.expire(key, self.ttls.vehicle)
             pipe.expire(live_layout.vehicles_geo(feed_id), self.ttls.vehicle)
             pipe.expire(live_layout.VEHICLES_GEO, self.ttls.vehicle)
-        if combined or kind == RealtimeKind.TRIP_UPDATES:
+        if kind.carries(RealtimeKind.TRIP_UPDATES):
             for key in self._trip_keys.get(feed_id, set()):
                 pipe.expire(live_layout.trip(key), self.ttls.trip)
-        if combined or kind == RealtimeKind.SERVICE_ALERTS:
+        if kind.carries(RealtimeKind.SERVICE_ALERTS):
             pipe.expire(live_layout.alerts(feed_id), self.ttls.alert)
         await pipe.execute()
 
-    async def write_meta(self, feed_id: str, kind: str, meta: dict) -> None:
+    async def write_meta(self, feed_id: str, kind: str, meta: live_layout.PollMeta) -> None:
         await self.redis.set(live_layout.meta(feed_id, kind), _dumps(meta))
 
     async def publish(self, feed_id: str, kind: str, ts: int) -> None:

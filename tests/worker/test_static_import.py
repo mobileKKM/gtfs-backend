@@ -4,7 +4,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import FIXTURES, ZTP_STOP_CODES, do_import, make_zip, meta, read_zip_csv
+from conftest import FIXTURES, ZTP_RULES, do_import, make_zip, meta, read_zip_csv
 
 from gtfs_backend.worker.static import integrity
 from gtfs_backend.worker.static.load import import_zip
@@ -213,7 +213,7 @@ def test_invalid_feed_fails_and_keeps_current_version(db, tmp_path):
             "calendar_dates.txt": "service_id,date,exception_type\nservice_4,20261024,1",
         },
     )
-    result = import_zip(db, "kmk_t", bad, meta(bad), "ztp", stop_code_pattern=ZTP_STOP_CODES)
+    result = import_zip(db, "kmk_t", bad, meta(bad), ZTP_RULES)
     assert result.status == "failed"
     assert "arrival_time" in result.error and "unknown stops" in result.error
     statuses = dict(db.execute("SELECT version, status FROM core.feed_version WHERE feed_id = 'kmk_t'").fetchall())
@@ -234,7 +234,7 @@ def test_integrity_check_catches_changed_values(db, tmp_path, monkeypatch):
         return out - 86400 if kind.name == "TIME" and out and out >= 86400 else out
 
     monkeypatch.setattr(integrity, "canonical_db", tamper)
-    result = import_zip(db, "kmk_t", path, meta(path), "ztp", stop_code_pattern=ZTP_STOP_CODES)
+    result = import_zip(db, "kmk_t", path, meta(path), ZTP_RULES)
     assert result.status == "failed"
     assert "IntegrityError" in result.error and "stop_times" in result.error
     assert db.execute("SELECT count(*) FROM core.feed_version WHERE status = 'ready'").fetchone()[0] == 0

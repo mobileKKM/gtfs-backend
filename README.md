@@ -73,6 +73,11 @@ Static imports are CPU-heavy and run in a separate process.
   (`gtfs.stop_times__kmk_t__v3`). Real Postgres types (`interval` for times, so `25:10:00` survives). An
   **integrity check** compares stored values with the raw CSV after every import; any difference fails it. ZTP's
   non-standard `blocks.txt` is kept as `gtfs.blocks`.
+- **Derived at import**: `core.service_date` (calendar expanded), `core.shape_line`, `core.stop_direction` (where
+  trips go next) and `core.stop_departure`: every stop time a board can show (pickup allowed, not the trip's last
+  stop), with its route and headsign, indexed by (stop, service, time), so a board reads one index range per stop
+  and day with no joins. It is partitioned per version like `gtfs.*` (`core.stop_departure__kmk_t__v3`) and
+  dropped with it (about 60 % of the size of `stop_times`).
 - **Versions**: every new zip is a `core.feed_version`, imported in one transaction, numbered per feed (never
   reused) and joined via `feed_version_id` (`kmk_t_v3`). Find the newest by `version`, not by id (`kmk_t_v10` sorts
   before `kmk_t_v9` as text). For each service date the newest ready version with service that day is

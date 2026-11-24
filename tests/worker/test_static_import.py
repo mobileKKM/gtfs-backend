@@ -159,6 +159,22 @@ def test_stop_directions_name_the_next_other_group(db, tmp_path):
         ("911-01", "912", "R1", "Gamma", 1),  # Y has no pickup at Beta
         ("912-01", "911", "R1", "Alfa", 1),
     ]
+    # what departure boards read: no last stops (X at Gamma, Y at Alfa, Z at Gamma), no stop without pickup (Y at Beta)
+    departures = db.execute(
+        """
+        SELECT p.current_code, d.service_id, d.departure_s, d.trip_id, d.stop_sequence, d.route_id, d.headsign, d.on_demand
+        FROM core.stop_departure d JOIN core.stop p ON p.id = d.public_stop_id
+        WHERE d.feed_version_id = %s ORDER BY d.departure_s
+        """,
+        (v,),
+    ).fetchall()
+    assert departures == [
+        ("910-01", "s", 6 * 3600, "X", 1, "R1", "Gamma", False),
+        ("910-02", "s", 6 * 3600 + 60, "X", 2, "R1", "Gamma", False),
+        ("911-01", "s", 6 * 3600 + 300, "X", 3, "R1", "Gamma", False),
+        ("912-01", "s", 7 * 3600, "Y", 1, "R1", "Alfa", False),
+        ("910-02", "s", 8 * 3600, "Z", 1, "R2", "Gamma", False),
+    ]
 
 
 def test_overnight_update_keeps_old_version_for_previous_service_day(db, tmp_path):
@@ -191,8 +207,10 @@ def test_overnight_update_keeps_old_version_for_previous_service_day(db, tmp_pat
     db.commit()
     assert db.execute("SELECT status FROM core.feed_version WHERE feed_id = 'kmk_t' AND version = 1").fetchone()[0] == "retired"
     assert db.execute("SELECT to_regclass('gtfs.stop_times__kmk_t__v1')").fetchone()[0] is None
+    assert db.execute("SELECT to_regclass('core.stop_departure__kmk_t__v1')").fetchone()[0] is None
     assert db.execute(directions, (old.feed_version_id,)).fetchone()[0] == 0
     assert db.execute("SELECT to_regclass('gtfs.stop_times__kmk_t__v2')").fetchone()[0] is not None
+    assert db.execute("SELECT to_regclass('core.stop_departure__kmk_t__v2')").fetchone()[0] is not None
     assert (
         db.execute("SELECT count(*) FROM gtfs.stop_times WHERE feed_version_id = %s", (new.feed_version_id,)).fetchone()[0] == 2
     )

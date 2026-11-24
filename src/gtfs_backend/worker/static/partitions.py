@@ -14,6 +14,9 @@ from psycopg import sql
 
 from gtfs_backend.worker.static.spec import TABLES, partition_name
 
+# core.stop_departure (derive.py) is partitioned per version too, named like the GTFS tables
+STOP_DEPARTURE = "stop_departure"
+
 
 class FeedVersion(NamedTuple):
     id: str  # core.feed_version.id (`kmk_t_v3`), the key every table joins on
@@ -49,3 +52,4 @@ def drop_version_partitions(conn: psycopg.Connection, fv: FeedVersion) -> None:
     cur = conn.cursor()
     for name in TABLES:
         cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier("gtfs", fv.partition(name))))
+    cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(sql.Identifier("core", fv.partition(STOP_DEPARTURE))))

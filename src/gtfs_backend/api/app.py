@@ -22,6 +22,8 @@ from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
 
+GZIP_LEVEL = 6
+
 
 async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
     """The worker publishes `static:updated` after an import; reload the catalog then."""
@@ -103,7 +105,9 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    # level 6 (zlib's default), not Starlette's 9: about a quarter of the time for a 5 % bigger body (640 kB of JSON:
+    # 5.5 ms instead of 19.7 ms, 77 kB instead of 73 kB)
+    app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=GZIP_LEVEL)
     if settings.server_timing:
         app.add_middleware(ServerTimingMiddleware)  # outermost: its `total` includes gzip
     errors.install(app)

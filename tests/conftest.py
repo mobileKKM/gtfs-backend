@@ -23,6 +23,7 @@ from gtfs_backend.logs import setup_logging
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.realtime.store import TTLs
 from gtfs_backend.worker.static.load import SourceMeta, import_zip
+from gtfs_backend.worker.static.partitions import STOP_DEPARTURE
 from gtfs_backend.worker.static.spec import TABLES
 from gtfs_backend.worker.static.stops import StopRules
 
@@ -75,15 +76,15 @@ TTLS = TTLs(vehicle=120, trip=600, alert=600, unmatched=120)  # the WorkerSettin
 def reset_db(database_url: str) -> None:
     """Remove all versions, partitions and stops."""
     with psycopg.connect(database_url, autocommit=True) as conn:
-        for name in TABLES:
+        for schema, name in [("gtfs", t) for t in TABLES] + [("core", STOP_DEPARTURE)]:
             parts = conn.execute(
                 "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid "
                 "JOIN pg_class p ON p.oid = i.inhparent JOIN pg_namespace n ON n.oid = p.relnamespace "
-                "WHERE n.nspname = 'gtfs' AND p.relname = %s",
-                (name,),
+                "WHERE n.nspname = %s AND p.relname = %s",
+                (schema, name),
             ).fetchall()
             for (part,) in parts:
-                conn.execute(f'DROP TABLE gtfs."{part}"')
+                conn.execute(f'DROP TABLE {schema}."{part}"')
         conn.execute(
             "TRUNCATE core.stop_direction, core.stop_link, core.shape_line, core.service_day_version, core.service_date, "
             "core.stop, core.stop_group, core.public_id, core.feed_version, core.feed CASCADE"

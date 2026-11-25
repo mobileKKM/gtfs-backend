@@ -178,6 +178,7 @@ def import_zip(
             for msg in stop_stats["errors"]:
                 warnings.append(f"stop matching: {msg}")
             directions = derive.build_stop_directions(conn, v)
+            departures = derive.build_stop_departures(conn, fv)
             bound.info(
                 "derived",
                 service_dates=services,
@@ -186,6 +187,7 @@ def import_zip(
                 shape_lines=shapes,
                 stops=stop_stats["methods"],
                 stop_directions=directions,
+                stop_departures=departures,
             )
 
             cur.execute(

@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from psycopg import AsyncConnection
-
 from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
@@ -102,7 +100,7 @@ def ref(a: dict) -> AlertRef:
     )
 
 
-async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> list[Alert]:
+async def to_models(ctx: Context, raws: list[dict]) -> list[Alert]:
     """Each alert with its entities as routes (today's timetable), trips and stops or stop groups. An entity whose route
     or stop we can't show is left out: without it, it would read as applying more widely than it does."""
     raws = sorted(raws, key=_order)
@@ -115,9 +113,9 @@ async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> li
 
     routes = await ctx.catalog.route_refs(k for a in raws for ie in entities(a) if (k := route_key(a, ie)))
     named = [ie for a in raws for ie in entities(a)]
-    groups = await stops.groups_by_id(conn, {ie["stop_group_id"] for ie in named if ie.get("stop_group_id")})
-    poles = await stops.stops_by_id(
-        conn, {ie["public_stop_ids"][0] for ie in named if ie.get("public_stop_ids") and not ie.get("stop_group_id")}
+    groups = ctx.catalog.stops.groups_by_id({ie["stop_group_id"] for ie in named if ie.get("stop_group_id")})
+    poles = ctx.catalog.stops.stops_by_id(
+        {ie["public_stop_ids"][0] for ie in named if ie.get("public_stop_ids") and not ie.get("stop_group_id")}
     )
 
     def entity(a: dict, ie: dict) -> AlertEntity | None:
@@ -148,9 +146,12 @@ async def to_models(ctx: Context, conn: AsyncConnection, raws: list[dict]) -> li
     ]
 
 
-async def in_scope(ctx: Context, scope: Scope) -> list[AlertRef]:
-    """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them."""
-    raws = current(ctx, await realtime.alerts_json(ctx.redis, ctx.feed_ids))
+async def in_scope(ctx: Context, scope: Scope, raws: list[dict] | None = None) -> list[AlertRef]:
+    """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them.
+    `raws`: all feeds' alerts, if already read from Redis."""
+    if raws is None:
+        raws = await realtime.alerts_json(ctx.redis, ctx.feed_ids)
+    raws = current(ctx, raws)
     return [ref(a) for a in sorted(raws, key=_order) if matches(a, scope)]
 
 
@@ -168,21 +169,20 @@ async def search(ctx: Context, feed: str | None, route_key: str | None, stop_key
         feed = route_feed
     if feed is not None and feed not in ctx.feed_ids:
         raise NotFound("feed")
-    async with ctx.pool.connection() as conn:
-        raws = await realtime.alerts_json(ctx.redis, [feed] if feed else ctx.feed_ids)
-        if active:
-            raws = current(ctx, raws)
-        if route_id is not None or stop_key is not None:
-            scope = Scope()
-            if route_id is not None:
-                version = ctx.catalog.today_version(feed)
-                info = await ctx.catalog.route(version, route_id) if version else None
-                scope.routes = {(feed, route_id): info.route_type if info else None}
-                scope.feeds = {feed}
-            if stop_key is not None:
-                scope.public_stop_ids = set(await stops.public_stop_ids(conn, await stops.get(conn, stop_key)))
-            raws = [a for a in raws if matches(a, scope)]
-        return AlertList(alerts=await to_models(ctx, conn, raws))
+    raws = await realtime.alerts_json(ctx.redis, [feed] if feed else ctx.feed_ids)
+    if active:
+        raws = current(ctx, raws)
+    if route_id is not None or stop_key is not None:
+        scope = Scope()
+        if route_id is not None:
+            version = ctx.catalog.today_version(feed)
+            info = await ctx.catalog.route(version, route_id) if version else None
+            scope.routes = {(feed, route_id): info.route_type if info else None}
+            scope.feeds = {feed}
+        if stop_key is not None:
+            scope.public_stop_ids = set(ctx.catalog.stops.public_stop_ids(stops.get(ctx.catalog, stop_key)))
+        raws = [a for a in raws if matches(a, scope)]
+    return AlertList(alerts=await to_models(ctx, raws))
 
 
 async def get(ctx: Context, alert_key: str) -> Alert:
@@ -192,5 +192,4 @@ async def get(ctx: Context, alert_key: str) -> Alert:
     raw = next((a for a in await realtime.alerts_json(ctx.redis, [feed_id]) if a["id"] == alert_id), None)
     if raw is None:
         raise NotFound("alert")
-    async with ctx.pool.connection() as conn:
-        return (await to_models(ctx, conn, [raw]))[0]
+    return (await to_models(ctx, [raw]))[0]

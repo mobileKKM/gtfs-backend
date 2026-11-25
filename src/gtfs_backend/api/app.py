@@ -17,9 +17,12 @@ from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog, Clock
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
 from gtfs_backend.api.settings import ApiSettings, get_api_settings
+from gtfs_backend.api.timing import ServerTimingMiddleware, TimedConnection, TimedPool, TimedRedis
 from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
+
+GZIP_LEVEL = 6
 
 
 async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
@@ -58,10 +61,16 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        pool = async_pool(settings.database_url, max_size=settings.db_pool_max_size, timeout=settings.db_pool_timeout)
+        pool = async_pool(
+            settings.database_url,
+            max_size=settings.db_pool_max_size,
+            timeout=settings.db_pool_timeout,
+            pool_class=TimedPool,
+            connection_class=TimedConnection,
+        )
         await pool.open()
         # bounded: under load requests wait for a connection (then 503) instead of opening ever more
-        redis = Redis(
+        redis = TimedRedis(
             connection_pool=BlockingConnectionPool.from_url(
                 settings.redis_url,
                 decode_responses=True,
@@ -83,6 +92,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             listener.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await listener
+            await catalog.close()
             await redis.aclose()
             await pool.close()
 
@@ -95,7 +105,11 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    # level 6 (zlib's default), not Starlette's 9: about a quarter of the time for a 5 % bigger body (640 kB of JSON:
+    # 5.5 ms instead of 19.7 ms, 77 kB instead of 73 kB)
+    app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=GZIP_LEVEL)
+    if settings.server_timing:
+        app.add_middleware(ServerTimingMiddleware)  # outermost: its `total` includes gzip
     errors.install(app)
 
     for module in (vehicles, stops, trips, routes, alerts, health):

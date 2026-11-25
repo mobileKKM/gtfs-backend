@@ -16,6 +16,7 @@ from conftest import FIXTURES, TEST_REDIS_URL, TTLS, do_import, message, reset_d
 from httpx import ASGITransport, AsyncClient
 from redis.asyncio import Redis
 
+from gtfs_backend import keys
 from gtfs_backend.api.app import create_app
 from gtfs_backend.api.settings import ApiSettings
 from gtfs_backend.db import async_pool
@@ -89,13 +90,9 @@ def loaded(database_url):
     return database_url
 
 
-# Most tests change Redis between requests and want to see it at once: the response cache is off for them.
-NO_CACHE = {"cache_ttl_live": 0, "cache_ttl_static": 0, "cache_ttl_alerts": 0}
-
-
 @pytest.fixture
 async def api(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c
@@ -246,27 +243,29 @@ async def test_stop_search(api, sql):
     assert (await api.get("/stops/search?q=%_%")).json()["results"] == []  # LIKE wildcards are literal
 
 
-async def test_stops_without_trips_are_never_returned(api, sql, loaded):
+async def test_stops_without_trips_are_never_returned(api_ctx, sql, loaded):
     """A stop with no trips in the current feeds (empty modes) is hidden, and so is a group made only of them."""
+    api, ctx = api_ctx
     gid = group_id(sql, "802")
     pid = stop_by_code(sql, "802-01")
     saved = sql("SELECT id, modes FROM core.stop")
 
-    def clear_modes(where: str, param: str):
+    async def clear_modes(where: str, param: str):
         with psycopg.connect(loaded) as conn:
             conn.execute(f"UPDATE core.stop SET modes = '{{}}' WHERE {where} = %s", (param,))
+        await ctx.catalog.reload()  # stops change with imports, which publish `static:updated`
 
     async def map_ids():
         return {ident(s) for s in (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]}
 
     try:
         # one stop without trips: gone from the map and from its group, which is still found
-        clear_modes("id", pid)
+        await clear_modes("id", pid)
         assert pid not in await map_ids()
         found = (await api.get("/stops/search?q=rondo mog")).json()["results"][0]
         assert ident(found) == gid and found["stops"] and pid not in {ident(p) for p in found["stops"]}
         # all of its stops without trips: the group disappears from search too
-        clear_modes("stop_group_id", gid)
+        await clear_modes("stop_group_id", gid)
         assert gid not in {ident(r) for r in (await api.get("/stops/search?q=rondo mog")).json()["results"]}
         on_map = (await api.get(f"/stops?bbox={RONDO_BBOX}")).json()["stops"]
         assert not {ident(s) for s in on_map if ident(s, "group_key") == gid}
@@ -278,7 +277,7 @@ async def test_stops_without_trips_are_never_returned(api, sql, loaded):
 
 async def test_stop_search_covers_only_search_namespaces(loaded, sql):
     """Search is limited to feeds.yml `search_namespaces` (ZTP); the map and the stop itself are not."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     feeds = FEEDS.model_copy(update={"search_namespaces": ["km_kolej"]})  # no stops loaded there; skips validation
     app = create_app(settings, feeds=feeds, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
@@ -423,7 +422,7 @@ async def test_departure_board_stop_and_other_days(api, sql):
 async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
     """Responses carry the time of their data, not of the request: a later poll of unchanged data is a 304."""
     clock = [NOW]
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: clock[0])
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         vehicles = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()
@@ -442,6 +441,48 @@ async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
             assert again.status_code == 304, u
         # nothing realtime shown: no timestamp
         assert (await c.get("/vehicles?bbox=19.0,49.0,19.01,49.01")).json() == {"timestamp": None, "vehicles": []}
+
+
+@pytest.mark.parametrize("arrival_only", [False, True])
+async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch, arrival_only):
+    """A trip scheduled to depart past the window but running early enough to come before the page's last departure
+    still makes the page, however early it runs (feeds allow any amount): the board finds it in its realtime index.
+    Also when the feed predicts only its arrival, and the stop's arrival (+29 min) is inside the window while its
+    departure (+31 min), by which the timetable is read, is past it."""
+    from gtfs_backend.api.data.realtime import BoardRealtime
+    from gtfs_backend.api.services import departures
+
+    pid = stop_by_code(sql, "802-01")
+    day = date(2026, 10, 25)
+
+    def dep(trip_id, at):
+        key = keys.trip_key("kmk_t", day, trip_id)
+        return departures.Scheduled("kmk_t", "kmk_t_v1", 1, day, trip_id, 1, pid, at, "X", "r", False, key)
+
+    timetable = [dep(f"every2min_{i}", NOW + 60 + 120 * i) for i in range(40)]
+    early = dep("early", NOW + departures.WINDOWS_S[0] + 60)  # departs a minute past the first window
+    timetable.append(early)
+    scheduled_arrival = early.scheduled_departure - 120
+    predicted = NOW + 16 * 60  # a quarter of an hour early
+
+    async def scheduled(conn, days, pids, start, end, lookback=departures.LOOKBACK_S):
+        return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
+
+    async def read(redis, feed_ids, public_stop_ids):
+        if arrival_only:  # its delay is against the scheduled arrival
+            value = f"[{predicted},null,{predicted - scheduled_arrival},false,1,{early.scheduled_departure}]"
+        else:
+            value = f"[null,{predicted},{predicted - early.scheduled_departure},false,1,{early.scheduled_departure}]"
+        return BoardRealtime({"kmk_t": {early.trip_key: f"[1,false,null,{NOW}]"}}, [{f"1|{early.trip_key}": value}])
+
+    monkeypatch.setattr(departures, "scheduled", scheduled)
+    monkeypatch.setattr(departures.realtime.BoardRealtime, "read", read)
+    monkeypatch.setattr(departures, "expected_span", lambda *_: departures.WINDOWS_S[0])  # whatever the stop's profile
+    # the first window alone has 10 departures (+1 to +19 min); the early one comes after the 8th (+15 min)
+    board = (await api.get(f"/stops/{pid}/departures?limit=10")).json()
+    trip_keys = [d["trip_key"] for d in board["departures"]]
+    assert trip_keys[8] == early.trip_key and trip_keys[:8] + trip_keys[9:] == [s.trip_key for s in timetable[:9]]
+    assert board["departures"][8]["time"] == predicted and board["departures"][8]["status"] == "live"
 
 
 async def test_departure_board_etag(api, sql):
@@ -741,105 +782,34 @@ async def test_openapi_lists_every_endpoint(api):
     } == set(paths)
 
 
-# ------------------------------------------------------------------------------------------------- response cache
+# ------------------------------------------------------------------------------------------------- revalidation
 
 
-@pytest.fixture
-async def cached_api(loaded, monkeypatch):
-    """An API with the response cache on, and a count of the boards it computed."""
-    from gtfs_backend.api.services import departures
-
-    r = redis.Redis.from_url(TEST_REDIS_URL)
-    for key in r.scan_iter("api:resp:*"):
-        r.delete(key)
-    r.close()
-    calls = []
-    real = departures.board
-
-    async def counted(*args, **kwargs):
-        calls.append(args[1])
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(departures, "board", counted)
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=60)
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        yield c, app.state.ctx, calls
-
-
-async def test_board_is_computed_once_and_revalidates(cached_api, sql):
-    api, _, calls = cached_api
+async def test_polls_revalidate_without_a_response_cache(api, sql):
+    """Nothing is cached: every request computes, the ETag (the body's hash) gives polling clients a 304."""
     url = f"/stops/{group_id(sql, '802')}/departures"
     first = await api.get(url)
     second = await api.get(url)
-    assert first.status_code == second.status_code == 200 and len(calls) == 1
+    assert first.status_code == second.status_code == 200
     assert first.content == second.content and first.headers["etag"] == second.headers["etag"]
     assert first.headers["cache-control"] == "no-cache"
     again = await api.get(url, headers={"If-None-Match": first.headers["etag"]})
-    assert again.status_code == 304 and len(calls) == 1
+    assert again.status_code == 304 and again.content == b"" and again.headers["etag"] == first.headers["etag"]
+    for path in (f"/stops?bbox={RONDO_BBOX}", "/stops/search?q=rondo", "/alerts"):
+        r = await api.get(path)
+        assert (await api.get(path, headers={"If-None-Match": r.headers["etag"]})).status_code == 304
+    r = redis.Redis.from_url(TEST_REDIS_URL)
+    assert list(r.scan_iter("api:*")) == []  # the API writes nothing to Redis
+    r.close()
 
 
-async def test_concurrent_misses_compute_once(cached_api, sql):
-    api, _, calls = cached_api
-    url = f"/stops/{group_id(sql, '802')}/departures?limit=7"
-    responses = await asyncio.gather(*(api.get(url) for _ in range(5)))
-    assert {r.status_code for r in responses} == {200} and len({r.content for r in responses}) == 1
-    assert len(calls) == 1
+async def test_map_stops_are_serialized_like_the_model(api):
+    """/stops joins precomputed JSON pieces: byte for byte what the model serializes to (so ETags stay the same)."""
+    from gtfs_backend.api.schemas import StopList
 
-
-async def test_cache_key(cached_api, sql):
-    api, ctx, calls = cached_api
-    url = f"/stops/{group_id(sql, '802')}/departures?limit=5"
-    await api.get(url + "&_=1")
-    await api.get(url + "&_=2")  # parameters the route doesn't declare don't count
-    assert len(calls) == 1
-    await api.get(url.replace("limit=5", "limit=6"))
-    assert len(calls) == 2
-    ctx.catalog.fingerprint = "other"  # another timetable version (import, new day)
-    await api.get(url)
-    assert len(calls) == 3
-
-
-async def test_errors_are_not_cached(cached_api):
-    api, _, calls = cached_api
-    assert (await api.get("/stops/nowhere-zzzzz/departures")).status_code == 404
-    assert (await api.get("/stops/nowhere-zzzzz/departures")).status_code == 404
-    assert len(calls) == 2
-
-
-async def test_cache_trouble_only_skips_the_cache(cached_api, sql, monkeypatch):
-    from redis.exceptions import ConnectionError as RedisConnectionError
-
-    api, ctx, calls = cached_api
-
-    async def broken(*args, **kwargs):
-        raise RedisConnectionError("down")
-
-    monkeypatch.setattr(ctx.redis, "get", broken)
-    monkeypatch.setattr(ctx.redis, "set", broken)
-    url = f"/stops/{group_id(sql, '802')}/departures"
-    assert (await api.get(url)).status_code == 200 and (await api.get(url)).status_code == 200
-    assert len(calls) == 2
-
-
-async def test_cache_off_with_ttl_zero(loaded, sql, monkeypatch):
-    from gtfs_backend.api.services import departures
-
-    calls = []
-    real = departures.board
-
-    async def counted(*args, **kwargs):
-        calls.append(1)
-        return await real(*args, **kwargs)
-
-    monkeypatch.setattr(departures, "board", counted)
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, cache_ttl_live=0)
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        url = f"/stops/{group_id(sql, '802')}/departures"
-        await c.get(url)
-        await c.get(url)
-    assert len(calls) == 2
+    for query in (f"bbox={CITY_BBOX}", f"bbox={CITY_BBOX}&kind=group", f"bbox={RONDO_BBOX}&modes=tram", "bbox=0,0,1,1"):
+        body = (await api.get(f"/stops?{query}")).content
+        assert body == StopList.model_validate_json(body).model_dump_json().encode(), query
 
 
 async def test_boards_and_trips_only_carry_current_alerts(api, sql):
@@ -880,7 +850,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
 @pytest.fixture
 async def api_no_raise(loaded):
     """Like `api`, but app exceptions become responses (as in production) instead of reaching the test."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, **NO_CACHE)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     transport = ASGITransport(app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app), AsyncClient(transport=transport, base_url="http://test/api/v1") as c:
@@ -904,3 +874,131 @@ async def test_unexpected_errors_keep_the_error_body(api_no_raise, monkeypatch):
     r = await api_no_raise.get("/trips/kmk_t:20261025:x")
     assert r.status_code == 503 and r.headers["retry-after"] == "1"
     assert r.json()["error"]["code"] == "unavailable" and "10.0.0.5" not in r.text
+
+
+# ------------------------------------------------------------------------------------------------- catalog, timing
+
+
+@pytest.fixture
+async def api_ctx(loaded):
+    """Like `api`, with the app's context."""
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        yield c, app.state.ctx
+
+
+def server_timing(response) -> dict[str, dict[str, str]]:
+    """`db;dur=1.2;desc="3 queries", total;dur=4.0` -> {"db": {"dur": "1.2", "desc": "3 queries"}, "total": {...}}"""
+    out = {}
+    for metric in response.headers["server-timing"].split(", "):
+        name, *params = metric.split(";")
+        out[name] = {k: v.strip('"') for k, v in (p.split("=", 1) for p in params)}
+    return out
+
+
+async def test_server_timing(api_ctx, sql):
+    api, _ = api_ctx
+    r = await api.get(f"/stops/{group_id(sql, '802')}/departures")
+    timing = server_timing(r)
+    assert set(timing) == {"db", "db-wait", "redis", "serialize", "total"}
+    assert int(timing["db"]["desc"].split()[0]) > 0 and int(timing["redis"]["desc"].split()[0]) > 0
+    assert all(float(m["dur"]) >= 0 for m in timing.values())
+    assert float(timing["total"]["dur"]) >= float(timing["serialize"]["dur"])
+    # an answer without the database: none counted, and nothing left over from the request before
+    timing = server_timing(await api.get(f"/vehicles?bbox={CITY_BBOX}"))
+    assert timing["db"]["desc"] == "0 queries" and timing["redis"]["desc"] != "0 calls"
+
+
+async def test_server_timing_off(loaded):
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, server_timing=False)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        assert "server-timing" not in (await c.get(f"/vehicles?bbox={CITY_BBOX}")).headers
+
+
+async def test_catalog_refreshes_in_the_background(api_ctx, sql, monkeypatch):
+    api, ctx = api_ctx
+    catalog = ctx.catalog
+    url = f"/stops/{group_id(sql, '802')}/departures"
+    await api.get(url)  # loads the routes it shows
+    feeds, routes = catalog.feeds, dict(catalog._routes)
+    assert routes
+
+    # the refresh waits for its connection until released; requests don't wait for the refresh
+    release = asyncio.Event()
+    real_getconn = catalog.pool.getconn
+
+    async def getconn(timeout=None):
+        if asyncio.current_task() is catalog._refresh:
+            await release.wait()
+        return await real_getconn(timeout)
+
+    monkeypatch.setattr(catalog.pool, "getconn", getconn)
+    catalog.invalidate()  # as on `static:updated`
+    assert (await api.get(url)).status_code == 200
+    assert catalog.feeds is feeds and not catalog._refresh.done()
+    catalog.invalidate()  # another import while the refresh runs
+    release.set()
+    await catalog._refresh
+    assert catalog.feeds is not feeds  # reloaded
+    assert all(catalog._routes[v] is r for v, r in routes.items())  # the versions are still ready: routes kept
+    assert catalog._stale(catalog.clock())  # the second invalidation isn't lost: the next request refreshes again
+    assert (await api.get(url)).status_code == 200
+    await catalog._refresh
+    assert not catalog._stale(catalog.clock())
+
+
+async def test_catalog_refresh_failure_keeps_serving(api_ctx, sql, monkeypatch):
+    api, ctx = api_ctx
+    catalog = ctx.catalog
+    feeds = catalog.feeds
+
+    async def broken(now):
+        raise psycopg.OperationalError("down")
+
+    monkeypatch.setattr(catalog, "_load", broken)
+    catalog.invalidate()
+    url = f"/stops/{group_id(sql, '802')}/departures"
+    assert (await api.get(url)).status_code == 200
+    await catalog._refresh
+    assert catalog.feeds is feeds
+    failed = catalog._refresh
+    assert (await api.get(url)).status_code == 200
+    assert catalog._refresh is failed  # not retried at once (RETRY_S)
+
+
+async def test_catalog_days_need_no_query(api_ctx, monkeypatch):
+    from gtfs_backend.api.data.catalog import PRELOAD_DAYS
+
+    _, ctx = api_ctx
+    catalog = ctx.catalog
+    queries = []
+    real_getconn = catalog.pool.getconn
+
+    async def getconn(timeout=None):
+        queries.append(1)
+        return await real_getconn(timeout)
+
+    monkeypatch.setattr(catalog.pool, "getconn", getconn)
+    today = catalog.today("kmk_t")
+    days = [await catalog.day("kmk_t", today + timedelta(days=i)) for i in range(-1, PRELOAD_DAYS + 1)]
+    assert queries == [] and days[1] is not None and days[1].date == today
+    far = today + timedelta(days=60)
+    assert await catalog.day("kmk_t", far) is not None
+    assert len(queries) == 1  # outside the preloaded days: one indexed lookup
+
+
+async def test_trip_live_reads_postgres_and_redis_at_once(api_ctx, monkeypatch):
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    api, ctx = api_ctx
+    v = (await api.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"][0]
+    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 200
+
+    async def down(*args, **kwargs):
+        raise RedisConnectionError("down")
+
+    monkeypatch.setattr(ctx.redis, "mget", down)
+    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 503
+    assert (await api.get("/trips/kmk_t:20261025:nope/live")).status_code == 404  # a missing trip still is a 404

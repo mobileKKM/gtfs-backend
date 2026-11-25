@@ -21,10 +21,12 @@ class ApiSettings(Settings):
     catalog_refresh_interval: float = Field(default=300, gt=0)  # also reloaded on `static:updated` and day change
     static_listener_retry_delay: float = Field(default=5, gt=0)
 
-    # Responses shared by all API processes through Redis (api/cache.py), also sent as Cache-Control max-age where
-    # the response is public; 0 turns the shared cache off.
-    cache_ttl_live: int = Field(default=3, ge=0)  # boards and trips: below ZTP's ~5 s update rate
-    cache_ttl_static: int = Field(default=300, ge=0)  # stops, route shapes
+    # `Server-Timing` header on every response: time in Postgres, Redis, serializing (api/timing.py)
+    server_timing: bool = True
+
+    # Cache-Control max-age of public responses, for clients and proxies (the API caches nothing; live ones are
+    # no-cache): stops, search, trips, route shapes / alerts
+    cache_ttl_static: int = Field(default=300, ge=0)
     cache_ttl_alerts: int = Field(default=15, ge=0)
 
     # /health `fresh`: realtime data older than this (or a feed's larger realtime_max_age) is stale; a static

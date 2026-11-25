@@ -56,7 +56,7 @@ src/gtfs_backend/
     realtime/ poller (one task per file) -> normalize -> store (Redis)
              runtime.py: per feed, the trip index (trip_index.py) and recent delays/fixes;
              normalize: resolve.py (trip_id -> timetable trip), trip_updates.py, vehicles.py, alerts.py
-  api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog cache, Redis, SQL/geo)
+  api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog + stops in memory, Redis, SQL/geo)
 ```
 
 Shared modules import neither `worker` nor `api`, and those don't import each other; `tests/test_boundaries.py`
@@ -73,6 +73,11 @@ Static imports are CPU-heavy and run in a separate process.
   (`gtfs.stop_times__kmk_t__v3`). Real Postgres types (`interval` for times, so `25:10:00` survives). An
   **integrity check** compares stored values with the raw CSV after every import; any difference fails it. ZTP's
   non-standard `blocks.txt` is kept as `gtfs.blocks`.
+- **Derived at import**: `core.service_date` (calendar expanded), `core.shape_line`, `core.stop_direction` (where
+  trips go next) and `core.stop_departure`: every stop time a board can show (pickup allowed, not the trip's last
+  stop), with its route and headsign, indexed by (stop, service, time), so a board reads one index range per stop
+  and day with no joins. It is partitioned per version like `gtfs.*` (`core.stop_departure__kmk_t__v3`) and
+  dropped with it (about 60 % of the size of `stop_times`).
 - **Versions**: every new zip is a `core.feed_version`, imported in one transaction, numbered per feed (never
   reused) and joined via `feed_version_id` (`kmk_t_v3`). Find the newest by `version`, not by id (`kmk_t_v10` sorts
   before `kmk_t_v9` as text). For each service date the newest ready version with service that day is
@@ -109,11 +114,12 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
 | `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop; removed when the vehicle leaves the feed (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times; removed when the trip leaves the feed |
+| `rt:tripstate:{feed_id}` | hash: trip key → `[version, canceled, vehicle_id, timestamp]` of every trip in `rt:trip` (TTL `TRIP_TTL`) |
+| `rt:stop:{feed_id}:{public_stop_id}` | hash: `{stop_sequence}\|{trip key}` → `[predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure]`: the trips' rows of `rt:trip` at this stop, so a board reads its stops, not whole trips. Written with `rt:trip` (only changed fields); only valid for trips in `rt:tripstate` with the same version; rewritten in full when the worker starts or finds `rt:tripstate` gone |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
 | pub/sub `rt:updated`, `static:updated` | change notifications |
-| `api:resp:{hash}` | the API's response cache |
 
 Rules:
 
@@ -176,7 +182,7 @@ of the request, so their ETag only changes with the data.
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_key` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
 | `GET /stops/{stop_key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
-| `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (cached like stops) |
+| `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (`Cache-Control` like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
@@ -187,13 +193,16 @@ unknown things, 422 malformed keys/dates/boxes/times, unknown feeds, 503 `unavai
 busy or a store is down, 500 `internal` without details.
 
 **Several processes.** `API_WORKERS` processes share one port, each with bounded pools (`DB_POOL_MAX_SIZE`,
-`REDIS_POOL_MAX_SIZE`) and its own catalog copy, reloaded on `static:updated`. `DB_POOL_MAX_SIZE` is the same for the
+`REDIS_POOL_MAX_SIZE`) and its own catalog copy (feed versions of yesterday to a week ahead, routes, and all stops,
+stop groups and today's directions, so boards, the map, search and alerts look up stops without Postgres), loaded
+before the first request and refreshed in the background on `static:updated`, a new day and every
+`CATALOG_REFRESH_INTERVAL` while requests keep using the loaded one. `DB_POOL_MAX_SIZE` is the same for the
 worker and every API process: keep `(API_WORKERS + 1) × DB_POOL_MAX_SIZE` below Postgres' `max_connections` (100).
 
-**Response cache.** Boards and live trips (`CACHE_TTL_LIVE`, 3 s), search, trips and shapes (`CACHE_TTL_STATIC`, 300 s) and
-alerts (`CACHE_TTL_ALERTS`, 15 s) are cached in Redis for all processes, so clients share bodies and ETags and
-polling gets 304s. Keys include the loaded versions; only declared query parameters count; errors aren't cached.
-`/vehicles` and `/stops` bbox queries aren't cached.
+**No response cache.** Every response is computed when asked for (a departure board takes about 4 ms, p95 6 ms, on
+a laptop with the full ZTP timetables; `Server-Timing` shows it in production), so live data is as fresh as Redis.
+The ETag is the body's hash: polling clients get a 304 while nothing changed. Public responses carry `Cache-Control: public, max-age=…` for clients and proxies:
+`CACHE_TTL_STATIC` (300 s: stops, search, trips, shapes) and `CACHE_TTL_ALERTS` (15 s).
 
 **Privacy.** No accounts, cookies, identifiers or client addresses; requests aren't logged (uvicorn's access log is
 off) and `X-Forwarded-For` is ignored. A reverse proxy or CDN in front should do the same (no IPs or query strings
@@ -205,14 +214,19 @@ Notes:
   headsigns, most served first; under 5 % of trips are left out. Precomputed per version (`core.stop_direction`).
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
-  delayed departures stay. Predictions are used only for the same version. `status`: `scheduled`, `live`,
+  delayed departures stay. The timetable comes from `core.stop_departure`, realtime from `rt:tripstate` and the
+  board's `rt:stop:*` hashes (one pipelined call). Predictions are used only for the same version. `status`: `scheduled`, `live`,
   `departed`, `canceled`, `skipped`; `time` is the estimate if known. `departed` is when the vehicle reports a later
   stop of the trip (VehiclePosition `current_stop_sequence`), else when the time is past; a TripUpdate not listing a
   stop doesn't count as passing it. `vehicle_state` (`at_stop`, `arriving`) is set when the vehicle reports this stop. Last stops and stops without pickup are not
   departures; `on_demand` marks GTFS pickup type 2/3.
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
   show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
-  (tell them apart by `trip_key` + `stop_sequence`). The window widens (2 h, 6 h, 24 h) until a page is full.
+  (tell them apart by `trip_key` + `stop_sequence`). The first window is where the stop's hourly departures
+  (today's timetables, counted once a day) expect 1.5 pages, so a board needs one query; if that isn't enough
+  (filters, another day's timetable) it widens through 2 h, 6 h and 24 h, each step reading only the time it adds. A
+  page is full unless a trip scheduled past the window is predicted before its last departure (feeds allow any
+  amount early; the board finds such trips in its stops' `rt:stop:*` hashes).
 - **Filters**: `feeds` (feed ids) and `routes` (route names, `RouteRef.name`), comma separated or repeated; they
   narrow the board and its alerts, and an unknown feed is a 422. The board lists `routes`, every route departing from
   the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish
@@ -233,7 +247,10 @@ Notes:
   failed last import, static not checked for `HEALTH_STATIC_MAX_AGE` (3 h), or a realtime file not polled, failing
   (5 polls) or older than `HEALTH_REALTIME_MAX_AGE` (5 min; a larger `realtime_max_age` wins). Alerts files are
   exempt from the age check.
-- Responses carry `ETag` and `Cache-Control` (static data 5 min, alerts 15 s); bodies over 1 kB are gzipped.
+- Responses carry `ETag` and `Cache-Control` (static data 5 min, alerts 15 s); bodies over 1 kB are gzipped (level 6).
+- **`Server-Timing`** on every response (`SERVER_TIMING`, on by default) says where the time went: `db` (queries),
+  `db-wait` (waiting for a pooled connection), `redis` (commands; a pipeline is one), `serialize` and `total`;
+  browser dev tools show it. Concurrent work adds up, so the parts can exceed `total`.
 - Queries name one feed version per block: joining `feed_version_id` across tables defeats partition pruning
   (a 20 ms board became 1.5 s).
 

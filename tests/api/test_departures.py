@@ -2,26 +2,42 @@
 
 from datetime import date
 
-from gtfs_backend.api.services.departures import GRACE_S, Row, Scheduled, overlay, select, vehicle_state
+from gtfs_backend import keys
+from gtfs_backend.api.data.realtime import BoardRealtime, TripUpdate
+from gtfs_backend.api.services.departures import (
+    GRACE_S,
+    WINDOWS_S,
+    Row,
+    Scheduled,
+    expected_span,
+    overlay,
+    select,
+    vehicle_state,
+)
 from gtfs_backend.api.services.vehicles import stop_state
 
 NOW = 1_800_000_000
 
 
 def sched(trip="t1", seq=5, dep=NOW + 600, version=1) -> Scheduled:
-    return Scheduled("kmk_t", "kmk_t_v1", version, date(2027, 1, 15), trip, seq, "plat1", dep, "Bardosa", "r1")
+    day = date(2027, 1, 15)
+    key = keys.trip_key("kmk_t", day, trip)
+    return Scheduled("kmk_t", "kmk_t_v1", version, day, trip, seq, "plat1", dep, "Bardosa", "r1", False, key)
 
 
-def rt(*rows, version=1, relationship="SCHEDULED", vehicle="704") -> dict:
+def rt(*rows, version=1, relationship="SCHEDULED", vehicle="704") -> TripUpdate:
     """rows: (stop_sequence, predicted_departure, delay_s, extra)"""
-    return {
-        "version": version,
-        "vehicle_id": vehicle,
-        "schedule_relationship": relationship,
-        "stops": [
-            {"stop_sequence": q, "predicted_departure": p, "predicted_arrival": None, "delay_s": d, **x} for q, p, d, x in rows
-        ],
-    }
+    return TripUpdate(
+        {
+            "version": version,
+            "vehicle_id": vehicle,
+            "schedule_relationship": relationship,
+            "stops": [
+                {"stop_sequence": q, "predicted_departure": p, "predicted_arrival": None, "delay_s": d, **x}
+                for q, p, d, x in rows
+            ],
+        }
+    )
 
 
 def test_no_update_is_scheduled_only():
@@ -40,8 +56,7 @@ def test_prediction_for_the_stop():
 
 
 def test_arrival_only_prediction_is_used():
-    update = rt((5, None, 60, {}))
-    update["stops"][0]["predicted_arrival"] = NOW + 660
+    update = rt((5, None, 60, {"predicted_arrival": NOW + 660}))
     assert overlay(sched(), update, NOW).estimated == NOW + 660
 
 
@@ -154,3 +169,64 @@ def test_status_needs_the_stop_sequence():
     assert stop_state({"current_status": "STOPPED_AT"}) == (None, None)
     assert stop_state({"current_stop_sequence": 5}) == (5, None)
     assert stop_state({}) == (None, None)
+
+
+# ------------------------------------------------------------------------------------------------- first window
+
+
+def test_expected_span_busy_stop():
+    """60 an hour: 1.5 pages of 20 within 30 min."""
+    assert expected_span((60,) * 24, 8 * 3600, 20) == 30 * 60
+
+
+def test_expected_span_reads_across_hours_and_midnight():
+    hourly = [0] * 24
+    hourly[23], hourly[5] = 10, 30  # 10 at 23:00, nothing at night, 30 from 05:00
+    # from 23:30: 5 left before midnight, the other 25 of 30 by 05:50
+    assert expected_span(tuple(hourly), 23 * 3600 + 1800, 20) == 6 * 3600 + 1200
+
+
+def test_expected_span_without_departures_reads_a_day():
+    assert expected_span((0,) * 24, 12 * 3600, 20) == WINDOWS_S[-1]
+    few = (1,) * 24
+    assert expected_span(few, 0, 20) == WINDOWS_S[-1]  # 24 a day: 30 aren't expected within it
+
+
+def test_board_realtime_ignores_predictions_of_another_version():
+    """A board can read a trip's state and its predictions from different updates (neither write nor read is atomic):
+    after a timetable change, predictions of the old version have other stop sequences."""
+    key = "kmk_t:20261025:a"
+    states = {"kmk_t": {key: "[2,false,null,1000]"}}
+    stops = [{f"1|{key}": "[null,50,60,false,1,-10]", f"2|{key}": "[null,60,60,false,2,0]"}]
+    state = BoardRealtime(states, stops).state(key)
+    assert state.version == 2 and state.stop(1) is None
+    assert state.stop(2).predicted == 60 and state.stop(2).delay_s == 60
+
+
+def test_board_realtime_finds_trips_running_early():
+    """Trips scheduled to depart after a time but predicted before the page ends: of the state's version, from
+    `since` on. By the scheduled departure, which boards read their rows by."""
+    early, other_version, last_stop = "kmk_t:20261025:early", "kmk_t:20261025:v1", "kmk_t:20261025:end"
+    states = {"kmk_t": {k: "[2,false,null,1000]" for k in (early, other_version, last_stop)}}
+    stops = [
+        {
+            f"3|{early}": "[null,1600,-1100,false,2,2700]",  # departs at 2700, 1100 s early
+            f"3|{other_version}": "[null,1500,-1200,false,1,2700]",
+            f"9|{last_stop}": "[1400,null,-1000,false,2,null]",  # no departure: never on a board
+        }
+    ]
+    rt = BoardRealtime(states, stops)
+    assert rt.earliest_early(after=1800, since=0) == 1600
+    assert rt.earliest_early(after=2700, since=0) is None  # its row is read
+    assert rt.earliest_early(after=1800, since=1700) is None  # before the board starts
+
+
+def test_board_realtime_finds_arrival_only_predictions_by_the_scheduled_departure():
+    """An arrival-only prediction's delay is against the scheduled arrival: predicted - delay_s would be the arrival
+    (+29 min), inside a 30 min window, though the row is read by its departure (+31 min), outside it."""
+    key = "kmk_t:20261025:dwell"
+    arrival, departure = 29 * 60, 31 * 60
+    predicted = 16 * 60
+    stops = [{f"4|{key}": f"[{predicted},null,{predicted - arrival},false,1,{departure}]"}]
+    rt = BoardRealtime({"kmk_t": {key: "[1,false,null,1000]"}}, stops)
+    assert rt.earliest_early(after=30 * 60, since=0) == predicted

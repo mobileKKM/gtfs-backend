@@ -28,6 +28,43 @@ def _dumps(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _int_json(value: int | None) -> str:
+    return "null" if value is None else str(int(value))
+
+
+def _prediction_json(p: live_layout.StopPrediction) -> str:
+    """json.dumps of a StopPrediction (ints, None, a bool), written directly: thousands per poll, a third of the
+    write's time with json.dumps."""
+    arrival, departure, delay, skipped, version, scheduled = p
+    flag = "true" if skipped else "false"
+    times = f"{_int_json(arrival)},{_int_json(departure)},{_int_json(delay)}"
+    return f"[{times},{flag},{_int_json(version)},{_int_json(scheduled)}]"
+
+
+def _departure_index(trips: dict[str, LiveTrip]) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """rt:tripstate and rt:stop:* contents of a feed's trips: (trip key -> state, public_stop_id -> field -> prediction)."""
+    states = {key: _dumps(live_layout.trip_state(trip)) for key, trip in trips.items()}
+    stops: dict[str, dict[str, str]] = {}
+    for key, trip in trips.items():
+        for row in trip["stops"]:
+            if (pid := row["public_stop_id"]) is not None:
+                field = live_layout.stop_prediction_field(row["stop_sequence"], key)
+                stops.setdefault(pid, {})[field] = _prediction_json(live_layout.stop_prediction(row, trip["version"]))
+    return states, stops
+
+
+def _write_hash(pipe, key: str, last: dict[str, str], new: dict[str, str], *, full: bool = False) -> None:
+    """Make the hash at `key` (last written as `last`) hold `new`: only changed fields are sent, or all (`full`)."""
+    if not new:
+        if last:
+            pipe.delete(key)
+        return
+    if changed := (new if full else {f: v for f, v in new.items() if last.get(f) != v}):
+        pipe.hset(key, mapping=changed)
+    if gone := last.keys() - new.keys():
+        pipe.hdel(key, *gone)
+
+
 class RealtimeStore:
     def __init__(self, redis: Redis, feed_ids: list[str], ttls: TTLs):
         self.redis = redis
@@ -38,6 +75,10 @@ class RealtimeStore:
         self._trips: dict[str, dict[str, LiveTrip]] = {}
         self._trip_keys: dict[str, set[str]] = {}  # the trip keys in Redis (incl. ones written before a restart)
         self._vehicle_keys: dict[str, set[str]] = {}
+        # per feed_id, the departure index as last written (rt:tripstate, rt:stop:*), so a write sends only changes.
+        # Missing: unknown (after a start or a failed write), cleared and written in full next time.
+        self._states: dict[str, dict[str, str]] = {}  # trip key -> TripState JSON
+        self._stop_fields: dict[str, dict[str, dict[str, str]]] = {}  # public_stop_id -> field -> StopPrediction JSON
 
     async def write_vehicles(self, feed_id: str, res: Result) -> None:
         geo_key = live_layout.vehicles_geo(feed_id)
@@ -87,6 +128,15 @@ class RealtimeStore:
         # the feed drops stops it is past: their last times are kept from the previous update
         last = self._trips[feed_id]
         merged = {trip["key"]: merge_stops(last.get(trip["key"]), trip) for trip in res.trips}
+        states, stop_fields = _departure_index(merged)
+        state_key = live_layout.trip_states(feed_id)
+        # rt:tripstate gone although written (it expired in an outage or with a file older than its TTL, or Redis lost
+        # its data): the rt:stop hashes may be gone too, so the index is rewritten as after a start
+        if self._states.get(feed_id) and not await self.redis.exists(state_key):
+            self._states.pop(feed_id)
+            self._stop_fields.pop(feed_id, None)
+        known = feed_id in self._states
+        old_index = [] if known else await self._stored_index_keys(feed_id)
         # no MULTI: readers want each trip whole, not all of them at once, and a transaction would hold them back
         # for the whole write (MBs for the big feeds)
         pipe = self.redis.pipeline(transaction=False)
@@ -95,9 +145,33 @@ class RealtimeStore:
         # FULL_DATASET: trips missing from this update are gone
         if stale := self._trip_keys[feed_id] - current:
             pipe.delete(*(live_layout.trip(key) for key in stale))
-        await pipe.execute()
+        if old_index:
+            pipe.delete(*old_index)
+        # trip states first: a board ignores predictions of trips without one. All of them, not only changed ones:
+        # a few hundred, and the hash can expire after the check above (a canceled trip's state can stay the same for
+        # hours, and would be missing until it changed)
+        _write_hash(pipe, state_key, self._states.get(feed_id, {}), states, full=True)
+        pipe.expire(state_key, self.ttls.trip)
+        last = self._stop_fields.get(feed_id, {})
+        for pid in last.keys() | stop_fields.keys():
+            _write_hash(pipe, live_layout.stop_predictions(feed_id, pid), last.get(pid, {}), stop_fields.get(pid, {}))
+        try:
+            await pipe.execute()
+        except BaseException:
+            # some commands may have run: diffing against the last good write could miss them, so start over
+            self._states.pop(feed_id, None)
+            self._stop_fields.pop(feed_id, None)
+            raise
         # only once written: a failed write is retried with the same update (the poller doesn't mark it as seen)
         self._trip_keys[feed_id], self._trips[feed_id] = current, merged
+        self._states[feed_id], self._stop_fields[feed_id] = states, stop_fields
+
+    async def _stored_index_keys(self, feed_id: str) -> list[str]:
+        """The departure index of this feed in Redis, as written before a restart (or a failed write)."""
+        keys = [live_layout.trip_states(feed_id)]
+        async for key in self.redis.scan_iter(match=live_layout.stop_predictions(feed_id, "*"), count=1000):
+            keys.append(key.decode() if isinstance(key, bytes) else key)
+        return keys
 
     async def write_alerts(self, feed_id: str, res: Result) -> None:
         await self.redis.set(live_layout.alerts(feed_id), _dumps(res.alerts), ex=self.ttls.alert)
@@ -122,6 +196,7 @@ class RealtimeStore:
         if kind.carries(RealtimeKind.TRIP_UPDATES):
             for key in self._trip_keys.get(feed_id, set()):
                 pipe.expire(live_layout.trip(key), self.ttls.trip)
+            pipe.expire(live_layout.trip_states(feed_id), self.ttls.trip)
         if kind.carries(RealtimeKind.SERVICE_ALERTS):
             pipe.expire(live_layout.alerts(feed_id), self.ttls.alert)
         await pipe.execute()

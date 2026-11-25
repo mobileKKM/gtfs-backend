@@ -153,7 +153,7 @@ class BoardRealtime:
         state = TripState(*json.loads(value)) if value else None
         if state is not None:
             for sequence, prediction in self._predictions.get(trip_key, []):
-                arrival, departure, delay, skipped, version = json.loads(prediction)
+                arrival, departure, delay, skipped, version, _ = json.loads(prediction)
                 if version == state.version:  # else of another update than the state, with other stop sequences
                     state._stops[sequence] = StopUpdate(arrival, departure, delay, skipped)
         self._decoded[trip_key] = state
@@ -170,9 +170,10 @@ class BoardRealtime:
             self._timed = []
             for key, rows in self._predictions.items():
                 for _, value in rows:
-                    arrival, departure, delay, _, version = json.loads(value)
-                    if (predicted := departure or arrival) is not None and delay is not None:
-                        self._timed.append((predicted - delay, predicted, key, version))
+                    arrival, departure, _, _, version, scheduled = json.loads(value)
+                    # no scheduled departure: not a departure (a trip's last stop), never on a board
+                    if (predicted := departure or arrival) is not None and scheduled is not None:
+                        self._timed.append((scheduled, predicted, key, version))
         early = [
             predicted
             for scheduled, predicted, key, version in self._timed

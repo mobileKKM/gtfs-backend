@@ -30,6 +30,7 @@ def trip(key, *stops, version=1, vehicle="V1", relationship="SCHEDULED"):
                 "public_stop_id": pid,
                 "predicted_departure": t,
                 "predicted_arrival": None,
+                "scheduled_departure": t - 60,
                 "delay_s": 60,
                 "schedule_relationship": "SCHEDULED",
             }
@@ -88,9 +89,9 @@ async def test_trips_mirror_the_latest_update(redis_url):
     # the departure index: every trip's state, and at each stop its trips' rows (the dropped stop pa included)
     assert await departure_index(r, "kmk_t") == (
         {"kmk_t:a:20261025": [1, False, "V1", 1000]},
-        {"pa": {"1|kmk_t:a:20261025": [None, 1, 60, False, 1]}, "pb": {"2|kmk_t:a:20261025": [None, 3, 60, False, 1]}},
+        {"pa": {"1|kmk_t:a:20261025": [None, 1, 60, False, 1, -59]}, "pb": {"2|kmk_t:a:20261025": [None, 3, 60, False, 1, -57]}},
     )
-    assert (await departure_index(r, "kmk_a"))[1] == {"pc": {"1|kmk_a:a:20261025": [None, 1, 60, False, 1]}}
+    assert (await departure_index(r, "kmk_a"))[1] == {"pc": {"1|kmk_a:a:20261025": [None, 1, 60, False, 1, -59]}}
     await r.aclose()
 
 
@@ -104,12 +105,12 @@ async def test_the_departure_index_follows_the_trips(redis_url):
     states, stops = await departure_index(r, "kmk_t")
     assert states == {a: [1, False, "V1", 1000], b: [1, True, "V1", 1000]}
     assert stops == {
-        "pa": {f"1|{a}": [None, 10, 60, False, 1]},
-        "pb": {f"2|{a}": [None, 25, 60, False, 1], f"1|{b}": [None, 30, 60, False, 1]},
+        "pa": {f"1|{a}": [None, 10, 60, False, 1, -50]},
+        "pb": {f"2|{a}": [None, 25, 60, False, 1, -35], f"1|{b}": [None, 30, 60, False, 1, -30]},
     }
     # b left the feed; a new version of a: a whole new set of rows
     await store.write_trips("kmk_t", Result(trips=[trip(a, (5, "pc", 50), version=2)]))
-    assert await departure_index(r, "kmk_t") == ({a: [2, False, "V1", 1000]}, {"pc": {f"5|{a}": [None, 50, 60, False, 2]}})
+    assert await departure_index(r, "kmk_t") == ({a: [2, False, "V1", 1000]}, {"pc": {f"5|{a}": [None, 50, 60, False, 2, -10]}})
     await store.write_trips("kmk_t", Result())  # nothing running
     assert await departure_index(r, "kmk_t") == ({}, {})
     await r.aclose()
@@ -126,7 +127,7 @@ async def test_the_departure_index_is_rewritten_after_a_restart(redis_url):
     await after.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:on", (1, "pb", 3))]))
     assert await departure_index(r, "kmk_t") == (
         {"kmk_t:20261025:on": [1, False, "V1", 1000]},
-        {"pb": {"1|kmk_t:20261025:on": [None, 3, 60, False, 1]}},
+        {"pb": {"1|kmk_t:20261025:on": [None, 3, 60, False, 1, -57]}},
     )
     assert await r.exists("rt:stop:kmk_a:pa") == 1  # other feeds are theirs to clean
     await r.aclose()
@@ -239,7 +240,7 @@ async def test_a_failed_trip_write_is_merged_again_from_the_last_written_one(red
     assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3)]
     # the index too, although the failed write may have changed part of it
     assert (await departure_index(r, "kmk_t"))[1] == {
-        "pa": {"1|kmk_t:20261025:a": [None, 1, 60, False, 1]},
-        "pb": {"2|kmk_t:20261025:a": [None, 3, 60, False, 1]},
+        "pa": {"1|kmk_t:20261025:a": [None, 1, 60, False, 1, -59]},
+        "pb": {"2|kmk_t:20261025:a": [None, 3, 60, False, 1, -57]},
     }
     await r.aclose()

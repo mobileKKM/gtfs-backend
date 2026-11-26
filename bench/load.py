@@ -177,6 +177,7 @@ def cmd_run(args) -> None:
             [
                 sys.executable, str(ROOT / "bench" / "loadgen.py"), "--base", API,
                 "--clients", str(args.clients), "--ramp", str(args.ramp), "--duration", str(args.duration),
+                "--mode", args.mode, "--clock-offset", f"{offset:.3f}",
                 "--out", str(out / "load.json"),
             ],
             stdout=(out / "load.log").open("w"),
@@ -194,6 +195,7 @@ def cmd_run(args) -> None:
         (out / "health.json").write_bytes(get(f"{API}/health"))
         resources = {
             "api_workers": args.workers,
+            "mode": args.mode,
             "api_cpu_percent_mean": round(sum(c for c, _ in samples) / max(len(samples), 1), 1),
             "api_cpu_percent_max": max((c for c, _ in samples), default=0),
             "api_rss_mb_max": round(max((r for _, r in samples), default=0) / 1024, 1),
@@ -227,6 +229,7 @@ def main() -> None:
     p.add_argument("--ramp", type=float, default=60, help="seconds over which clients start")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--warmup", type=float, default=30)
+    p.add_argument("--mode", choices=("rest", "ws"), default="rest", help="clients poll REST, or get it pushed (WebSocket)")
     args = parser.parse_args()
     args.recording = args.recording.resolve()
     args.code = args.code.resolve()

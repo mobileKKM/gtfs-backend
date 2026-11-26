@@ -214,6 +214,7 @@ of the request, so their ETag only changes with the data.
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
+| `GET /ws` (WebSocket) | push instead of polling: `{"op": "subscribe" \| "unsubscribe", "topics": [...]}`; `tile:{z}/{x}/{y}` (z 10–16: vehicles, updates as `upsert`/`remove`), `stop:{key}` (the board), `trip:{key}` (its live state); a `snapshot` (the REST body) on subscribe, then `update`s |
 | `GET /metrics[?window=300]` | p50/p90/p99 per endpoint (route template, all API processes) and each realtime file's data age (now minus its feed header timestamp), over the last `window` seconds (60–3600) |
 
 **Errors**: `{"error": {"code": "not_found" | "invalid_input" | "method_not_allowed" | …, "message": "…"}}`: 404
@@ -267,6 +268,16 @@ Notes:
   trip; its `stop_sequence` and `status` (where the feed reports them) say which stop it is at or heading to.
 - **Polling**: live responses are `no-cache`; clients refetch the open view about every 10 s with `If-None-Match`
   and stop in the background.
+- **Push** (`/ws`, `api/ws.py`): one WebSocket per client, JSON text messages (compressed with permessage-deflate). A
+  subscription gets a `snapshot`, the body the REST endpoint would return; then every change the process's live state
+  applies marks the topics it touches (a vehicle's old and new tile, its trip and the boards of its stops; a trip's
+  boards and itself; alerts every board and trip), and every 15 s all of them. A marked topic is computed again at
+  most every second (boards every 2 s) and sent only if it changed: tiles as `{"timestamp", "upsert": [Vehicle],
+  "remove": [key]}`, boards and trips whole. Each message is serialized once and sent to every subscriber; a slow
+  connection keeps only the latest one per topic (a tile's whole snapshot rather than a second update). At most 50
+  topics per connection; errors come as `{"type": "error", "topic", "error": {"code", "message"}}`. A reverse proxy
+  needs to pass the upgrade (nginx: `proxy_http_version 1.1`, `Upgrade`/`Connection` headers, a `proxy_read_timeout`
+  above the 20 s ping interval).
 - **Alerts**: `cause`/`effect` are the GTFS-RT enums in lowercase (`construction`, `detour`), `severity` is `info`,
   `warning` or `severe`; unknown or unset is `null`. Each of `entities` is one place the alert applies, its fields
   combined with AND (GTFS-RT): `{route, stop}` is that line at that stop only, `{route, direction_id}` one direction,

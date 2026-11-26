@@ -1336,3 +1336,96 @@ async def test_vehicles_joined_from_pieces_are_the_models_json(api_ctx, monkeypa
     monkeypatch.setattr(vehicles, "models", counting)
     await c.get(f"/vehicles?bbox={CITY_BBOX}")
     assert built == []
+
+
+# ------------------------------------------------------------------------------------------------- WebSocket
+
+
+@pytest.fixture
+async def served(loaded):
+    """The app on a real port (uvicorn), for WebSocket clients: (ws url, http base url, app)."""
+    import uvicorn
+
+    settings = ApiSettings(
+        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
+    )
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on"))
+    task = asyncio.create_task(server.serve())
+    for _ in range(200):
+        if server.started:
+            break
+        await asyncio.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield f"ws://127.0.0.1:{port}/api/v1/ws", f"http://127.0.0.1:{port}/api/v1", app
+    server.should_exit = True
+    await task
+
+
+async def receive(ws, n, seconds=5.0):
+    out = []
+    for _ in range(n):
+        out.append(json.loads(await asyncio.wait_for(ws.recv(), seconds)))
+    return out
+
+
+async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served, sql):
+    from websockets.asyncio.client import connect
+
+    from gtfs_backend.api.ws import tile_bbox, tile_of
+
+    ws_url, http, _ = served
+    async with AsyncClient(base_url=http) as c:
+        v = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"][0]
+        z = 14
+        x, y = tile_of(v["lat"], v["lon"], z)
+        box = tile_bbox(z, x, y)
+        tile_rest = (await c.get(f"/vehicles?bbox={box.min_lon},{box.min_lat},{box.max_lon},{box.max_lat}")).json()
+        stop = group_id(sql, "802")
+        board_rest = (await c.get(f"/stops/{stop}/departures")).json()
+        trip_rest = (await c.get(f"/trips/{v['trip_key']}/live")).json()
+
+    topics = [f"tile:{z}/{x}/{y}", f"stop:{stop}", f"trip:{v['trip_key']}"]
+    async with connect(ws_url) as ws:
+        await ws.send(json.dumps({"op": "subscribe", "topics": topics + ["tile:3/0/0", "stop:nope-zzzzz", "bad"]}))
+        got = {m.get("topic"): m for m in await receive(ws, 6)}
+        assert got[topics[0]]["type"] == "snapshot" and got[topics[0]]["data"] == tile_rest
+        assert got[topics[1]]["data"] == board_rest and got[topics[2]]["data"] == trip_rest
+        assert got["tile:3/0/0"]["error"]["code"] == "invalid_input" and got["stop:nope-zzzzz"]["error"]["code"] == "not_found"
+        assert got["bad"]["type"] == "error"
+
+        # the worker reports the tram a few metres on: the tile gets it as an update
+        r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+        feed = feed_of(v)
+        members = await r.zrange(f"rt:veh:geo:{feed}", 0, -1)
+        originals = [json.loads(x) for x in await r.mget([f"rt:veh:{m}" for m in members])]
+        moved = [dict(o, lat=o["lat"] + 0.00005) if f"{feed}:{o['vehicle_id']}" == v["key"] else o for o in originals]
+        store = RealtimeStore(r, [feed], TTLS)
+        try:
+            from gtfs_backend.worker.realtime.normalize import Result
+
+            await store.write_vehicles(feed, Result(vehicles=originals))  # what the store last said: the originals
+            await store.publish(
+                feed, "vehicle_positions", NOW, {"vehicles": await store.write_vehicles(feed, Result(vehicles=moved))}
+            )
+            for _ in range(10):
+                (update,) = await receive(ws, 1)
+                if update["topic"] == topics[0]:
+                    break
+            assert update["type"] == "update" and update["data"]["remove"] == []
+            assert [u["key"] for u in update["data"]["upsert"]] == [v["key"]]
+            assert update["data"]["upsert"][0]["lat"] == round(v["lat"] + 0.00005, 5)
+        finally:
+            await store.write_vehicles(feed, Result(vehicles=originals))
+            await store.publish(
+                feed,
+                "vehicle_positions",
+                NOW,
+                {"vehicles": {"set": {f"{feed}:{o['vehicle_id']}": o for o in originals}, "del": []}},
+            )
+            await r.aclose()
+
+        await ws.send(json.dumps({"op": "unsubscribe", "topics": topics}))
+        await ws.send("not json")
+        (error,) = await receive(ws, 1)
+        assert error["type"] == "error" and error["topic"] is None

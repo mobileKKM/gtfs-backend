@@ -12,7 +12,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from redis.asyncio import BlockingConnectionPool, Redis
 
 from gtfs_backend import live_layout, metrics
-from gtfs_backend.api import errors
+from gtfs_backend.api import errors, ws
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog, Clock
 from gtfs_backend.api.data.live import LiveState
@@ -109,7 +109,10 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         live.start()
         if not await live.wait_ready(LIVE_WARMUP_S):  # requests before the first load get 503s
             log.warning("live_warmup_failed")
-        app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings, live)
+        app.state.ctx = ctx = Context(pool, redis, feeds_file, catalog, clock, settings, live)
+        app.state.hub = hub = ws.Hub(ctx)  # WebSocket push (api/ws.py), following the live state
+        live.listeners.append(hub.on_change)
+        hub.start()
         listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
         # a context of its own: flushing is no request's work (api/timing.py)
         flusher = asyncio.create_task(recorder.run(redis), context=contextvars.Context())
@@ -120,6 +123,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await hub.close()
             await live.close()
             await catalog.close()
             await redis.aclose()
@@ -145,4 +149,5 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
 
     for module in (vehicles, stops, trips, routes, alerts, health, metrics_router):
         app.include_router(module.router, responses=errors.ERROR_RESPONSES)
+    app.include_router(ws.router)
     return app

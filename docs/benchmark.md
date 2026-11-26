@@ -59,6 +59,10 @@ uv run python bench/load.py import bench/out/rec-peak     # the recording's time
 uv run python bench/load.py run bench/out/rec-peak --out bench/out/results/NAME   # 2,000 clients, 60 s ramp, 600 s
 ```
 
+`--mode ws` has the clients subscribe over the WebSocket instead of polling (the same views: a map box's z14 tiles,
+a board, a trip). Both modes sample, every second, how old the newest realtime data each client holds is
+(`data_age_s`, in replayed time): what polling adds to freshness and push saves.
+
 `--code PATH` runs another checkout's worker and API with the same load (a git worktree of the commit before a
 change: `git worktree add ../wt-before <commit>`). The load always comes from this checkout's `bench/loadgen.py`.
 

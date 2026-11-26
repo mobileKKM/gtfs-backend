@@ -1,5 +1,5 @@
-"""Departure boards: the timetable from Postgres (core.stop_departure) with realtime predictions from Redis
-(rt:tripstate, rt:stop:*: only the board's stops) laid over it.
+"""Departure boards: the timetable from the snapshot (api/data/timetable.py; Postgres' core.stop_departure for days it
+doesn't have) with realtime predictions from Redis (rt:tripstate, rt:stop:*: only the board's stops) laid over it.
 
 The timetable query covers every authoritative service day that can run in the window (a night trip of
 yesterday's service can still be running) and reaches back LOOKBACK_S so delayed trips stay on the board until
@@ -133,6 +133,36 @@ async def scheduled(
     return out
 
 
+async def timetable(
+    ctx: Context, days: list[Day], public_stop_ids: list[str], start: int, end: int, lookback: int = LOOKBACK_S
+) -> list[Scheduled]:
+    """scheduled(), from the snapshot when it has each of these days in the catalog's version, else from Postgres."""
+    tt = ctx.catalog.timetable
+    if tt is not None and (by_index := tt.days_for(days)) is not None:
+        # trip keys from one prefix per day (formatting the date for every row costs more than the rest of a row)
+        prefixes = {(d.feed_id, d.date): keys.trip_key(d.feed_id, d.date, "") for d in by_index.values()}
+        return [
+            Scheduled(
+                r.day.feed_id,
+                r.day.feed_version_id,
+                r.day.version,
+                r.day.date,
+                r.trip_id,
+                r.stop_sequence,
+                r.public_stop_id,
+                r.epoch,
+                r.headsign,
+                r.route_id,
+                r.on_demand,
+                prefixes[(r.day.feed_id, r.day.date)] + r.trip_id,
+            )
+            for r in tt.departures(by_index, public_stop_ids, start - lookback, end)
+        ]
+    # a connection only for the query: held across the Redis calls after it, boards would queue for the pool
+    async with ctx.pool.connection() as conn:
+        return await scheduled(conn, days, public_stop_ids, start, end, lookback)
+
+
 def runs(vehicle: dict | None, s: Scheduled) -> bool:
     """Whether the vehicle is on this trip (it may have moved on to the next one) in this timetable version."""
     return vehicle is not None and vehicle["trip"]["key"] == s.trip_key and vehicle["trip"]["version"] == s.version
@@ -228,9 +258,7 @@ async def _page(
         else:
             first, lookback = fetched_to + 1, 0
         days = [d for d in await ctx.catalog.days_between(first, hi) if not feeds or d.feed_id in feeds]
-        # a connection only for the query: held across the Redis calls below, boards would queue for the pool
-        async with ctx.pool.connection() as conn:
-            found = await scheduled(conn, days, pids, first, hi, lookback)
+        found = await timetable(ctx, days, pids, first, hi, lookback)
         fetched_to = hi
         refs |= await ctx.catalog.route_refs({(f.feed_version_id, f.route_id) for f in found})
         if route_names:

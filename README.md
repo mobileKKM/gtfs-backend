@@ -80,6 +80,14 @@ Static imports are CPU-heavy and run in a separate process.
   stop), with its route and headsign, indexed by (stop, service, time), so a board reads one index range per stop
   and day with no joins. It is partitioned per version like `gtfs.*` (`core.stop_departure__kmk_t__v3`) and
   dropped with it (about 60 % of the size of `stop_times`).
+- **Timetable snapshot** (`gtfs_backend/snapshot.py`, `SNAPSHOT_DIR`): what boards and trip views read instead of
+  Postgres. The worker builds it in its import process (a few seconds) after every import, before `static:updated`,
+  and on every new local day (`snapshot:updated`): each feed's authoritative version on yesterday, today and tomorrow,
+  their trips, stop times and shapes, and every departure (`core.stop_departure`) sorted by stop and time, as numpy
+  columns. A new generation folder is written and `current` switched to it in one rename; the API maps the columns
+  (`np.load`, mmap: one copy in the page cache for all its processes) and swaps the whole snapshot at once. A day is
+  used only while the snapshot has the version the API's catalog has for it; other dates (paging past tomorrow) and a
+  missing snapshot read Postgres as before.
 - **Versions**: every new zip is a `core.feed_version`, imported in one transaction, numbered per feed (never
   reused) and joined via `feed_version_id` (`kmk_t_v3`). Find the newest by `version`, not by id (`kmk_t_v10` sorts
   before `kmk_t_v9` as text). For each service date the newest ready version with service that day is
@@ -192,10 +200,11 @@ of the request, so their ETag only changes with the data.
 | `GET /vehicles?bbox=minLon,minLat,maxLon,maxLat[&modes=tram,bus][&routes=52]` | live vehicles in a box (≤ 50 km): position, bearing, route (`RouteRef`, with its mode), headsign, delay, `trip_key`, and where the feed reports it `stop_sequence` + `status` (`stopped_at`, `incoming_at`, `in_transit_to`) |
 | `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_key` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
-| `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10 |
+| `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10. In memory, ranked as pg_trgm (prefix, substring, `word_similarity`, `similarity`, name: `gtfs_backend/trigram.py`, checked against the database) |
+| `GET /search?q=…` | everything a query names: `stops` (as `/stops/search`) and `routes` of today's timetables by name (`52`, `N1`: the exact name first, then names starting with it) |
 | `GET /stops/{stop_key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (`Cache-Control` like stops) |
-| `GET /trips/{trip_key}/live` | to poll: every stop's predictions and skipped (match to the trip's `stops` by `stop_sequence`), status, live vehicle, alerts as refs |
+| `GET /trips/{trip_key}/live` | to poll: every stop's predictions and `status` (match to the trip's `stops` by `stop_sequence`), the trip's status, live vehicle, alerts as refs |
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
@@ -207,13 +216,14 @@ busy or a store is down, 500 `internal` without details.
 
 **Several processes.** `API_WORKERS` processes share one port, each with bounded pools (`DB_POOL_MAX_SIZE`,
 `REDIS_POOL_MAX_SIZE`) and its own catalog copy (feed versions of yesterday to a week ahead, routes, and all stops,
-stop groups and today's directions, so boards, the map, search and alerts look up stops without Postgres), loaded
+stop groups and today's directions, the routes of those versions, and the timetable snapshot, so boards, trips, the
+map, search and alerts need no Postgres), loaded
 before the first request and refreshed in the background on `static:updated`, a new day and every
 `CATALOG_REFRESH_INTERVAL` while requests keep using the loaded one. `DB_POOL_MAX_SIZE` is the same for the
 worker and every API process: keep `(API_WORKERS + 1) × DB_POOL_MAX_SIZE` below Postgres' `max_connections` (100).
 
-**No response cache.** Every response is computed when asked for (a departure board takes about 4 ms, p95 6 ms, on
-a laptop with the full ZTP timetables; `Server-Timing` shows it in production), so live data is as fresh as Redis.
+**No response cache.** Every response is computed when asked for (`/metrics` and `Server-Timing` show how long it
+takes; docs/benchmark.md has the numbers), so live data is as fresh as Redis.
 The ETag is the body's hash: polling clients get a 304 while nothing changed. Public responses carry `Cache-Control: public, max-age=…` for clients and proxies:
 `CACHE_TTL_STATIC` (300 s: stops, search, trips, shapes) and `CACHE_TTL_ALERTS` (15 s).
 
@@ -227,7 +237,8 @@ Notes:
   headsigns, most served first; under 5 % of trips are left out. Precomputed per version (`core.stop_direction`).
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
-  delayed departures stay. The timetable comes from `core.stop_departure`, realtime from `rt:tripstate` and the
+  delayed departures stay. The timetable comes from the snapshot (`core.stop_departure` for days it lacks), realtime
+  from `rt:tripstate` and the
   board's `rt:stop:*` hashes (one pipelined call). Predictions are used only for the same version. `status` says
   where the time comes from: `scheduled` (timetable; also where the feed says `NO_DATA`), `live` (the feed's
   prediction for this stop), `predicted` (a delay the feed gave for an earlier stop, carried over), `canceled`,

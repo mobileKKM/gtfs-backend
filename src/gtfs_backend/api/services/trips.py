@@ -1,5 +1,7 @@
 """One trip on one service day, in two parts: the view (shape, route, every stop's place and timetable), which stays
 the same while the trip runs, and its live state (every stop's predictions, the vehicle, alerts), which clients poll.
+
+The timetable part comes from the snapshot (api/data/timetable.py) for the days it has, else from Postgres.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Day
 from gtfs_backend.api.data.geo import bbox_of, encode_polyline
 from gtfs_backend.api.data.realtime import StopUpdate, TripUpdate
+from gtfs_backend.api.data.timetable import NOT_COVERED, TripStatic
 from gtfs_backend.api.errors import NotFound
 from gtfs_backend.api.schemas import StopRef, TripLive, TripShape, TripStop, TripStopLive, TripView, Vehicle
 from gtfs_backend.api.schemas.trips import TripStopStatus
@@ -110,11 +113,59 @@ def _shape(polyline: str | None, bbox: list[float] | None, stops: list[TripStop]
     return TripShape(polyline=encode_polyline(points), bbox=bbox_of(points), source="stops")
 
 
+def _static(ctx: Context, day: Day, trip_id: str):
+    """The trip from the snapshot: TripStatic, NOT_COVERED (read Postgres), or NotFound if it doesn't run that day."""
+    tt = ctx.catalog.timetable
+    if tt is None:
+        return NOT_COVERED
+    static = tt.trip(day.feed_id, day.date, day.feed_version_id, trip_id)
+    if static is None:
+        raise NotFound("trip")
+    return static
+
+
+def _snapshot_stops(ctx: Context, static: TripStatic, day: Day) -> list[TripStop] | None:
+    """The view's stops from the snapshot and the catalog's stops; None if the catalog lacks one of them (a stop
+    imported since it loaded: Postgres has it)."""
+    wanted = {pid for *_, pid in static.stops if pid}
+    by_id = ctx.catalog.stops.stops_by_id(wanted)
+    if len(by_id) != len(wanted):
+        return None
+    out = []
+    for seq, arr, dep, on_demand, pid in static.stops:
+        stop = by_id.get(pid) if pid else None
+        out.append(
+            TripStop(
+                stop_sequence=seq,
+                stop=StopRef(key=stop.key, name=stop.name, group_key=stop.group_key, platform_code=stop.platform_code)
+                if stop
+                else None,
+                lat=stop.lat if stop else None,
+                lon=stop.lon if stop else None,
+                scheduled_arrival=day.base + arr if arr is not None else None,
+                scheduled_departure=day.base + dep if dep is not None else None,
+                on_demand=on_demand,
+            )
+        )
+    return out
+
+
 async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> TripView:
     day = await _day(ctx, feed_id, service_date)
-    params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
-    route_id, headsign, direction_id, polyline, bbox, rows = await _row(ctx, VIEW_SQL, params)
-    stops = [_stop(r, day) for r in rows or []]
+    static = _static(ctx, day, trip_id)
+    stops = _snapshot_stops(ctx, static, day) if static is not NOT_COVERED else None
+    if stops is not None:
+        route_id, headsign, direction_id, polyline, bbox = (
+            static.route_id,
+            static.headsign,
+            static.direction_id,
+            static.polyline,
+            static.bbox,
+        )
+    else:
+        params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
+        route_id, headsign, direction_id, polyline, bbox, rows = await _row(ctx, VIEW_SQL, params)
+        stops = [_stop(r, day) for r in rows or []]
     info = await ctx.catalog.route(day.feed_version_id, route_id)
     return TripView(
         key=keys.trip_key(feed_id, service_date, trip_id),
@@ -156,10 +207,16 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     day = await _day(ctx, feed_id, service_date)
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     key = keys.trip_key(feed_id, service_date, trip_id)
-    # independent: the timetable from Postgres, the trip update and alerts from Redis (one call)
-    (route_id, direction_id, seqs, pids), (raw, alert_raws) = await _both(
-        _row(ctx, LIVE_SQL, params), realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
-    )
+    static = _static(ctx, day, trip_id)
+    if static is not NOT_COVERED:
+        route_id, direction_id = static.route_id, static.direction_id
+        seqs, pids = [st[0] for st in static.stops], [st[4] for st in static.stops]
+        raw, alert_raws = await realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
+    else:
+        # independent: the timetable from Postgres, the trip update and alerts from Redis (one call)
+        (route_id, direction_id, seqs, pids), (raw, alert_raws) = await _both(
+            _row(ctx, LIVE_SQL, params), realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
+        )
     rows = list(zip(seqs or [], pids or [], strict=True))
     update = TripUpdate.for_version(raw, day.version)
     if update is not None and not ctx.fresh(feed_id, update.timestamp):

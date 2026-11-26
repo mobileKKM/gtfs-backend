@@ -116,6 +116,15 @@ class StopData:
     def groups_by_id(self, ids) -> dict[str, Stop]:
         return {i: group.stop for i in ids if (group := self._groups.get(i)) is not None}
 
+    def searchable_groups(self, namespaces: list[str]) -> list[tuple[str, str]]:
+        """(id, name) of the active groups of these namespaces with a served stop: what stop search finds."""
+        wanted = set(namespaces)
+        return [
+            (gid, g.stop.name)
+            for gid, g in sorted(self._groups.items())
+            if g.active and g.namespace in wanted and self._served_members.get(gid)
+        ]
+
     def group_stops(self, group_ids: list[str]) -> dict[str, list[Stop]]:
         """Active stops of each group, by platform_code."""
         return {g: [self._poles[p].stop for p in self._served_members.get(g, [])] for g in group_ids}

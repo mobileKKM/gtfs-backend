@@ -25,6 +25,7 @@ from gtfs_backend.worker.realtime.runtime import FeedRuntime
 from gtfs_backend.worker.realtime.store import RealtimeStore, TTLs
 from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static.fetch import PREVIOUSLY_FAILED, check_static, import_order
+from gtfs_backend.worker.static.snapshot import run_snapshot_job
 from gtfs_backend.worker.static.stops.osm import fetch_osm_poles, file_age_s
 from gtfs_backend.worker.static.versions import RetirementBusy, feed_today, retire_versions
 
@@ -65,6 +66,7 @@ class Worker:
         if not self.uses_osm:
             self.osm_ready.set()
         self.realtime_tasks: list[RealtimeTask] = []
+        self.snapshot_date = None  # local date the timetable snapshot was last built on (MAINTENANCE_TZ)
         self.exit_code = 0
         self.clock = settings.clock()  # time.time() unless CLOCK_OFFSET (benchmark replays)
         self.recorder = metrics.Recorder()  # data age per realtime file, flushed to Redis (gtfs_backend/metrics.py)
@@ -144,6 +146,7 @@ class Worker:
         if self.uses_osm:
             tasks.append(asyncio.create_task(self._osm_loop(), name="osm"))
         tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
+        tasks.append(asyncio.create_task(self._snapshot_loop(), name="snapshot"))
         tasks.append(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
         tasks.append(asyncio.create_task(self.recorder.run(self.redis), name="metrics"))
         log.info("worker_started", tasks=[t.get_name() for t in tasks])
@@ -230,6 +233,7 @@ class Worker:
                 if result.status == "ready":
                     self._invalidate_runtimes()
                     await self._rewrite_realtime(feed)
+                    await self._build_snapshot()  # boards read it: the new version's departures, before the API switches
                     await self.redis.publish(live_layout.STATIC_UPDATED, feed.feed_id)
         except asyncio.CancelledError:
             raise
@@ -241,6 +245,51 @@ class Worker:
             self.executor = _import_executor()
         except Exception as exc:  # noqa: BLE001
             bound.error("static_check_failed", error=f"{type(exc).__name__}: {exc}")
+
+    async def _build_snapshot(self) -> bool:
+        """Write the timetable snapshot (yesterday, today, tomorrow) in the import process, not while an import runs.
+        False if it failed (logged; the API keeps the previous one, or reads Postgres)."""
+        s = self.settings
+        now = self.clock()
+        try:
+            async with self.static_lock:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    self.executor,
+                    run_snapshot_job,
+                    s.database_url,
+                    str(s.feeds_config),
+                    str(s.snapshot_dir),
+                    now,
+                    s.log_level,
+                )
+        except asyncio.CancelledError:
+            raise
+        except BrokenProcessPool as exc:
+            log.error("snapshot_build_crashed", error=f"{type(exc).__name__}: {exc}")
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = _import_executor()
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.error("snapshot_build_failed", error=f"{type(exc).__name__}: {exc}")
+            return False
+        self.snapshot_date = datetime.fromtimestamp(now, MAINTENANCE_TZ).date()
+        return True
+
+    async def _snapshot_loop(self) -> None:
+        """The timetable snapshot once every feed had its first static check, then again on every new local day (it
+        covers yesterday to tomorrow, so the day before's still serves until then); a failed build is retried at the next
+        check (MAINTENANCE_CHECK_INTERVAL_S)."""
+        for event in self.first_check.values():
+            await event.wait()
+        while True:
+            today = datetime.fromtimestamp(self.clock(), MAINTENANCE_TZ).date()
+            if self.snapshot_date != today and await self._build_snapshot():
+                try:
+                    await self.redis.publish(live_layout.SNAPSHOT_UPDATED, str(self.snapshot_date))
+                except Exception as exc:  # noqa: BLE001 - the API also checks for a new one every few minutes
+                    log.warning("snapshot_publish_failed", error=str(exc))
+            await asyncio.sleep(MAINTENANCE_CHECK_INTERVAL_S)
 
     async def _rewrite_realtime(self, feed: FeedConfig) -> None:
         """Load the feed's new trip index and wait until each of its realtime files was written with it (each processes

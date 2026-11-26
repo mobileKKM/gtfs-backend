@@ -49,6 +49,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ARCHIVE_DIR: /data/archive
       OSM_STOPS_FILE: /data/osm/stops.json
+      SNAPSHOT_DIR: /data/snapshot # the timetable snapshot the API reads
     command: ["sh", "-c", "alembic upgrade head && exec gtfs-worker run"]
     volumes:
       - ./data:/data
@@ -77,11 +78,13 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-gtfs}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-gtfs}
       REDIS_URL: redis://redis:6379/0
       API_WORKERS: ${API_WORKERS:-4}
+      SNAPSHOT_DIR: /data/snapshot # written by the worker: boards and trips read it instead of Postgres
     networks:
       - default
       - nginx_proxy
     volumes:
       - ./feeds.yml:/app/feeds.yml:ro
+      - ./data/snapshot:/data/snapshot:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 15s

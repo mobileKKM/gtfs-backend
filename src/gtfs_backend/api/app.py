@@ -28,13 +28,18 @@ GZIP_LEVEL = 6
 
 
 async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
-    """The worker publishes `static:updated` after an import; reload the catalog then."""
+    """The worker publishes `static:updated` after an import (reload the catalog, which reloads the snapshot too) and
+    `snapshot:updated` after a new day's snapshot (reload only that)."""
     while True:
         try:
             async with redis.pubsub() as ps:
-                await ps.subscribe(live_layout.STATIC_UPDATED)
+                await ps.subscribe(live_layout.STATIC_UPDATED, live_layout.SNAPSHOT_UPDATED)
                 async for msg in ps.listen():
-                    if msg["type"] == "message":
+                    if msg["type"] != "message":
+                        continue
+                    if msg["channel"] == live_layout.SNAPSHOT_UPDATED:
+                        catalog.timetable_changed()
+                    else:
                         catalog.invalidate()
         except asyncio.CancelledError:
             raise
@@ -87,7 +92,9 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             )
         )
         feeds_file = feeds or load_feeds(settings.feeds_config)
-        catalog = Catalog(pool, feeds_file, clock, refresh_s=settings.catalog_refresh_interval)
+        catalog = Catalog(
+            pool, feeds_file, clock, refresh_s=settings.catalog_refresh_interval, snapshot_dir=settings.snapshot_dir
+        )
         try:  # warm up, so the first requests don't all wait for it; they retry if the database is down
             await catalog.ensure_fresh()
         except Exception as exc:  # noqa: BLE001

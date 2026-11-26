@@ -69,3 +69,11 @@ class StopGroupInfo(BaseModel):
 class SearchResult(BaseModel):
     query: str
     results: list[StopGroupInfo]
+
+
+class Search(BaseModel):
+    """GET /search: what a query names. Stops as /stops/search; routes by name (exact first, then by prefix)."""
+
+    query: str
+    stops: list[StopGroupInfo]
+    routes: list[RouteRef]

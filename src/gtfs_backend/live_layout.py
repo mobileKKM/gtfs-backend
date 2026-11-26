@@ -17,7 +17,8 @@ rt:alerts:{feed_id}                 alerts JSON (TTL ALERT_TTL)
 rt:unmatched:{feed_id}:{kind}       unmatched trip ids / vehicles for debugging (TTL UNMATCHED_TTL), never shown
 rt:meta:{feed_id}:{kind}            poll stats: last poll, last data change, timings, counters
 pub/sub rt:updated                  {"feed_id", "kind", "ts"} after each write
-pub/sub static:updated              feed_id, after a static import became ready
+pub/sub static:updated              feed_id, after a static import became ready (and its snapshot was written)
+pub/sub snapshot:updated            generation, after the timetable snapshot was rebuilt for a new day
 
 The JSON values are typed below (LiveVehicle, LiveTrip, LiveAlert, Unmatched, PollMeta): the worker builds exactly
 these, the API reads them. Times are epoch seconds, delays seconds; enums are GTFS-RT names (alerts: lowercase).
@@ -30,6 +31,7 @@ from typing import NotRequired, TypedDict
 VEHICLES_GEO = "rt:veh:geo"
 REALTIME_UPDATED = "rt:updated"
 STATIC_UPDATED = "static:updated"
+SNAPSHOT_UPDATED = "snapshot:updated"
 
 
 def vehicles_geo(feed_id: str) -> str:

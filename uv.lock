@@ -280,6 +280,7 @@ name = "gtfs-backend"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
@@ -318,6 +319,7 @@ requires-dist = [
     { name = "gtfs-kit", marker = "extra == 'worker'", specifier = ">=13.0.1" },
     { name = "gtfs-realtime-bindings", marker = "extra == 'worker'", specifier = ">=3.0.0" },
     { name = "httpx", marker = "extra == 'worker'", specifier = ">=0.28.1" },
+    { name = "numpy", specifier = ">=2.3" },
     { name = "osmium", marker = "extra == 'worker'", specifier = ">=4.3.2" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.6" },
     { name = "pyarrow", marker = "extra == 'worker'", specifier = ">=26.0.0" },

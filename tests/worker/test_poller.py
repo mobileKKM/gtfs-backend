@@ -1,5 +1,8 @@
 """Poll meta (rt:meta:{feed_id}:{kind}): written after every poll, keeps the last good stats through failures."""
 
+from datetime import UTC, datetime
+from types import SimpleNamespace
+
 from conftest import FIXTURES
 
 from gtfs_backend.feeds import FeedConfig, RealtimeKind
@@ -17,30 +20,41 @@ class FakeStore:
         self.meta: dict = {}
         self.published = 0
         self.touched = 0
+        self.lost_count = 0
 
     async def write_meta(self, feed_id, kind, meta):
         self.meta = dict(meta)
 
-    async def publish(self, feed_id, kind, ts):
+    async def publish(self, feed_id, kind, ts, changes=None):
         self.published += 1
+        self.changes = changes
 
     async def touch(self, feed_id, kind):
         self.touched += 1
+
+    def lost(self, feed_id, kind):
+        self.lost_count += 1
 
     async def write_trips(self, feed_id, res): ...
 
     async def write_unmatched(self, feed_id, kind, res): ...
 
 
-def make_task(monkeypatch, *responses):
+def make_task(monkeypatch, *responses, **task_kwargs):
     """A trip-updates task whose downloads return `responses` in order (an Exception is raised)."""
     runtime = FeedRuntime(FeedConfig(feed_id="kmk_t", static="https://x.test/t.zip"), pool=None)
 
+    index = SimpleNamespace(generation=1)  # a TripIndex as far as the task looks at it
+
     async def get_index(now):
-        return object()
+        runtime.index = index
+        return index
 
     async def process_message(feed_id, msg, index, state, load, now):
-        return Result(trips=[{"key": "kmk_t:a:20261025", "delay_s": 60}], entities=1)
+        res = Result(trips=[{"key": "kmk_t:a:20261025", "delay_s": 60}], entities=1)
+        res.trip_relationships.update(CANCELED=1, SCHEDULED=3)
+        res.block_late_next, res.block_late_next_without_update = 2, 1
+        return res
 
     queue = list(responses)
 
@@ -64,6 +78,7 @@ def make_task(monkeypatch, *responses):
         max_age=120,
         retries=1,
         retry_delay=0,
+        **task_kwargs,
     ), store
 
 
@@ -147,3 +162,102 @@ async def test_a_new_etag_for_data_already_stored_is_remembered(monkeypatch):
     await task.cycle()
     assert task.etag == '"v2"'  # the next poll asks with it and gets a 304
     assert store.published == 1  # the rewrite isn't an update
+
+
+async def test_data_age_is_sampled_every_poll_with_the_tasks_clock(monkeypatch):
+    from gtfs_backend import metrics
+
+    ts = MSG.header.timestamp
+    now = [ts + 4.0]
+    recorder = metrics.Recorder()
+    task, store = make_task(
+        monkeypatch,
+        Fetched(True),
+        Fetched(False, MSG, etag='"v1"'),
+        Fetched(True, etag='"v1"'),
+        clock=lambda: now[0],
+        recorder=recorder,
+    )
+    await task.cycle()  # nothing yet: no age
+    assert recorder._counts == {} and store.meta["age_s"] is None
+    await task.cycle()
+    now[0] += 30  # the file stays unchanged: its data gets older
+    await task.cycle()
+    name = metrics.age_name("kmk_t", "trip_updates")
+    s = metrics.summarize([{f: str(n) for f, n in recorder._counts.items()}])[name]
+    assert s.count == 2 and s.quantile(0.5) >= 4 and s.max >= 34
+    assert store.meta["age_s"] == 34
+    assert store.meta["last_poll"].startswith(datetime.fromtimestamp(now[0], UTC).isoformat(timespec="seconds"))
+    assert store.meta["trip_relationships"] == {"CANCELED": 1, "SCHEDULED": 3}  # sorted by name
+    assert (store.meta["block_late_next"], store.meta["block_late_next_without_update"]) == (2, 1)
+
+
+def older(msg, seconds):
+    """`msg` with its header timestamp `seconds` earlier."""
+    out = type(msg)()
+    out.CopyFrom(msg)
+    out.header.timestamp -= seconds
+    return out
+
+
+async def test_an_older_feed_timestamp_is_taken_only_after_max_age_without_news(monkeypatch):
+    back = older(MSG, 3600)  # the producer restarted with its clock an hour behind
+    task, store = make_task(
+        monkeypatch,
+        Fetched(False, MSG, etag='"v1"'),
+        Fetched(False, back, etag='"v0"'),  # within max_age: an older copy, ignored
+        Fetched(False, back, etag='"v0"'),
+    )
+    await task.cycle()
+    await task.cycle()
+    assert task.last_ts == MSG.header.timestamp and store.published == 1
+    task.last_change -= task.max_age + 1  # nothing newer for max_age: the feed would freeze, so take it
+    await task.cycle()
+    assert task.last_ts == back.header.timestamp and store.published == 2
+
+
+async def test_a_new_index_rewrites_the_last_update_at_the_next_poll(monkeypatch):
+    task, store = make_task(monkeypatch, Fetched(False, MSG, etag='"v1"'), Fetched(True, etag='"v1"'), Fetched(True, etag='"v1"'))
+    await task.cycle()
+    assert task.written_generation == 1 and store.published == 1
+    changed_at = task.last_change
+    task.runtime.index.generation = 2  # an import: FeedRuntime installed a new index
+    await task.cycle()  # 304, but written again with the new index
+    assert task.written_generation == 2 and store.published == 2 and store.touched == 0
+    assert task.last_change == changed_at  # the data itself is as old as before
+    await task.cycle()  # nothing new: kept alive only
+    assert store.published == 2 and store.touched == 1
+
+
+async def test_a_failed_write_or_publish_is_processed_and_published_again(monkeypatch):
+    """Readers would otherwise miss what was written: a failed write makes the next message skip a number (they load
+    the feed from Redis), and nothing counts as done until it is published."""
+    task, store = make_task(monkeypatch, *(Fetched(False, MSG, etag='"v1"') for _ in range(3)))
+    real_unmatched, real_publish = store.write_unmatched, store.publish
+
+    async def broken(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(store, "write_unmatched", broken)  # after the trips were written
+    await task.cycle()
+    assert store.lost_count == 1 and store.published == 0 and task.last_ts == 0 and task.etag is None
+
+    monkeypatch.setattr(store, "write_unmatched", real_unmatched)
+    monkeypatch.setattr(store, "publish", broken)
+    await task.cycle()
+    assert task.last_ts == 0 and task.etag is None  # the same file again next time
+
+    monkeypatch.setattr(store, "publish", real_publish)
+    await task.cycle()
+    assert store.published == 1 and task.last_ts == MSG.header.timestamp and task.etag == '"v1"'
+
+
+async def test_an_older_copys_etag_is_not_kept(monkeypatch):
+    task, store = make_task(
+        monkeypatch,
+        Fetched(False, MSG, etag='"v1"'),
+        Fetched(False, older(MSG, 30), etag='"v0"'),  # a cache's older copy: ignored, and asked for again
+    )
+    await task.cycle()
+    await task.cycle()
+    assert task.etag == '"v1"' and store.published == 1

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from google.transit import gtfs_realtime_pb2 as pb
 
-from gtfs_backend.live_layout import LiveVehicle
+from gtfs_backend.live_layout import LiveVehicle, TripFields
 from gtfs_backend.worker.realtime.motion import MotionTracker
 from gtfs_backend.worker.realtime.resolve import TripRef
 from gtfs_backend.worker.realtime.trip_index import TripIndex
@@ -19,6 +19,13 @@ def build_vehicle(
     feed_id: str, ref: TripRef, vp, index: TripIndex, delay: int | None, motion: MotionTracker | None = None, ts: int = 0
 ) -> LiveVehicle:
     """`motion` fills bearing/speed the feed left out (from the vehicle's previous fix at `ts` or vp.timestamp)."""
+    return vehicle_for(feed_id, trip_fields(feed_id, ref), ref.info.version, vp, index, delay, motion, ts)
+
+
+def vehicle_for(
+    feed_id: str, trip: TripFields, version: int, vp, index: TripIndex, delay: int | None, motion: MotionTracker | None, ts: int
+) -> LiveVehicle:
+    """A vehicle on a trip given by its fields (also an extra trip, which has no timetabled one)."""
     pos = vp.position
     # ZTP sends 0 for unknown: speed 0 for most MPK buses (driving ones too), bearing 0 far more often than
     # heading north explains. Treated as missing; a standing vehicle is estimated as speed 0, last bearing.
@@ -35,12 +42,12 @@ def build_vehicle(
         "lon": pos.longitude,
         "bearing": bearing,
         "speed": speed,
-        "timestamp": int(vp.timestamp) or None,
+        "timestamp": int(vp.timestamp) or ts,  # without its own: as old as the feed (the API hides old data by it)
         "current_status": _enum_name(vp, "current_status", pb.VehiclePosition.VehicleStopStatus),
         "current_stop_sequence": vp.current_stop_sequence if vp.HasField("current_stop_sequence") else None,
         "stop_id": vp.stop_id or None,
-        "public_stop_id": index.public_stop(ref.info.version, vp.stop_id),
-        "trip": trip_fields(feed_id, ref),
+        "public_stop_id": index.public_stop(version, vp.stop_id),
+        "trip": trip,
         "delay_s": delay,
         "occupancy": _enum_name(vp, "occupancy_status", pb.VehiclePosition.OccupancyStatus),
         "wheelchair_accessible": _enum_name(vp.vehicle, "wheelchair_accessible", pb.VehicleDescriptor.WheelchairAccessible),

@@ -8,6 +8,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 # Shared by the worker and the API (the modules at the gtfs_backend root).
 dependencies = [
+    "msgspec>=0.19",
+    "orjson>=3.11",
     "psycopg[binary,pool]>=3.3.6",
     "pydantic-settings>=2.16.1",
     "pyyaml>=6.0.3",
@@ -55,5 +57,6 @@ dev = [
     "gtfs-backend[api,worker]",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-benchmark>=5.3.1",
     "ruff>=0.17.2",
 ]

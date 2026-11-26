@@ -4,8 +4,6 @@ the same while the trip runs, and its live state (every stop's predictions, the 
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable
 from datetime import date
 
 from gtfs_backend import keys
@@ -13,11 +11,12 @@ from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Day
 from gtfs_backend.api.data.geo import bbox_of, encode_polyline
-from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.errors import NotFound
 from gtfs_backend.api.schemas import StopRef, TripLive, TripShape, TripStop, TripStopLive, TripView, Vehicle
+from gtfs_backend.api.schemas.trips import TripStopStatus
 from gtfs_backend.api.services import alerts, vehicles
 from gtfs_backend.api.services.routes import POLYLINE_SQL
+from gtfs_backend.live_layout import StopState, TripState
 
 ON_DEMAND = (2, 3)  # GTFS pickup/drop_off_type: phone the agency, coordinate with the driver
 
@@ -77,15 +76,6 @@ async def _row(ctx: Context, sql: str, params: dict) -> tuple:
     return row
 
 
-async def _both[A, B](first: Awaitable[A], second: Awaitable[B]) -> tuple[A, B]:
-    """Both at once; the first one's error wins (a missing trip is a 404 even while Redis is down)."""
-    a, b = await asyncio.gather(first, second, return_exceptions=True)
-    for result in (a, b):
-        if isinstance(result, BaseException):
-            raise result
-    return a, b
-
-
 def _stop(row, day: Day) -> TripStop:
     seq, arr, dep, pickup, drop_off, pkey, pname, gkey, pcode, lat, lon = row
     return TripStop(
@@ -109,8 +99,50 @@ def _shape(polyline: str | None, bbox: list[float] | None, stops: list[TripStop]
     return TripShape(polyline=encode_polyline(points), bbox=bbox_of(points), source="stops")
 
 
+def _extra(ctx: Context, key: str) -> TripState | None:
+    """The live state's trip, if it is one no timetable has (GTFS-RT NEW, DUPLICATED, ...)."""
+    live = ctx.live_state
+    trip = live.trips.get(key) if live is not None and live.ready else None
+    return trip if trip is not None and trip.extra is not None else None
+
+
+def _extra_stops(ctx: Context, trip: TripState) -> list[TripStop]:
+    """The stops of an extra trip, from realtime."""
+    by_id = ctx.catalog.stops.stops_by_id({s.public_stop_id for s in trip.stops if s.public_stop_id})
+    out = []
+    for s in trip.stops:
+        stop = by_id.get(s.public_stop_id) if s.public_stop_id else None
+        out.append(
+            TripStop(
+                stop_sequence=s.stop_sequence,
+                stop=StopRef(key=stop.key, name=stop.name, group_key=stop.group_key, platform_code=stop.platform_code)
+                if stop
+                else None,
+                lat=stop.lat if stop else None,
+                lon=stop.lon if stop else None,
+                scheduled_arrival=s.scheduled_arrival,
+                scheduled_departure=s.scheduled_departure,
+                on_demand=False,
+            )
+        )
+    return out
+
+
 async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> TripView:
     day = await _day(ctx, feed_id, service_date)
+    if (extra := _extra(ctx, keys.trip_key(feed_id, service_date, trip_id))) is not None:
+        route_id, headsign = extra.extra
+        stops = _extra_stops(ctx, extra)
+        info = await ctx.catalog.route(day.feed_version_id, route_id) if route_id else None
+        return TripView(
+            key=keys.trip_key(feed_id, service_date, trip_id),
+            service_date=keys.service_date_str(service_date),
+            route=info.model() if info else None,
+            headsign=headsign,
+            direction_id=None,
+            shape=_shape(None, None, stops),  # drawn through its stops
+            stops=stops,
+        )
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     route_id, headsign, direction_id, polyline, bbox, rows = await _row(ctx, VIEW_SQL, params)
     stops = [_stop(r, day) for r in rows or []]
@@ -126,15 +158,25 @@ async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> 
     )
 
 
-def _live_stop(row, update: TripUpdate | None) -> TripStopLive:
-    seq, _ = row
-    live = update.stop(seq) if update else None
+def stop_status(live: StopState | None) -> TripStopStatus:
+    """`skipped`; `live` / `predicted` with a time from the feed for this stop / carried over from an earlier one; else
+    `scheduled` (also where the feed says it has no data: NO_DATA)."""
+    if live is None:
+        return "scheduled"
+    if live.skipped:
+        return "skipped"
+    if live.predicted is None:
+        return "scheduled"
+    return "predicted" if live.propagated else "live"
+
+
+def _live_stop(seq: int, live: StopState | None) -> TripStopLive:
     return TripStopLive(
         stop_sequence=seq,
+        status=stop_status(live),
         estimated_arrival=live.predicted_arrival if live else None,
         estimated_departure=live.predicted_departure if live else None,
         delay_s=live.delay_s if live else None,
-        skipped=bool(live and live.skipped),
     )
 
 
@@ -143,13 +185,22 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     day = await _day(ctx, feed_id, service_date)
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     key = keys.trip_key(feed_id, service_date, trip_id)
-    # independent: the timetable from Postgres, the trip update and alerts from Redis (one call)
-    (route_id, direction_id, seqs, pids), (raw, alert_raws) = await _both(
-        _row(ctx, LIVE_SQL, params), realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
-    )
+    live_state = ctx.live
+    extra = _extra(ctx, key)
+    if extra is not None:
+        route_id, direction_id = extra.extra[0], None
+        seqs, pids = [s.stop_sequence for s in extra.stops], [s.public_stop_id for s in extra.stops]
+    else:
+        route_id, direction_id, seqs, pids = await _row(ctx, LIVE_SQL, params)
+    alert_raws = live_state.alerts_of(ctx.feed_ids, ctx.fresh_since())
     rows = list(zip(seqs or [], pids or [], strict=True))
-    update = TripUpdate.for_version(raw, day.version)
-    stops = [_live_stop(r, update) for r in rows]
+    update = live_state.trips.get(key)
+    if update is not None and update.version != day.version:
+        update = None  # computed for another timetable version: stop sequences differ
+    if update is not None and not ctx.fresh(feed_id, update.timestamp):
+        update = None  # measured too long ago: the worker or the feed stopped
+    by_seq = {s.stop_sequence: s for s in update.stops} if update else {}
+    stops = [_live_stop(seq, by_seq.get(seq)) for seq, _ in rows]
 
     if vehicle is None and update and update.vehicle_id:
         found = await vehicles.by_ids(ctx, [f"{feed_id}:{update.vehicle_id}"])
@@ -191,7 +242,7 @@ async def live_by_key(ctx: Context, trip_key: str) -> TripLive:
 async def for_vehicle(ctx: Context, vehicle_key: str) -> TripLive:
     """The live state of the trip the vehicle runs now; its `key` changes when the vehicle starts its next trip."""
     feed_id, _ = keys.split_feed(vehicle_key, "vehicle key")
-    raws = await realtime.vehicle_json(ctx.redis, [vehicle_key])
+    raws = vehicles.fresh(ctx, [v] if (v := ctx.live.vehicle(vehicle_key)) is not None else [])
     if not raws:
         raise NotFound("vehicle")
     (vehicle,) = await vehicles.models(ctx, raws)

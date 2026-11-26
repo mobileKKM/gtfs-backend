@@ -12,8 +12,6 @@ import hashlib
 from fastapi import Request, Response
 from pydantic import BaseModel
 
-from gtfs_backend.api import timing
-
 NO_STORE = "no-store"
 # Vehicles, boards, trips: change every few seconds. Clients poll and always revalidate, getting a 304 via the ETag
 # while nothing changed.
@@ -38,14 +36,10 @@ def _respond(request: Request, body: bytes, etag: str, cache_control: str, statu
 
 def json_response(request: Request, model: BaseModel, cache_control: str, status_code: int = 200) -> Response:
     """Serialize `model`; answer 304 if the client already has this body."""
-    with timing.serializing():
-        body = model.model_dump_json().encode()
-        etag = _etag(body)
-    return _respond(request, body, etag, cache_control, status_code)
+    body = model.model_dump_json().encode()
+    return _respond(request, body, _etag(body), cache_control, status_code)
 
 
 def json_bytes_response(request: Request, body: bytes, cache_control: str) -> Response:
     """An already serialized body; answer 304 if the client already has it."""
-    with timing.serializing():
-        etag = _etag(body)
-    return _respond(request, body, etag, cache_control)
+    return _respond(request, body, _etag(body), cache_control)

@@ -19,6 +19,10 @@ from gtfs_backend.feeds import FeedConfig, RealtimeKind
 META_FIELDS = ("ok", "last_error", "last_poll", "last_change", "age_s", "consecutive_failures")
 DB_TIMEOUT_S = 3  # /health answers even when the pool is exhausted
 FAILING_POLLS = 5  # consecutive failed polls before a file counts as failing (ZTP fails one or two while replacing)
+# GTFS-RT trip schedule_relationship values the worker shows (CANCELED as canceled, DELETED hidden, REPLACEMENT and
+# UNSCHEDULED as the timetabled trip; the feed's `extra_trips` too): any other one in a feed's last update is reported,
+# as its trips aren't shown
+SHOWN_TRIP_RELATIONSHIPS = frozenset({"SCHEDULED", "CANCELED", "DELETED", "REPLACEMENT", "UNSCHEDULED"})
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,10 @@ def feed_problems(
             continue
         if not meta.get("ok") and (meta.get("consecutive_failures") or 0) >= FAILING_POLLS:
             problems.append(f"{kind.value}: failing ({meta.get('consecutive_failures')} polls): {meta.get('last_error')}")
+        shown = SHOWN_TRIP_RELATIONSHIPS | {k.upper() for k in feed.extra_trips}
+        for relationship, n in sorted((meta.get("trip_relationships") or {}).items()):
+            if relationship not in shown:
+                problems.append(f"{kind.value}: {n} {relationship} trips not shown (feeds.yml extra_trips)")
         if kind == RealtimeKind.SERVICE_ALERTS:
             continue
         feed_ts = meta.get("feed_timestamp")

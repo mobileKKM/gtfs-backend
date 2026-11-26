@@ -61,7 +61,11 @@ def on_time(trips) -> float:
 async def test_trams_counted_from_midnight_keep_their_own_trips(imported):
     tu, vp = await run_feed(imported, "kmk_t", "T", "midnight")
     # every tram is shown under the trip id it reports, except a few ids missing from static
-    reported = {e.vehicle.trip.trip_id for e in message("VehiclePositions", "T").entity}
+    msg = message("VehiclePositions", "T")
+    # positions measured over 120 s before the file (the feed's max age) aren't shown: one tram stood 145 s
+    stale = {e.vehicle.trip.trip_id for e in msg.entity if msg.header.timestamp - e.vehicle.timestamp > 120}
+    assert len(stale) == vp.stale_vehicles == 1
+    reported = {e.vehicle.trip.trip_id for e in msg.entity} - stale
     assert len(vp.unmatched_vehicles) <= 7
     assert {v["trip"]["trip_id"] for v in vp.vehicles} == reported - {u["trip_id"] for u in vp.unmatched_vehicles}
     # the old "twin" remap had to hide these

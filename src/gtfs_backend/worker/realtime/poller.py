@@ -6,15 +6,17 @@ import asyncio
 import statistics
 import time
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import httpx
 from google.transit import gtfs_realtime_pb2 as pb
 
+from gtfs_backend import metrics
 from gtfs_backend.feeds import RealtimeKind
 from gtfs_backend.live_layout import PollMeta
 from gtfs_backend.logs import log
-from gtfs_backend.worker.http import Fetched, fetch_bytes
+from gtfs_backend.worker.http import fetch_bytes
 from gtfs_backend.worker.realtime.normalize import Result, process_message
 from gtfs_backend.worker.realtime.runtime import FeedRuntime
 from gtfs_backend.worker.realtime.store import RealtimeStore
@@ -36,8 +38,8 @@ def median_delay(res: Result) -> float | None:
 RECENT_POLLS = 60  # window for poll_seconds_max (10 minutes at the default 10 s interval)
 
 
-def _iso_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
 
 
 def _secs(seconds: float) -> float:
@@ -56,6 +58,9 @@ class RealtimeTask:
 
     A download attempt gives up after `attempt_timeout`, so a hanging server delays a fast feed by a few polls at
     most (retries x timeout), not by minutes.
+
+    `clock`: the wall clock the data is compared with (Settings.clock: shifted only in benchmark replays).
+    `recorder`: gets the data age (now - feed header timestamp of the newest data) after every poll.
     """
 
     def __init__(
@@ -71,8 +76,12 @@ class RealtimeTask:
         retries: int,
         retry_delay: float,
         attempt_timeout: float | None = None,
+        clock: Callable[[], float] = time.time,
+        recorder: metrics.Recorder | None = None,
     ):
         self.runtime = runtime
+        self.clock = clock
+        self.recorder = recorder
         self.kind = kind
         self.url = url
         self.store = store
@@ -85,9 +94,14 @@ class RealtimeTask:
         self.etag: str | None = None
         self.last_modified: str | None = None
         self.last_ts = 0
+        # the last update processed, kept to process it again with a new index right away (after an import), and the
+        # generation of the index it was last written with (TripIndex.generation)
+        self.last_msg = None
+        self.last_size = 0
+        self.written_generation = 0
         self.failures = 0
         self.recent: deque[float] = deque(maxlen=RECENT_POLLS)
-        self.meta: PollMeta = {"started_at": _iso_now()}
+        self.meta: PollMeta = {"started_at": _iso(clock())}
         self.last_cycle = time.monotonic()  # when the last poll finished (or the task started): the worker's watchdog
         self.log = log.bind(feed=runtime.feed.feed_id, kind=kind.value)
 
@@ -117,13 +131,17 @@ class RealtimeTask:
             self.meta.update(ok=False, last_error=f"{type(exc).__name__}: {exc}")
         elapsed = time.perf_counter() - started
         self.recent.append(elapsed)
+        now = self.clock()
+        # how old the newest data is now, not when it was written
+        age = now - self.last_ts if self.last_ts else None
+        if age is not None and self.recorder is not None:
+            self.recorder.observe(metrics.age_name(self.feed_id, self.kind.value), age)
         self.meta.update(
-            last_poll=_iso_now(),
+            last_poll=_iso(now),
             consecutive_failures=self.failures,
             poll_seconds=_secs(elapsed),
             poll_seconds_max=_secs(max(self.recent)),
-            # how old the data in Redis is now, not when it was written
-            age_s=round(time.time() - self.last_ts) if self.last_ts else None,
+            age_s=round(age) if age is not None else None,
         )
         try:
             await self.store.write_meta(self.feed_id, self.kind.value, self.meta)
@@ -149,17 +167,43 @@ class RealtimeTask:
         )
         self.meta.update(fetch_seconds=_secs(time.perf_counter() - t0), fetch_attempts=fetched.attempts)
         if fetched.not_modified:
-            await self._unchanged()
-            return None
+            return await self._unchanged_or_reindexed()
         msg = fetched.value
         ts = int(msg.header.timestamp)
-        if ts and ts <= self.last_ts:
-            # data we have, under a new ETag (ZTP rewrites its files between timestamp changes): asking with this one
-            # gets a 304 next time instead of the whole file
+        if ts and ts <= self.last_ts and not self._went_back(ts):
+            if ts == self.last_ts:
+                # data we have, under a new ETag (ZTP rewrites its files between timestamp changes): asking with this
+                # one gets a 304 next time instead of the whole file. Not for an older copy: that one is looked at
+                # again until _went_back takes it
+                self.etag, self.last_modified = fetched.etag, fetched.last_modified
+            return await self._unchanged_or_reindexed()
+        res = await self._process(msg, ts, fetched.size)
+        if res is not None:
+            # remembered only once the data is stored, so a failed update is fetched and processed again
             self.etag, self.last_modified = fetched.etag, fetched.last_modified
-            await self._unchanged()
-            return None
-        now = time.time()
+        return res
+
+    def _went_back(self, ts: int) -> bool:
+        """An older header timestamp than the data we have is taken (once nothing newer came for `max_age`): a producer
+        restarted with its clock behind would otherwise freeze the feed until its clock caught up. Within `max_age` it is
+        an older copy (a second server, a cache) and ignored."""
+        if ts >= self.last_ts or self.last_change is None or time.monotonic() - self.last_change <= self.max_age:
+            return False
+        self.log.warning("feed_timestamp_went_back", timestamp=ts, previous=self.last_ts)
+        return True
+
+    async def _unchanged_or_reindexed(self) -> Result | None:
+        """Nothing new in the file: process the last update again if the index changed since it was written (an import:
+        realtime is then written for the new timetable version at once, not at the next change of the file), else keep
+        the last data alive."""
+        index = self.runtime.index
+        if self.last_msg is not None and index is not None and index.generation != self.written_generation:
+            return await self._process(self.last_msg, self.last_ts, self.last_size, again=True)
+        await self._unchanged()
+        return None
+
+    async def _process(self, msg, ts: int, size: int, *, again: bool = False) -> Result | None:
+        now = self.clock()
         t1 = time.perf_counter()
         index = await self.runtime.get_index(now)
         if index is None:
@@ -172,38 +216,45 @@ class RealtimeTask:
         t2 = time.perf_counter()
         res = await process_message(self.feed_id, msg, index, self.runtime.state, load, now)
         t3 = time.perf_counter()
-        await self._store(res)
+        try:
+            changes = await self._store(res)
+        except BaseException:
+            self.store.lost(self.feed_id, self.kind.value)
+            raise
         t4 = time.perf_counter()
-        # remembered only once the data is stored, so a failed update is fetched and processed again
-        self.etag, self.last_modified = fetched.etag, fetched.last_modified
+        await self.store.publish(self.feed_id, self.kind.value, ts, changes)
+        # only now: a failed write or publish processes this update again at the next poll
+        self.last_msg, self.last_size, self.written_generation = msg, size, index.generation
         self.last_ts = ts
-        self.last_change = time.monotonic()
-        self._record_change(fetched, ts, res, index_s=t2 - t1, process_s=t3 - t2, write_s=t4 - t3)
-        await self.store.publish(self.feed_id, self.kind.value, ts)
+        if not again:  # the data itself didn't change: its age (max_age) counts from when it did
+            self.last_change = time.monotonic()
+        self._record_change(size, ts, res, index_s=t2 - t1, process_s=t3 - t2, write_s=t4 - t3)
         return res
 
-    async def _store(self, res: Result) -> None:
-        """Write what this file carries."""
+    async def _store(self, res: Result) -> dict:
+        """Write what this file carries; returns what changed (live_layout.LiveChanges' parts)."""
+        changes = {}
         if self.kind.carries(RealtimeKind.VEHICLE_POSITIONS):
-            await self.store.write_vehicles(self.feed_id, res)
+            changes["vehicles"] = await self.store.write_vehicles(self.feed_id, res)
         if self.kind.carries(RealtimeKind.TRIP_UPDATES):
-            await self.store.write_trips(self.feed_id, res)
+            changes["trips"] = await self.store.write_trips(self.feed_id, res)
         if self.kind.carries(RealtimeKind.SERVICE_ALERTS):
-            await self.store.write_alerts(self.feed_id, res)
+            changes["alerts"] = await self.store.write_alerts(self.feed_id, res)
         await self.store.write_unmatched(self.feed_id, self.kind.value, res)
+        return changes
 
-    def _record_change(self, fetched: Fetched, ts: int, res: Result, *, index_s: float, process_s: float, write_s: float):
+    def _record_change(self, size: int, ts: int, res: Result, *, index_s: float, process_s: float, write_s: float):
         """The stats of a poll that changed data; they stay in meta until the next change."""
         unmatched = res.unmatched_trips + [v["trip_id"] or v["vehicle_id"] for v in res.unmatched_vehicles]
         self.meta.update(
             ok=True,
             last_error=None,
-            last_change=_iso_now(),
+            last_change=_iso(self.clock()),
             index_seconds=_secs(index_s),
             process_seconds=_secs(process_s),  # includes loading missing stop times
             write_seconds=_secs(write_s),
             feed_timestamp=ts,
-            bytes=fetched.size,
+            bytes=size,
             entities=res.entities,
             vehicles=len(res.vehicles),
             trips=len(res.trips),
@@ -215,6 +266,14 @@ class RealtimeTask:
             route_mismatches=res.mismatches,
             # ~0 normally; about +-3600 on a clock-change day would mean the feed's day_start is wrong
             median_delay_s=median_delay(res),
+            # GTFS-RT schedule_relationship counts of this update, matched or not (trip level, and per stop)
+            trip_relationships=dict(sorted(res.trip_relationships.items())),
+            stop_relationships=dict(sorted(res.stop_relationships.items())),
+            # trips predicted to reach their last stop after the next trip of their block is due to leave, and of
+            # those, how many next trips have no update of their own in this file
+            block_late_next=res.block_late_next,
+            block_late_next_without_update=res.block_late_next_without_update,
+            stale_vehicles=res.stale_vehicles,
         )
 
     async def _unchanged(self) -> None:

@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from gtfs_backend.feeds import FeedConfig
 from gtfs_backend.logs import log
 from gtfs_backend.servicetime import local_date
+from gtfs_backend.worker.realtime.extra import KINDS
 from gtfs_backend.worker.realtime.normalize import FeedRealtimeState
 from gtfs_backend.worker.realtime.trip_index import TripIndex, ensure_stop_times, load_index
 
@@ -35,16 +36,24 @@ def _describe(exc: Exception) -> str:
 class FeedRuntime:
     """The trip index and the recent trip delays and vehicle fixes of one feed."""
 
-    def __init__(self, feed: FeedConfig, pool: AsyncConnectionPool, state: FeedRealtimeState | None = None):
+    def __init__(
+        self, feed: FeedConfig, pool: AsyncConnectionPool, state: FeedRealtimeState | None = None, max_age: int | None = None
+    ):
+        """`max_age`: the feed's realtime max age (vehicles with older positions are dropped); default: the feed's own."""
         self.feed = feed
         self.pool = pool
-        self.state = state or FeedRealtimeState(ignore_service_suffix=feed.ignore_service_suffix)
+        self.state = state or FeedRealtimeState(
+            ignore_service_suffix=feed.ignore_service_suffix, extra_kinds=frozenset(KINDS[k] for k in feed.extra_trips)
+        )
+        if max_age is not None:
+            self.state.max_age_s = max_age
         self.index: TripIndex | None = None
         self._dirty = True
         self._reload: asyncio.Task | None = None
         self._reload_retry_at = 0.0  # time.monotonic()
         self._reload_error: str | None = None
         self._stop_times_retry_at = 0.0
+        self.generation = 0  # of the installed index (TripIndex.generation)
         self.log = log.bind(feed=feed.feed_id)
 
     @property
@@ -86,6 +95,9 @@ class FeedRuntime:
         finally:
             self._reload = None
         reused = index is not None and self.index is not None and index.trips is self.index.trips
+        if index is not None:
+            self.generation += 1
+            index.generation = self.generation
         self.index, self._reload_error = index, None
         if index is not None:
             self.log.info(
@@ -95,6 +107,21 @@ class FeedRuntime:
                 reused=reused,
                 seconds=round(time.monotonic() - started, 2),
             )
+
+    async def reload(self, now: float) -> bool:
+        """Load the index now (after an import) and wait for it, also for a reload that was already running. False if
+        it failed (the previous index keeps serving; the next poll retries)."""
+        self.invalidate()
+        for _ in range(2):  # a reload already under way may have read the database before the import committed
+            if self._reload is not None:
+                await asyncio.shield(self._reload)
+            if not self._dirty:
+                break
+            self._reload_retry_at = 0.0
+            await self.get_index(now)
+            if self._reload is not None:
+                await asyncio.shield(self._reload)
+        return not self._dirty and self.index is not None
 
     async def load_stop_times(self, index: TripIndex, keys: set[tuple[int, str]]) -> None:
         """The stop times of these (version, trip_id)s, into `index` (the one the caller works with). Fails quietly:

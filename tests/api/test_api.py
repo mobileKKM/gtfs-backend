@@ -21,6 +21,7 @@ from gtfs_backend.api.app import create_app
 from gtfs_backend.api.settings import ApiSettings
 from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedConfig, FeedsFile
+from gtfs_backend.live_layout import StopState, TripState
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, process_message
 from gtfs_backend.worker.realtime.store import RealtimeStore
@@ -41,13 +42,16 @@ FEEDS = FeedsFile(
     ]
 )
 NOW = message("TripUpdates", "T").header.timestamp
+# The snapshot's bus files were saved ~220 s before the tram files (NOW): the API, which ignores realtime measured
+# longer ago than a feed's max age, gets one that covers that (test_stale_realtime_is_not_shown checks the default).
+FIXTURE_MAX_AGE = 600
 
 
 async def _load_realtime(database_url: str) -> None:
     pool = async_pool(database_url)
     await pool.open()
     r = Redis.from_url(TEST_REDIS_URL)
-    store = RealtimeStore(r, list(SUFFIX), TTLS)
+    store = RealtimeStore(r, TTLS)
     try:
         for f in FEEDS.feeds:
             index = await load_index(pool, f.feed_id, NOW, f.day_start)
@@ -92,10 +96,16 @@ def loaded(database_url):
 
 @pytest.fixture
 async def api(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        c.ctx = app.state.ctx  # for tests that change Redis: the app's live state reloads it (reload_live)
         yield c
+
+
+async def reload_live(api, feed_id: str = "kmk_t") -> None:
+    """The app's live data, read from Redis again (what a change message would have brought): after a test wrote it."""
+    await api.ctx.live.load_feed(feed_id)
 
 
 @pytest.fixture(scope="module")
@@ -277,7 +287,7 @@ async def test_stops_without_trips_are_never_returned(api_ctx, sql, loaded):
 
 async def test_stop_search_covers_only_search_namespaces(loaded, sql):
     """Search is limited to feeds.yml `search_namespaces` (ZTP); the map and the stop itself are not."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     feeds = FEEDS.model_copy(update={"search_namespaces": ["km_kolej"]})  # no stops loaded there; skips validation
     app = create_app(settings, feeds=feeds, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
@@ -312,7 +322,9 @@ async def test_departure_board_merges_feeds_with_realtime(api, sql):
     assert r.headers["cache-control"] == "no-cache"
     assert len(deps) == 60
     assert [d["time"] for d in deps] == sorted(d["time"] for d in deps)
-    assert all(d["time"] >= NOW - 30 and d["status"] != "departed" for d in deps)
+    assert all(d["time"] >= NOW - 30 and not d["departed"] for d in deps)
+    assert {d["status"] for d in deps} <= {"scheduled", "live", "predicted", "canceled", "skipped"}
+    assert {"live", "scheduled"} <= {d["status"] for d in deps}
     assert {feed_of(d) for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
     assert not {"feed_id", "trip_id", "service_date", "realtime", "vehicle_id"} & {k for d in deps for k in d}
     own = {p[0] for p in sql("SELECT id FROM core.stop WHERE stop_group_id = %s", gid)}
@@ -367,9 +379,9 @@ async def test_departure_board_pages_by_time(api, sql):
     past = (await api.get(f"{url}?limit=100&time={NOW - 3600}")).json()["departures"]
     assert [d["time"] for d in past] == sorted(d["time"] for d in past)
     assert all(d["time"] >= NOW - 3600 for d in past)
-    assert any(d["status"] == "departed" for d in past)
-    # vehicles that passed keep the last time realtime had
-    assert any(d["status"] == "departed" and d["estimated"] for d in past)
+    assert any(d["departed"] for d in past)
+    # vehicles that passed keep the last time realtime had, and where it came from
+    assert any(d["departed"] and d["estimated"] and d["status"] in ("live", "predicted") for d in past)
 
     assert (await api.get(f"{url}?time=garbage")).status_code == 422
     assert (await api.get(f"{url}?time=-1")).status_code == 422
@@ -422,7 +434,7 @@ async def test_departure_board_stop_and_other_days(api, sql):
 async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
     """Responses carry the time of their data, not of the request: a later poll of unchanged data is a 304."""
     clock = [NOW]
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: clock[0])
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         vehicles = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()
@@ -444,13 +456,14 @@ async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
 
 
 @pytest.mark.parametrize("arrival_only", [False, True])
-async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch, arrival_only):
+async def test_departure_board_widens_for_early_trips(api_ctx, sql, monkeypatch, arrival_only):
     """A trip scheduled to depart past the window but running early enough to come before the page's last departure
     still makes the page, however early it runs (feeds allow any amount): the board finds it in its realtime index.
     Also when the feed predicts only its arrival, and the stop's arrival (+29 min) is inside the window while its
     departure (+31 min), by which the timetable is read, is past it."""
-    from gtfs_backend.api.data.realtime import BoardRealtime
     from gtfs_backend.api.services import departures
+
+    api, ctx = api_ctx
 
     pid = stop_by_code(sql, "802-01")
     day = date(2026, 10, 25)
@@ -468,15 +481,15 @@ async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch, arr
     async def scheduled(conn, days, pids, start, end, lookback=departures.LOOKBACK_S):
         return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
 
-    async def read(redis, feed_ids, public_stop_ids):
-        if arrival_only:  # its delay is against the scheduled arrival
-            value = f"[{predicted},null,{predicted - scheduled_arrival},false,1,{early.scheduled_departure}]"
-        else:
-            value = f"[null,{predicted},{predicted - early.scheduled_departure},false,1,{early.scheduled_departure}]"
-        return BoardRealtime({"kmk_t": {early.trip_key: f"[1,false,null,{NOW}]"}}, [{f"1|{early.trip_key}": value}])
-
+    if arrival_only:  # its delay is against the scheduled arrival
+        entry = StopState(1, pid, predicted, None, predicted - scheduled_arrival, False, early.scheduled_departure, False, None)
+    else:
+        delay = predicted - early.scheduled_departure
+        entry = StopState(1, pid, None, predicted, delay, False, early.scheduled_departure, False, None)
+    live = ctx.live
+    monkeypatch.setattr(live, "trips", {early.trip_key: TripState(1, False, False, None, NOW, None, [entry])})
+    monkeypatch.setattr(live, "_at_stop", {pid: {(early.trip_key, 0)}})
     monkeypatch.setattr(departures, "scheduled", scheduled)
-    monkeypatch.setattr(departures.realtime.BoardRealtime, "read", read)
     monkeypatch.setattr(departures, "expected_span", lambda *_: departures.WINDOWS_S[0])  # whatever the stop's profile
     # the first window alone has 10 departures (+1 to +19 min); the early one comes after the 8th (+15 min)
     board = (await api.get(f"/stops/{pid}/departures?limit=10")).json()
@@ -528,6 +541,11 @@ async def test_trip_of_a_live_vehicle(api):
     assert live["vehicle"] == v
     assert any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"])
     assert not {"current_index"} & set(live) and not any("passed" in s for s in live["stops"])
+    # each stop says where its time comes from: the feed's (live, ZTP predicts every stop) or none (scheduled)
+    for s in live["stops"]:
+        timed = bool(s["estimated_arrival"] or s["estimated_departure"])
+        assert s["status"] in (("live", "predicted") if timed else ("scheduled", "skipped"))
+    assert "live" in {s["status"] for s in live["stops"]}
     # the same live state by trip key
     by_key = await api.get(f"/trips/{v['trip_key']}/live")
     assert by_key.json() == live and by_key.headers["cache-control"] == "no-cache"
@@ -564,8 +582,9 @@ async def test_trip_without_realtime_or_shape(api, sql, loaded):
         "AND sd.service_id = t.service_id AND sd.date = '2026-10-25' WHERE t.feed_version_id = 'kmk_t_v1' ORDER BY 1"
     )
     r = redis.Redis.from_url(TEST_REDIS_URL)
-    trip_id = next(t for (t,) in candidates if not r.exists(f"rt:trip:kmk_t:20261025:{t}"))
+    with_realtime = json.loads(r.get("rt:trips:kmk_t"))
     r.close()
+    trip_id = next(t for (t,) in candidates if f"kmk_t:20261025:{t}" not in with_realtime)
     key = f"kmk_t:20261025:{trip_id}"
     live = (await api.get(f"/trips/{key}/live")).json()
     assert live["status"] == "scheduled" and live["vehicle"] is None
@@ -668,9 +687,11 @@ async def alerts_in_redis(api, sql):
         alert("other_direction", route_id=tram["route_id"], direction_id=1 - (tram["direction_id"] or 0)),
     ]
     r = Redis.from_url(TEST_REDIS_URL)
-    await r.set("rt:alerts:kmk_t", json.dumps(raws))
+    await r.set("rt:alerts:kmk_t", json.dumps({"timestamp": NOW, "alerts": raws}))
+    await reload_live(api)
     yield {"raws": raws, "tram": tram, "pid": pid, "group": group, "far": far}
     await r.delete("rt:alerts:kmk_t")
+    await reload_live(api)
     await r.aclose()
 
 
@@ -779,6 +800,7 @@ async def test_openapi_lists_every_endpoint(api):
         "/api/v1/alerts",
         "/api/v1/alerts/{alert_key}",
         "/api/v1/health",
+        "/api/v1/metrics",
     } == set(paths)
 
 
@@ -832,7 +854,8 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
     ]
     current = {"always", "now", "open_end", "soon", "over_and_soon"}
     r = Redis.from_url(TEST_REDIS_URL)
-    await r.set("rt:alerts:kmk_t", json.dumps(raws))
+    await r.set("rt:alerts:kmk_t", json.dumps({"timestamp": NOW, "alerts": raws}))
+    await reload_live(api)
     try:
         board = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()
         keys = {f"kmk_t:{a}" for a in current}
@@ -844,13 +867,14 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
         assert {a["key"] for a in (await api.get("/alerts?active=true")).json()["alerts"]} == keys
     finally:
         await r.delete("rt:alerts:kmk_t")
+        await reload_live(api)
         await r.aclose()
 
 
 @pytest.fixture
 async def api_no_raise(loaded):
     """Like `api`, but app exceptions become responses (as in production) instead of reaching the test."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     transport = ASGITransport(app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app), AsyncClient(transport=transport, base_url="http://test/api/v1") as c:
@@ -876,45 +900,16 @@ async def test_unexpected_errors_keep_the_error_body(api_no_raise, monkeypatch):
     assert r.json()["error"]["code"] == "unavailable" and "10.0.0.5" not in r.text
 
 
-# ------------------------------------------------------------------------------------------------- catalog, timing
+# ------------------------------------------------------------------------------------------------- catalog
 
 
 @pytest.fixture
 async def api_ctx(loaded):
     """Like `api`, with the app's context."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c, app.state.ctx
-
-
-def server_timing(response) -> dict[str, dict[str, str]]:
-    """`db;dur=1.2;desc="3 queries", total;dur=4.0` -> {"db": {"dur": "1.2", "desc": "3 queries"}, "total": {...}}"""
-    out = {}
-    for metric in response.headers["server-timing"].split(", "):
-        name, *params = metric.split(";")
-        out[name] = {k: v.strip('"') for k, v in (p.split("=", 1) for p in params)}
-    return out
-
-
-async def test_server_timing(api_ctx, sql):
-    api, _ = api_ctx
-    r = await api.get(f"/stops/{group_id(sql, '802')}/departures")
-    timing = server_timing(r)
-    assert set(timing) == {"db", "db-wait", "redis", "serialize", "total"}
-    assert int(timing["db"]["desc"].split()[0]) > 0 and int(timing["redis"]["desc"].split()[0]) > 0
-    assert all(float(m["dur"]) >= 0 for m in timing.values())
-    assert float(timing["total"]["dur"]) >= float(timing["serialize"]["dur"])
-    # an answer without the database: none counted, and nothing left over from the request before
-    timing = server_timing(await api.get(f"/vehicles?bbox={CITY_BBOX}"))
-    assert timing["db"]["desc"] == "0 queries" and timing["redis"]["desc"] != "0 calls"
-
-
-async def test_server_timing_off(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, server_timing=False)
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        assert "server-timing" not in (await c.get(f"/vehicles?bbox={CITY_BBOX}")).headers
 
 
 async def test_catalog_refreshes_in_the_background(api_ctx, sql, monkeypatch):
@@ -989,16 +984,267 @@ async def test_catalog_days_need_no_query(api_ctx, monkeypatch):
     assert len(queries) == 1  # outside the preloaded days: one indexed lookup
 
 
-async def test_trip_live_reads_postgres_and_redis_at_once(api_ctx, monkeypatch):
+async def test_live_data_is_served_from_memory_while_redis_is_down(api_ctx, monkeypatch):
+    """Requests read the live state of the process, not Redis: a Redis outage leaves the last data (until it is
+    older than the feeds' max age); a process that never loaded it answers 503."""
     from redis.exceptions import ConnectionError as RedisConnectionError
 
     api, ctx = api_ctx
     v = (await api.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"][0]
-    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 200
+    live = (await api.get(f"/trips/{v['trip_key']}/live")).json()
 
     async def down(*args, **kwargs):
         raise RedisConnectionError("down")
 
-    monkeypatch.setattr(ctx.redis, "mget", down)
-    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 503
+    for command in ("mget", "get", "hgetall", "geosearch", "pipeline", "execute_command"):
+        monkeypatch.setattr(ctx.redis, command, down)
+    assert (await api.get(f"/trips/{v['trip_key']}/live")).json() == live
+    assert v in (await api.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"]
     assert (await api.get("/trips/kmk_t:20261025:nope/live")).status_code == 404  # a missing trip still is a 404
+    monkeypatch.setattr(ctx.live_state, "ready", False)
+    r = await api.get(f"/vehicles?bbox={CITY_BBOX}")
+    assert r.status_code == 503 and r.headers["retry-after"] == "1"
+
+
+# ------------------------------------------------------------------------------------------------- metrics
+
+
+async def test_metrics_count_requests_by_route_template_across_app_instances(loaded):
+    """Each process flushes its histograms to Redis (at the latest when it stops); /metrics adds up all of them."""
+    r = Redis.from_url(TEST_REDIS_URL)
+    try:
+        await r.delete(*[k async for k in r.scan_iter(match="metrics:*")] or ["metrics:none"])
+        settings = ApiSettings(
+            _env_file=None,
+            database_url=loaded,
+            redis_url=TEST_REDIS_URL,
+            realtime_max_age=FIXTURE_MAX_AGE,
+        )
+        app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c,
+        ):
+            v = (await c.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"][0]
+            assert (await c.get(f"/trips/{v['trip_key']}/live")).status_code == 200
+            assert (await c.get("/trips/kmk_t:20261025:nope/live")).status_code == 404
+            assert (await c.get("/nothing/here")).status_code == 404
+        app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)  # another process reads them
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c,
+        ):
+            body = (await c.get("/metrics?window=120")).json()
+            assert (await c.get("/metrics?window=10")).status_code == 422
+    finally:
+        await r.aclose()
+    routes = {e["route"]: e for e in body["endpoints"]}
+    assert routes["GET /api/v1/vehicles"]["count"] == 1
+    live = routes["GET /api/v1/trips/{trip_key}/live"]  # the template, never the trip key
+    assert live["count"] == 2 and live["status"] == {"2xx": 1, "4xx": 1}
+    assert routes["GET (no route)"]["status"] == {"4xx": 1}
+    assert all(v["trip_key"] not in route for route in routes)
+    assert 0 < live["p50_ms"] <= live["p90_ms"] <= live["p99_ms"] <= live["max_ms"]
+    assert body["window_s"] == 120 and body["bucket_error"] == 0.091
+
+
+async def test_stale_realtime_is_not_shown(loaded, sql):
+    """With the worker stopped (nothing newer in Redis), trip updates and vehicles measured longer ago than the feed's
+    max age disappear from the map, boards and trips: the timetable stays."""
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)  # max age 120 s
+    for at, fresh in ((NOW + 60, True), (NOW + 121 + 30, False)):
+        app = create_app(settings, feeds=FEEDS, clock=lambda at=at: at)
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c,
+        ):
+            trams = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"]
+            board = (await c.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()["departures"]
+            assert board  # the timetable either way
+            statuses = {d["status"] for d in board if feed_of(d) == "kmk_t"}
+            if fresh:
+                assert trams and "live" in statuses
+                trip = trams[0]["trip_key"]
+            else:
+                assert trams == [] and statuses == {"scheduled"}
+                live = (await c.get(f"/trips/{trip}/live")).json()
+                assert live["status"] == "scheduled" and live["vehicle"] is None
+                assert {s["status"] for s in live["stops"]} == {"scheduled"}
+
+
+async def test_deleted_trips_leave_the_board_canceled_ones_stay(api, sql):
+    url = f"/stops/{group_id(sql, '802')}/departures?limit=30"
+    deps = (await api.get(url)).json()["departures"]
+    live = [d for d in deps if d["status"] == "live" and feed_of(d) == "kmk_t"][:2]
+    assert len(live) == 2
+    r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    saved = await r.get("rt:trips:kmk_t")
+    try:
+        trips = json.loads(saved)
+        for d, relationship in zip(live, ("DELETED", "CANCELED"), strict=True):
+            trips[d["trip_key"]]["schedule_relationship"] = relationship
+        await r.set("rt:trips:kmk_t", json.dumps(trips))
+        await reload_live(api)
+        deleted, canceled = live
+        after = {d["trip_key"]: d for d in (await api.get(url)).json()["departures"]}
+        assert deleted["trip_key"] not in after
+        assert after[canceled["trip_key"]]["status"] == "canceled"
+        assert (await api.get(f"/trips/{deleted['trip_key']}/live")).json()["status"] == "canceled"
+    finally:
+        await r.set("rt:trips:kmk_t", saved)
+        await reload_live(api)
+        await r.aclose()
+
+
+async def test_vehicles_joined_from_pieces_are_the_models_json(api_ctx, monkeypatch):
+    from gtfs_backend.api.data.geo import Bbox
+    from gtfs_backend.api.services import vehicles
+
+    c, ctx = api_ctx
+    for modes, routes in ((set(), set()), ({"tram"}, set()), (set(), {"52", "4"}), ({"bus"}, {"52"})):
+        bbox = Bbox.parse(CITY_BBOX)
+        joined = await vehicles.in_bbox_json(ctx, bbox, modes, routes)
+        assert joined == (await vehicles.in_bbox(ctx, bbox, modes, routes)).model_dump_json().encode()
+    assert (await c.get(f"/vehicles?bbox={CITY_BBOX}")).content == await vehicles.in_bbox_json(
+        ctx, Bbox.parse(CITY_BBOX), set(), set()
+    )
+    # the next request builds nothing: every vehicle's JSON is kept for its Redis value
+    built = []
+    real = vehicles.models
+
+    async def counting(ctx_, raws):
+        built.append(len(raws))
+        return await real(ctx_, raws)
+
+    monkeypatch.setattr(vehicles, "models", counting)
+    await c.get(f"/vehicles?bbox={CITY_BBOX}")
+    assert built == []
+
+
+# ------------------------------------------------------------------------------------------------- WebSocket
+
+
+@pytest.fixture
+async def served(loaded):
+    """The app on a real port (uvicorn), for WebSocket clients: (ws url, http base url, app)."""
+    import uvicorn
+
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
+    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on"))
+    task = asyncio.create_task(server.serve())
+    for _ in range(200):
+        if server.started:
+            break
+        await asyncio.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield f"ws://127.0.0.1:{port}/api/v1/ws", f"http://127.0.0.1:{port}/api/v1", app
+    server.should_exit = True
+    await task
+
+
+async def receive(ws, n, seconds=5.0):
+    out = []
+    for _ in range(n):
+        out.append(json.loads(await asyncio.wait_for(ws.recv(), seconds)))
+    return out
+
+
+async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served, sql):
+    from websockets.asyncio.client import connect
+
+    ws_url, http, _ = served
+    async with AsyncClient(base_url=http) as c:
+        city_rest = (await c.get(f"/vehicles?bbox={CITY_BBOX}")).json()
+        v = next(x for x in city_rest["vehicles"] if x["route"]["mode"] == "tram")
+        stop = group_id(sql, "802")
+        board_rest = (await c.get(f"/stops/{stop}/departures")).json()
+        trip_rest = (await c.get(f"/trips/{v['trip_key']}/live")).json()
+
+    topics = ["vehicles", f"stop:{stop}", f"trip:{v['trip_key']}"]
+    async with connect(ws_url) as ws:
+        await ws.send(json.dumps({"op": "subscribe", "topics": topics + ["tile:14/1/1", "stop:nope-zzzzz", "bad"]}))
+        got = {m.get("topic"): m for m in await receive(ws, 6)}
+        # every vehicle of the city, as GET /vehicles has them, without their own timestamps
+        snapshot = got["vehicles"]
+        assert snapshot["type"] == "snapshot" and snapshot["data"]["timestamp"] >= city_rest["timestamp"]
+        streamed = {x["key"]: x for x in snapshot["data"]["vehicles"]}
+        assert {x["key"]: {k: x[k] for k in x if k != "timestamp"} for x in city_rest["vehicles"]}.items() <= streamed.items()
+        assert got[topics[1]]["data"] == board_rest and got[topics[2]]["data"] == trip_rest
+        assert got["tile:14/1/1"]["error"]["code"] == "invalid_input" and got["stop:nope-zzzzz"]["error"]["code"] == "not_found"
+        assert got["bad"]["type"] == "error"
+
+        # the worker reports the tram a few metres on: an update with only it
+        r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+        feed = feed_of(v)
+        originals = list(json.loads(await r.get(f"rt:vehicles:{feed}")).values())
+        moved = [dict(o, lat=o["lat"] + 0.00005) if f"{feed}:{o['vehicle_id']}" == v["key"] else o for o in originals]
+        store = RealtimeStore(r, TTLS)
+        try:
+            from gtfs_backend.worker.realtime.normalize import Result
+
+            await store.write_vehicles(feed, Result(vehicles=originals))  # what the store last said: the originals
+            await store.publish(
+                feed, "vehicle_positions", NOW, {"vehicles": await store.write_vehicles(feed, Result(vehicles=moved))}
+            )
+            for _ in range(10):
+                (update,) = await receive(ws, 1)
+                if update["topic"] == "vehicles":
+                    break
+            assert update["type"] == "update" and update["data"]["remove"] == []
+            assert [(u["key"], u["lat"]) for u in update["data"]["upsert"]] == [(v["key"], round(v["lat"] + 0.00005, 5))]
+        finally:
+            await store.write_vehicles(feed, Result(vehicles=originals))
+            await store.publish(
+                feed,
+                "vehicle_positions",
+                NOW,
+                {"vehicles": {"set": {f"{feed}:{o['vehicle_id']}": o for o in originals}, "del": []}},
+            )
+            await r.aclose()
+
+        await ws.send(json.dumps({"op": "unsubscribe", "topics": topics}))
+        await ws.send("not json")
+        for _ in range(10):  # updates of the topics still on their way may come first
+            (error,) = await receive(ws, 1)
+            if error["type"] == "error":
+                break
+        assert error["type"] == "error" and error["topic"] is None
+
+
+async def test_extra_trips_come_from_realtime_onto_boards_and_trip_views(api_ctx, sql, monkeypatch):
+    """A trip no timetable has (GTFS-RT NEW, built by the worker): its departures on boards, its view and live state."""
+    api, ctx = api_ctx
+    gid = group_id(sql, "802")
+    tram = next(d for d in (await api.get(f"/stops/{gid}/departures?limit=60")).json()["departures"] if feed_of(d) == "kmk_t")
+    route_id = tram["route"]["key"].split(":", 1)[1]
+    pole, other = ident(tram["stop"]), stop_by_code(sql, "125-01")
+    key = "kmk_t:20261025:extra_1"
+    at = NOW + 600
+    stops = [
+        StopState(1, pole, at, at, None, False, at, False, at),
+        StopState(2, other, at + 300, None, None, False, None, False, at + 300),
+    ]
+    extra = TripState(1, False, False, None, NOW, None, stops, (route_id, "Extra"))
+    live = ctx.live
+    monkeypatch.setattr(live, "trips", {**live.trips, key: extra})
+    at_stop = {k: set(v) for k, v in live._at_stop.items()}
+    at_stop.setdefault(pole, set()).add((key, 0))
+    at_stop.setdefault(other, set()).add((key, 1))
+    monkeypatch.setattr(live, "_at_stop", at_stop)
+
+    board = (await api.get(f"/stops/{gid}/departures?limit=60")).json()["departures"]
+    (extra,) = [d for d in board if d["trip_key"] == key]
+    assert (extra["time"], extra["status"], extra["headsign"], extra["route"]["key"]) == (
+        at,
+        "live",
+        "Extra",
+        tram["route"]["key"],
+    )
+    assert extra["scheduled"] == at and extra["delay_s"] is None
+    view = (await api.get(f"/trips/{key}")).json()
+    assert view["headsign"] == "Extra" and view["route"]["key"] == tram["route"]["key"] and view["shape"]["source"] == "stops"
+    assert [(s["stop_sequence"], s["scheduled_departure"]) for s in view["stops"]] == [(1, at), (2, None)]
+    assert view["stops"][0]["stop"]["key"] == tram["stop"]["key"]
+    trip_live = (await api.get(f"/trips/{key}/live")).json()
+    assert trip_live["status"] == "live" and [s["status"] for s in trip_live["stops"]] == ["live", "live"]

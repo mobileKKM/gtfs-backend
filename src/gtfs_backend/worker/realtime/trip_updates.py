@@ -107,6 +107,17 @@ def propagate(ref: TripRef, index: TripIndex, stops: list[StopTime], explicit: d
     return rows
 
 
+def with_timetable(ref: TripRef, index: TripIndex, stops: list[StopTime], rows: list[StopRow]) -> list[StopRow]:
+    """Every stop of the trip, in order: its row where it has one, else its timetable without a prediction. For trips
+    no timetable has (DUPLICATED copies), whose stops come only from realtime. The last stop is no departure, as in
+    the timetable's departures."""
+    by_sequence = {r["stop_sequence"]: r for r in rows}
+    out = [by_sequence.get(st.sequence) or _row(ref, index, st, None, None, "SCHEDULED") for st in stops]
+    if out:
+        out[-1] = {**out[-1], "scheduled_departure": None}
+    return out
+
+
 def trip_fields(feed_id: str, ref: TripRef) -> TripFields:
     i = ref.info
     return {

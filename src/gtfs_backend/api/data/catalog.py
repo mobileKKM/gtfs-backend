@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -145,8 +144,7 @@ class Catalog:
             return
         if time.monotonic() < self._retry_at:
             return
-        # a context of its own: the refresh is no request's work (api/timing.py)
-        self._refresh = asyncio.create_task(self._refresh_now(), context=contextvars.Context())
+        self._refresh = asyncio.create_task(self._refresh_now())
 
     async def _refresh_now(self) -> None:
         try:
@@ -207,6 +205,10 @@ class Catalog:
         self.stops = stops
         self._loaded_for = {f: local_date(now, info.tz) for f, info in feeds.items()}
         self._routes = {v: routes for v, routes in self._routes.items() if v in ready}  # retired ones go
+        # the routes of every version a preloaded day uses, so no request waits for them
+        if missing := sorted({d.feed_version_id for info in feeds.values() for d in info.days} - set(self._routes)):
+            async with self._routes_lock:
+                await self._load_routes(missing)
         self._loaded_at = now
         self._loaded_generation = generation
 

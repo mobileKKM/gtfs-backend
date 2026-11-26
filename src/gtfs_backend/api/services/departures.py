@@ -1,12 +1,12 @@
-"""Departure boards: the timetable from Postgres (core.stop_departure) with realtime predictions from Redis
-(rt:tripstate, rt:stop:*: only the board's stops) laid over it.
+"""Departure boards: the timetable from Postgres (core.stop_departure) with the realtime predictions at the board's stops
+from the process's live state (api/data/live.py).
 
 The timetable query covers every authoritative service day that can run in the window (a night trip of
 yesterday's service can still be running) and reaches back LOOKBACK_S so delayed trips stay on the board until
 they leave (and GRACE_S after).
 
 A board starts at `time` (epoch). Without it, it starts now and leaves out departures that have left; with it, rows
-from that time on include departed ones as `departed`, with the last time realtime knew. Clients page by passing
+from that time on include departed ones (`departed: true`), with the last time realtime knew. Clients page by passing
 the last departure's time. `feeds` and `routes` (route names) narrow the board, and its alerts with it.
 """
 
@@ -21,13 +21,14 @@ from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Catalog, Day, RouteInfo
-from gtfs_backend.api.data.realtime import TripState, TripUpdate
+from gtfs_backend.api.data.live import LiveBoard
 from gtfs_backend.api.data.sql import union_per_version
 from gtfs_backend.api.data.stopdata import Hourly
 from gtfs_backend.api.errors import InvalidInput
 from gtfs_backend.api.schemas import Departure, DepartureBoard, DepartureStatus, RouteRef
 from gtfs_backend.api.schemas.departures import VehicleState
 from gtfs_backend.api.services import alerts, stops, vehicles
+from gtfs_backend.live_layout import StopState, TripState
 
 LOOKBACK_S = 60 * 60  # delayed departures stay this long past their time
 GRACE_S = 30  # keep a departure this long after it leaves
@@ -65,6 +66,7 @@ class Live:
     delay_s: int | None
     realtime: bool
     status: DepartureStatus
+    departed: bool
     vehicle_id: str | None
     timestamp: int | None = None  # of the trip update
 
@@ -132,37 +134,81 @@ async def scheduled(
     return out
 
 
+async def timetable(
+    ctx: Context, days: list[Day], public_stop_ids: list[str], start: int, end: int, lookback: int = LOOKBACK_S
+) -> list[Scheduled]:
+    """scheduled() on a connection held only for the query."""
+    async with ctx.pool.connection() as conn:
+        return await scheduled(conn, days, public_stop_ids, start, end, lookback)
+
+
+def _extra_rows(live_data: LiveBoard, days: list[Day], lo: int, hi: int) -> list[Scheduled]:
+    """The departures of trips no timetable has (GTFS-RT NEW, DUPLICATED, ...) from the live state, as timetable rows
+    of the day they run on (one of `days`, in the version realtime has)."""
+    by_date = {(d.feed_id, d.date): d for d in days}
+    out = []
+    for key, stop, trip in live_data.extra_departures(lo, hi):
+        feed_id, service_date, trip_id = keys.parse_trip_key(key)
+        day = by_date.get((feed_id, service_date))
+        if day is None or trip.version != day.version:
+            continue
+        route_id, headsign = trip.extra
+        out.append(
+            Scheduled(
+                feed_id,
+                day.feed_version_id,
+                day.version,
+                service_date,
+                trip_id,
+                stop.stop_sequence,
+                stop.public_stop_id,
+                stop.scheduled_departure,
+                headsign,
+                route_id or "",
+                False,
+                key,
+            )
+        )
+    return out
+
+
 def runs(vehicle: dict | None, s: Scheduled) -> bool:
     """Whether the vehicle is on this trip (it may have moved on to the next one) in this timetable version."""
     return vehicle is not None and vehicle["trip"]["key"] == s.trip_key and vehicle["trip"]["version"] == s.version
 
 
 def overlay(
-    s: Scheduled, update: TripUpdate | TripState | None, now: int, vehicle: dict | None = None, grace: int = GRACE_S
+    s: Scheduled,
+    trip: TripState | None,
+    stop: StopState | None,
+    now: int,
+    vehicle: dict | None = None,
+    grace: int = GRACE_S,
 ) -> Live:
-    """Realtime state of one scheduled departure.
+    """Realtime state of one scheduled departure: `trip`'s state and its `stop` at this departure's stop (if any).
 
-    `departed` once the vehicle reports a later stop of the trip (GTFS-RT VehiclePosition.current_stop_sequence),
-    or, without that, once its time is `grace` past. A TripUpdate says nothing about passed stops: it only lists
-    predictions, so a stop it doesn't list isn't taken as passed.
+    `status`: `canceled` (the trip), `skipped` (this stop), `live` (the feed predicts this stop), `predicted` (a delay
+    carried over from an earlier stop), else `scheduled`. `departed` once the vehicle reports a later stop of the trip
+    (GTFS-RT VehiclePosition.current_stop_sequence), or, without that, once its time is `grace` past. A trip update says
+    nothing about passed stops: it only lists predictions, so a stop it doesn't list isn't taken as passed.
     """
-    if update is not None and update.version != s.version:
-        update = None  # computed for another timetable version: stop sequences differ
-    stop = update.stop(s.stop_sequence) if update else None
+    if trip is None or trip.version != s.version:
+        trip = stop = None  # none, or computed for another timetable version: stop sequences differ
     estimated = stop.predicted if stop else None
     delay = stop.delay_s if stop else None
-    is_live = estimated is not None or delay is not None
-    if update is not None and update.canceled:
+    is_live = estimated is not None
+    if trip is not None and trip.canceled:
         status = "canceled"
     elif stop is not None and stop.skipped:
         status = "skipped"
-    elif _vehicle_past(vehicle, s) or (estimated or s.scheduled_departure) + grace < now:
-        status = "departed"
+    elif is_live:
+        status = "predicted" if stop.propagated else "live"
     else:
-        status = "live" if is_live else "scheduled"
-    if update is None:
-        return Live(estimated, delay, is_live, status, None)
-    return Live(estimated, delay, is_live, status, update.vehicle_id, update.timestamp)
+        status = "scheduled"
+    departed = _vehicle_past(vehicle, s) or (estimated or s.scheduled_departure) + grace < now
+    if trip is None:
+        return Live(estimated, delay, is_live, status, departed, None)
+    return Live(estimated, delay, is_live, status, departed, trip.vehicle_id, trip.timestamp)
 
 
 def _vehicle_past(vehicle: dict | None, s: Scheduled) -> bool:
@@ -171,7 +217,7 @@ def _vehicle_past(vehicle: dict | None, s: Scheduled) -> bool:
 
 
 def _upcoming(row: Row, now: int, grace: int) -> bool:
-    return row.live.status != "departed" and row.time >= now - grace
+    return not row.live.departed and row.time >= now - grace
 
 
 def select(rows: list[Row], now: int, limit: int, start: int, end: int, live: bool, grace: int = GRACE_S) -> list[Row]:
@@ -186,12 +232,16 @@ def select(rows: list[Row], now: int, limit: int, start: int, end: int, live: bo
 
 
 async def _vehicles(ctx: Context, found: list[Scheduled], states: dict[str, TripState]) -> dict[str, dict]:
-    """trip_key -> JSON of the vehicle running it, for the trips whose realtime names one (one Redis call)."""
+    """trip_key -> the vehicle running it, for the trips whose realtime names one."""
     wanted = {
         s.trip_key: keys.vehicle_key(s.feed_id, u.vehicle_id) for s in found if (u := states.get(s.trip_key)) and u.vehicle_id
     }
-    raws = await realtime.vehicle_json(ctx.redis, sorted(set(wanted.values())))
-    by_key = {keys.vehicle_key(v["feed_id"], v["vehicle_id"]): v for v in raws}
+    live = ctx.live
+    raws = [v for k in sorted(set(wanted.values())) if (v := live.vehicle(k)) is not None]
+    since = ctx.fresh_since()
+    by_key = {
+        keys.vehicle_key(v["feed_id"], v["vehicle_id"]): v for v in raws if ctx.fresh(v["feed_id"], v.get("timestamp"), since)
+    }
     return {t: v for t, k in wanted.items() if (v := by_key.get(k)) and v["trip"]["key"] == t}
 
 
@@ -213,7 +263,7 @@ async def _page(
     page: list[Row] = []
     fetched_to: int | None = None  # departures are read up to here (from lo - LOOKBACK_S)
     board_feeds = [f for f in ctx.feed_ids if not feeds or f in feeds]
-    live_data = await realtime.BoardRealtime.read(ctx.redis, board_feeds, pids)
+    live_data = ctx.live.board(board_feeds, pids, ctx.fresh_since())
     first_span = expected_span(ctx.catalog.stops.hourly(pids), _second_of_day(ctx.catalog, start), limit)
     for span in [first_span, *(w for w in WINDOWS_S if w > first_span)]:
         hi = start + span
@@ -222,22 +272,22 @@ async def _page(
         else:
             first, lookback = fetched_to + 1, 0
         days = [d for d in await ctx.catalog.days_between(first, hi) if not feeds or d.feed_id in feeds]
-        # a connection only for the query: held across the Redis calls below, boards would queue for the pool
-        async with ctx.pool.connection() as conn:
-            found = await scheduled(conn, days, pids, first, hi, lookback)
+        found = await timetable(ctx, days, pids, first, hi, lookback) + _extra_rows(live_data, days, first - lookback, hi)
         fetched_to = hi
         refs |= await ctx.catalog.route_refs({(f.feed_version_id, f.route_id) for f in found})
         if route_names:
             found = [f for f in found if (ref := refs.get((f.feed_version_id, f.route_id))) and ref.name in route_names]
-        # only what these stops need of each trip (rt:stop:*), not whole trips
-        states = live_data.states({f.trip_key for f in found})
+        states = {k: trip for k in {f.trip_key for f in found} if (trip := live_data.trip(k)) is not None}
+        # the feed deleted the trip (GTFS-RT DELETED, unlike CANCELED): not shown at all
+        found = [f for f in found if not ((st := states.get(f.trip_key)) and st.deleted and st.version == f.version)]
         # the hour before `lo` only for delays: without realtime (of its version) such a departure has left (live)
         # or is before the board's start (with a time), so it can't be on the page. Most of that hour is gone here.
         found = [f for f in found if f.scheduled_departure >= lo or _realtime_of(states, f)]
         by_vehicle = await _vehicles(ctx, found, states)
-        rows += [
-            Row(f, overlay(f, states.get(f.trip_key), now, by_vehicle.get(f.trip_key)), by_vehicle.get(f.trip_key)) for f in found
-        ]
+        for f in found:
+            vehicle = by_vehicle.get(f.trip_key)
+            shown = overlay(f, states.get(f.trip_key), live_data.stop(f.trip_key, f.stop_sequence), now, vehicle)
+            rows.append(Row(f, shown, vehicle))
         page = select(rows, now, limit, lo, hi, live)
         # full, unless a trip scheduled after the window runs early enough to come before its last departure
         if len(page) >= limit and ((early := live_data.earliest_early(hi, lo)) is None or early > page[-1].time):
@@ -277,7 +327,7 @@ VEHICLE_STATES = {"stopped_at": "at_stop", "incoming_at": "arriving"}
 
 def vehicle_state(row: Row, vehicle: dict | None) -> VehicleState | None:
     """Whether the vehicle is at / arriving at this very stop; the feed's stop report says so only for one stop."""
-    if vehicle is None or row.live.status in ("departed", "canceled", "skipped"):
+    if vehicle is None or row.live.departed or row.live.status in ("canceled", "skipped"):
         return None
     seq, status = vehicles.stop_state(vehicle)
     if seq != row.s.stop_sequence:
@@ -298,6 +348,7 @@ def _departure(row: Row, route: RouteRef | None, stop, state: VehicleState | Non
         time=row.time,
         delay_s=live.delay_s,
         status=live.status,
+        departed=live.departed,
         vehicle_key=keys.vehicle_key(s.feed_id, live.vehicle_id) if live.vehicle_id else None,
         vehicle_state=state,
         on_demand=s.on_demand,

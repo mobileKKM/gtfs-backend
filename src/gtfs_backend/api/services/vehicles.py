@@ -1,6 +1,8 @@
-"""Live vehicles (Redis only)."""
+"""Live vehicles, from the process's live state (api/data/live.py)."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
@@ -11,6 +13,9 @@ from gtfs_backend.keys import vehicle_key, version_id
 
 MAX_BBOX_KM = 50
 COORD_DIGITS = 5  # ~1 m
+# the WebSocket stream (city): a Vehicle without its own timestamp, which is new at every poll: a vehicle standing at
+# a stop then sends nothing
+STREAM_EXCLUDE = {"timestamp"}
 
 
 def stop_state(raw: dict) -> tuple[int | None, str | None]:
@@ -48,23 +53,92 @@ async def models(ctx: Context, raws: list[dict]) -> list[Vehicle]:
 
 
 async def by_ids(ctx: Context, ids: list[str]) -> list[Vehicle]:
-    """Vehicles by key; expired ones are skipped."""
-    return await models(ctx, await realtime.vehicle_json(ctx.redis, ids))
+    """Vehicles by key; gone ones and positions older than their feed's realtime max age are skipped."""
+    live = ctx.live
+    return await models(ctx, fresh(ctx, [v for i in ids if (v := live.vehicle(i)) is not None]))
+
+
+def fresh(ctx: Context, raws: list[dict]) -> list[dict]:
+    since = ctx.fresh_since()
+    return [v for v in raws if ctx.fresh(v["feed_id"], v.get("timestamp"), since)]
 
 
 async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[str]) -> VehicleList:
-    """Vehicles inside the box, optionally only some modes / route names."""
+    """Vehicles inside the box, optionally only some modes / route names (as models: in_bbox_json is the endpoint's)."""
+    pieces = await _in_bbox(ctx, bbox, modes, route_names)
+    return VehicleList(timestamp=realtime.newest(p.timestamp for p in pieces), vehicles=[p.model for p in pieces])
+
+
+async def in_bbox_json(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[str]) -> bytes:
+    """GET /vehicles: a VehicleList body, joined from each vehicle's JSON (built once per position, _pieces):
+    byte for byte what in_bbox(...).model_dump_json() gives."""
+    pieces = await _in_bbox(ctx, bbox, modes, route_names)
+    newest = realtime.newest(p.timestamp for p in pieces)
+    head = b'{"timestamp":' + (b"null" if newest is None else str(newest).encode()) + b',"vehicles":['
+    return head + b",".join(p.json for p in pieces) + b"]}"
+
+
+async def _in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[str]) -> list[Piece]:
     width, height = bbox.size_km()
     if max(width, height) > MAX_BBOX_KM:
         raise InvalidInput(f"bbox is larger than {MAX_BBOX_KM:g} km")
-    center = bbox.center
-    # GEOSEARCH boxes are approximate: search a little wider, then cut exactly
-    ids = await realtime.vehicles_near(ctx.redis, center.lat, center.lon, width * 1.02 + 0.01, height * 1.02 + 0.01)
-    out = [
-        v
-        for v in await by_ids(ctx, sorted(ids))
-        if bbox.contains(v.lat, v.lon)
-        and (not modes or (v.route is not None and v.route.mode in modes))
-        and (not route_names or (v.route is not None and v.route.name in route_names))
+    pieces = await _pieces(ctx, ctx.live.vehicles_in(bbox))  # the grid cells the box touches: cut exactly below
+    since = ctx.fresh_since()
+    return [
+        p
+        for p in pieces
+        if ctx.fresh(p.feed_id, p.timestamp, since)
+        and bbox.contains(p.lat, p.lon)
+        and (not modes or p.mode in modes)
+        and (not route_names or p.route_name in route_names)
     ]
-    return VehicleList(timestamp=realtime.newest(v.timestamp for v in out), vehicles=out)
+
+
+async def city(ctx: Context) -> tuple[int | None, dict[str, bytes]]:
+    """Every vehicle shown, of every feed: (the newest one's timestamp, vehicle key -> its stream JSON), for the
+    WebSocket's `vehicles` topic."""
+    pieces = await _pieces(ctx, sorted(ctx.live.vehicles.items()))
+    since = ctx.fresh_since()
+    shown = [p for p in pieces if ctx.fresh(p.feed_id, p.timestamp, since)]
+    return realtime.newest(p.timestamp for p in shown), {p.model.key: p.stream_json for p in shown}
+
+
+@dataclass(frozen=True, slots=True)
+class Piece:
+    """One vehicle of /vehicles: what the filters look at, the model and its JSON."""
+
+    feed_id: str
+    lat: float  # as shown (rounded)
+    lon: float
+    mode: str | None
+    route_name: str | None
+    timestamp: int | None
+    model: Vehicle
+    json: bytes
+    stream_json: bytes  # without STREAM_EXCLUDE
+
+
+async def _pieces(ctx: Context, found: list[tuple[str, dict]]) -> list[Piece]:
+    """Each vehicle's Piece, built once per position: the live state keeps it (vehicle_pieces) until the vehicle
+    changes, so the next ~thousand requests of the map only filter and join. One whose route isn't known yet (its
+    version's routes not loaded) isn't kept."""
+    live = ctx.live
+    pieces = {key: piece for key, _ in found if (piece := live.vehicle_pieces.get(key)) is not None}
+    missing = [(key, raw) for key, raw in found if key not in pieces]
+    if missing:
+        built = await models(ctx, [raw for _, raw in missing])  # may wait for routes: the live state can change
+        for (key, raw), model in zip(missing, built, strict=True):
+            pieces[key] = piece = Piece(
+                feed_id=key.split(":", 1)[0],
+                lat=model.lat,
+                lon=model.lon,
+                mode=model.route.mode if model.route else None,
+                route_name=model.route.name if model.route else None,
+                timestamp=model.timestamp,
+                model=model,
+                json=model.model_dump_json().encode(),
+                stream_json=model.model_dump_json(exclude=STREAM_EXCLUDE).encode(),
+            )
+            if model.route is not None and live.vehicles.get(key) is raw:  # kept only while it is the current one
+                live.vehicle_pieces[key] = piece
+    return [pieces[key] for key, _ in found]

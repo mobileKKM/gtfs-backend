@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
 
-from gtfs_backend import live_layout
+from gtfs_backend import live_layout, metrics
 from gtfs_backend.db import async_pool, connect
 from gtfs_backend.feeds import FeedConfig, load_feeds
 from gtfs_backend.logs import log
@@ -26,7 +26,7 @@ from gtfs_backend.worker.realtime.store import RealtimeStore, TTLs
 from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static.fetch import PREVIOUSLY_FAILED, check_static, import_order
 from gtfs_backend.worker.static.stops.osm import fetch_osm_poles, file_age_s
-from gtfs_backend.worker.static.versions import RetirementBusy, retire_versions
+from gtfs_backend.worker.static.versions import RetirementBusy, feed_today, retire_versions
 
 # Touched every HEARTBEAT_INTERVAL_S while every realtime task keeps finishing polls; the healthcheck in
 # docker-compose.yml reads its age (and hardcodes this path).
@@ -38,6 +38,10 @@ OSM_CHECK_INTERVAL_S = 3600  # how often the OSM file's age is looked at
 OSM_FIRST_ATTEMPTS = 3  # the first fetch is tried this often before feeds that need the file start without it
 OSM_RETRY_DELAY_S = 30
 MIN_FETCH_ATTEMPT_S = 5  # a realtime download attempt may take its poll interval, but at least this long
+# After an import, `static:updated` waits until the feed's realtime is written for the new version (at each file's
+# next poll), so the API doesn't switch to a version no realtime is written for yet: at most this long.
+REWRITE_WAIT_MAX_S = 90
+REWRITE_CHECK_S = 0.25
 
 
 def _import_executor() -> ProcessPoolExecutor:
@@ -62,6 +66,10 @@ class Worker:
             self.osm_ready.set()
         self.realtime_tasks: list[RealtimeTask] = []
         self.exit_code = 0
+        self.clock = settings.clock()  # time.time() unless CLOCK_OFFSET (benchmark replays)
+        self.recorder = metrics.Recorder()  # data age per realtime file, flushed to Redis (gtfs_backend/metrics.py)
+        if settings.clock_offset:
+            log.warning("clock_offset", seconds=settings.clock_offset)
 
     async def run(self) -> int:
         """Until SIGINT/SIGTERM, or until a task ends (a bug: every loop catches its own errors) or gets stuck.
@@ -98,9 +106,9 @@ class Worker:
         self.static_client = make_client(s.static_download_timeout, s.http_connect_timeout)
         self.rt_client = make_client(s.realtime_fetch_timeout, s.http_connect_timeout)
         self.executor = _import_executor()
-        self.runtimes = {f.feed_id: FeedRuntime(f, self.pool) for f in self.enabled}
+        self.runtimes = {f.feed_id: FeedRuntime(f, self.pool, max_age=s.max_age(f)) for f in self.enabled}
         ttls = TTLs(vehicle=s.vehicle_ttl, trip=s.trip_ttl, alert=s.alert_ttl, unmatched=s.unmatched_ttl)
-        self.store = RealtimeStore(self.redis, [f.feed_id for f in self.enabled], ttls)
+        self.store = RealtimeStore(self.redis, ttls)
 
     async def _close(self) -> None:
         for rt in self.runtimes.values():
@@ -124,10 +132,12 @@ class Worker:
                     self.store,
                     self.rt_client,
                     interval=interval,
-                    max_age=feed.realtime_max_age or s.realtime_max_age,
+                    max_age=s.max_age(feed),
                     retries=s.http_retries,
                     retry_delay=s.http_retry_delay,
                     attempt_timeout=min(s.realtime_fetch_timeout, max(interval, MIN_FETCH_ATTEMPT_S)),
+                    clock=self.clock,
+                    recorder=self.recorder,
                 )
                 self.realtime_tasks.append(task)
                 tasks.append(asyncio.create_task(task.run(), name=f"realtime:{task.name}"))
@@ -135,6 +145,7 @@ class Worker:
             tasks.append(asyncio.create_task(self._osm_loop(), name="osm"))
         tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
         tasks.append(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
+        tasks.append(asyncio.create_task(self.recorder.run(self.redis), name="metrics"))
         log.info("worker_started", tasks=[t.get_name() for t in tasks])
         return tasks
 
@@ -218,6 +229,7 @@ class Worker:
                 )
                 if result.status == "ready":
                     self._invalidate_runtimes()
+                    await self._rewrite_realtime(feed)
                     await self.redis.publish(live_layout.STATIC_UPDATED, feed.feed_id)
         except asyncio.CancelledError:
             raise
@@ -230,13 +242,35 @@ class Worker:
         except Exception as exc:  # noqa: BLE001
             bound.error("static_check_failed", error=f"{type(exc).__name__}: {exc}")
 
+    async def _rewrite_realtime(self, feed: FeedConfig) -> None:
+        """Load the feed's new trip index and wait until each of its realtime files was written with it (each processes
+        its last update again at its next poll), at most REWRITE_WAIT_MAX_S. Realtime carries the timetable version it
+        was computed for, and the API uses it only for the version serving the day: switching the API first would leave
+        boards without realtime until the files change (5 min for km_kolej)."""
+        bound = log.bind(feed=feed.feed_id)
+        runtime = self.runtimes.get(feed.feed_id)
+        if runtime is None or not await runtime.reload(self.clock()):
+            bound.warning("realtime_rewrite_skipped", reason="index not loaded")
+            return
+        generation = runtime.generation
+        tasks = [t for t in self.realtime_tasks if t.feed_id == feed.feed_id and t.last_msg is not None]
+        wait = min(REWRITE_WAIT_MAX_S, 2 * max((t.interval for t in tasks), default=0) + 5)
+        deadline = time.monotonic() + wait
+        while (pending := [t.name for t in tasks if t.written_generation < generation]) and time.monotonic() < deadline:
+            await asyncio.sleep(REWRITE_CHECK_S)
+        if pending:
+            bound.warning("realtime_rewrite_incomplete", pending=pending, waited_s=wait)
+        else:
+            bound.info("realtime_rewritten", files=len(tasks))
+
     def _retire_all(self) -> tuple[dict[str, list[int]], list[str]]:
         """(retired version numbers per feed, feeds whose tables were busy)."""
         retired, busy = {}, []
+        now = datetime.fromtimestamp(self.clock(), MAINTENANCE_TZ)
         with connect(self.settings.database_url) as conn, conn.transaction():
             for feed in self.feeds.feeds:
                 try:
-                    retired[feed.feed_id] = retire_versions(conn, feed.feed_id)
+                    retired[feed.feed_id] = retire_versions(conn, feed.feed_id, feed_today(conn, feed.feed_id, now))
                 except RetirementBusy:
                     busy.append(feed.feed_id)
         return retired, busy
@@ -261,7 +295,7 @@ class Worker:
         last_retire = None
         while True:
             await asyncio.sleep(MAINTENANCE_CHECK_INTERVAL_S)
-            now = datetime.now(MAINTENANCE_TZ)
+            now = datetime.fromtimestamp(self.clock(), MAINTENANCE_TZ)
             if now.time() >= self.settings.retire_at and last_retire != now.date() and await self._retire_once():
                 last_retire = now.date()
 

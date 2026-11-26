@@ -33,6 +33,10 @@ class InvalidInput(ServiceError):
     code = "invalid_input"
 
 
+class LiveUnavailable(Exception):
+    """The process hasn't loaded the live data yet (Redis unreachable since it started)."""
+
+
 class ErrorDetail(BaseModel):
     code: str  # not_found, invalid_input, method_not_allowed, ...
     message: str
@@ -82,6 +86,7 @@ def install(app: FastAPI) -> None:
 
     @app.exception_handler(RedisConnectionError)
     @app.exception_handler(RedisTimeoutError)
+    @app.exception_handler(LiveUnavailable)
     async def redis_down(request: Request, exc: Exception) -> JSONResponse:
         return _error(503, "unavailable", "live data unavailable, try again", {"Retry-After": "1"})
 

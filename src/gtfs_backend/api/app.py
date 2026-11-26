@@ -4,29 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from redis.asyncio import BlockingConnectionPool, Redis
 
-from gtfs_backend import live_layout
-from gtfs_backend.api import errors
+from gtfs_backend import live_layout, metrics
+from gtfs_backend.api import errors, ws
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog, Clock
+from gtfs_backend.api.data.live import LiveState
+from gtfs_backend.api.metrics import RequestMetricsMiddleware
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
+from gtfs_backend.api.routers import metrics as metrics_router
 from gtfs_backend.api.settings import ApiSettings, get_api_settings
-from gtfs_backend.api.timing import ServerTimingMiddleware, TimedConnection, TimedPool, TimedRedis
 from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
 
 GZIP_LEVEL = 6
+LIVE_WARMUP_S = 10  # how long the start waits for the live data's first load
 
 
 async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
-    """The worker publishes `static:updated` after an import; reload the catalog then."""
+    """The worker publishes `static:updated` after an import: reload the catalog."""
     while True:
         try:
             async with redis.pubsub() as ps:
@@ -54,23 +56,23 @@ unset). Responses carry `ETag`; live ones are `no-cache`, so poll them (about ev
 Errors are `{"error": {"code", "message"}}`."""
 
 
-def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None = None, clock: Clock = time.time) -> FastAPI:
-    """Called once in every API process (API_WORKERS), so each sets up its own logging, pools and catalog."""
+def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None = None, clock: Clock | None = None) -> FastAPI:
+    """Called once in every API process (API_WORKERS), so each sets up its own logging, pools and catalog.
+    `clock`: default time.time(), shifted by CLOCK_OFFSET (benchmark replays)."""
     settings = settings or get_api_settings()
     setup_logging(settings.log_level)
+    if clock is None:
+        clock = settings.clock()
+        if settings.clock_offset:
+            log.warning("clock_offset", seconds=settings.clock_offset)
+    recorder = metrics.Recorder()  # this process's request latencies (gtfs_backend/metrics.py)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        pool = async_pool(
-            settings.database_url,
-            max_size=settings.db_pool_max_size,
-            timeout=settings.db_pool_timeout,
-            pool_class=TimedPool,
-            connection_class=TimedConnection,
-        )
+        pool = async_pool(settings.database_url, max_size=settings.db_pool_max_size, timeout=settings.db_pool_timeout)
         await pool.open()
         # bounded: under load requests wait for a connection (then 503) instead of opening ever more
-        redis = TimedRedis(
+        redis = Redis(
             connection_pool=BlockingConnectionPool.from_url(
                 settings.redis_url,
                 decode_responses=True,
@@ -84,14 +86,29 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             await catalog.ensure_fresh()
         except Exception as exc:  # noqa: BLE001
             log.warning("catalog_warmup_failed", error=str(exc))
-        app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings)
+        live = LiveState(
+            redis,
+            [f.feed_id for f in feeds_file.enabled],
+            {f.feed_id: [k.value for k, _ in f.realtime.items()] for f in feeds_file.enabled},
+        )
+        live.start()
+        if not await live.wait_ready(LIVE_WARMUP_S):  # requests before the first load get 503s
+            log.warning("live_warmup_failed")
+        app.state.ctx = ctx = Context(pool, redis, feeds_file, catalog, clock, settings, live)
+        app.state.hub = hub = ws.Hub(ctx)  # WebSocket push (api/ws.py), following the live state
+        live.listeners.append(hub.on_change)
+        hub.start()
         listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
+        flusher = asyncio.create_task(recorder.run(redis))
         try:
             yield
         finally:
-            listener.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await listener
+            for task in (listener, flusher):  # the flusher sends what is left when cancelled, so before Redis closes
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await hub.close()
+            await live.close()
             await catalog.close()
             await redis.aclose()
             await pool.close()
@@ -108,10 +125,11 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
     # level 6 (zlib's default), not Starlette's 9: about a quarter of the time for a 5 % bigger body (640 kB of JSON:
     # 5.5 ms instead of 19.7 ms, 77 kB instead of 73 kB)
     app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=GZIP_LEVEL)
-    if settings.server_timing:
-        app.add_middleware(ServerTimingMiddleware)  # outermost: its `total` includes gzip
+    if settings.request_metrics:
+        app.add_middleware(RequestMetricsMiddleware, recorder=recorder)  # outermost: times everything
     errors.install(app)
 
-    for module in (vehicles, stops, trips, routes, alerts, health):
+    for module in (vehicles, stops, trips, routes, alerts, health, metrics_router):
         app.include_router(module.router, responses=errors.ERROR_RESPONSES)
+    app.include_router(ws.router)
     return app

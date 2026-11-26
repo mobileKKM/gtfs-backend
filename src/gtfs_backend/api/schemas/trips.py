@@ -39,12 +39,16 @@ class TripView(BaseModel):
     stops: list[TripStop]
 
 
+# as a departure's status (DepartureStatus), for one stop of the trip
+TripStopStatus = Literal["scheduled", "live", "predicted", "skipped"]
+
+
 class TripStopLive(BaseModel):
     stop_sequence: int
+    status: TripStopStatus
     estimated_arrival: int | None = None
     estimated_departure: int | None = None
     delay_s: int | None = None
-    skipped: bool = False
 
 
 class TripLive(BaseModel):

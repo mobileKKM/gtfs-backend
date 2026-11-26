@@ -4,7 +4,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
 
-from gtfs_backend.api import timing
 from gtfs_backend.api.cache import LIVE, json_bytes_response, json_response, public
 from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, RoutesQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
@@ -20,8 +19,7 @@ async def stops_in_bbox(request: Request, ctx: Ctx, bbox: BboxQuery, modes: Mode
     (`kind=group`, one marker per logical stop at its stops' centroid) for far zoom levels.
 
     `modes` keeps stops served by any of them, e.g. `kind=group&modes=rail` for train stations."""
-    with timing.serializing():
-        body = stops.in_bbox_json(ctx, bbox, modes, kind)
+    body = stops.in_bbox_json(ctx, bbox, modes, kind)
     return json_bytes_response(request, body, public(ctx.settings.cache_ttl_static))
 
 
@@ -52,8 +50,11 @@ async def departure_board(
     """Departures from a stop group (all its stops) or one stop, with realtime.
 
     Without `time`: the next departures (delayed ones stay until they leave). With it: the departures from then on,
-    where those that have left show as `departed`. Page forward by passing the last departure's `time` (departures
+    where those that have left have `departed: true`. Page forward by passing the last departure's `time` (departures
     in the same second can repeat: tell them apart by `trip_key` and `stop_sequence`). `feeds` and `routes` (route
     names) narrow the board and its alerts. Canceled trips and skipped stops stay with their status.
+
+    `status` says where the time comes from: `scheduled` (timetable), `live` (the feed's prediction for this stop),
+    `predicted` (a delay the feed gave for an earlier stop, carried over), `canceled`, `skipped`.
     """
     return json_response(request, await departures.board(ctx, stop_key, time, feeds, routes, limit), LIVE)

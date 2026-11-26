@@ -21,8 +21,8 @@ class ApiSettings(Settings):
     catalog_refresh_interval: float = Field(default=300, gt=0)  # also reloaded on `static:updated` and day change
     static_listener_retry_delay: float = Field(default=5, gt=0)
 
-    # `Server-Timing` header on every response: time in Postgres, Redis, serializing (api/timing.py)
-    server_timing: bool = True
+    # latency histograms per endpoint, added up in Redis across processes: GET /api/v1/metrics (api/metrics.py)
+    request_metrics: bool = True
 
     # Cache-Control max-age of public responses, for clients and proxies (the API caches nothing; live ones are
     # no-cache): stops, search, trips, route shapes / alerts

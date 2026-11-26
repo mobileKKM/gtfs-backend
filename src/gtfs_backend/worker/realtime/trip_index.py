@@ -72,6 +72,20 @@ class TripIndex:
     version_ids: dict[int, str] = field(default_factory=dict)  # version number -> core.feed_version.id
     services: dict[int, frozenset[str]] = field(default_factory=dict)  # version -> its services on `days`
     loaded_for: date | None = None
+    # (version, block_id) -> the block's trips by first departure, built on first use (block_trips)
+    blocks: dict[tuple[int, str], list[TripInfo]] | None = field(default=None, repr=False, compare=False)
+
+    def block_trips(self, version: int, block_id: str) -> list[TripInfo]:
+        """The trips of a block (all its services) in this index, by first departure."""
+        if self.blocks is None:
+            blocks: dict[tuple[int, str], list[TripInfo]] = defaultdict(list)
+            for info in self.trips.values():
+                if info.block_id:
+                    blocks[(info.version, info.block_id)].append(info)
+            for trips in blocks.values():
+                trips.sort(key=lambda t: (t.first_departure, t.trip_id))
+            self.blocks = dict(blocks)
+        return self.blocks.get((version, block_id), [])
 
     def add_trip(self, info: TripInfo) -> None:
         self.trips[(info.version, info.trip_id)] = info

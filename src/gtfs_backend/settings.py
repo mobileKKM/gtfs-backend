@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,6 +21,16 @@ class Settings(BaseSettings):
     # Connections per process (the worker, and each API process). Postgres allows 100 in all: the worker's pool +
     # API_WORKERS x this (+ imports, psql) must stay below that.
     db_pool_max_size: int = Field(default=10, ge=1)
+    # Benchmark replays only (docs/benchmark.md): the worker and the API run as if it were this many seconds later
+    # (negative: earlier), so a recorded realtime feed meets the timetable day it was recorded on. 0 in production.
+    clock_offset: float = 0
+
+    def clock(self) -> Callable[[], float]:
+        """The wall clock (epoch seconds) for what the data is about: time.time(), shifted by CLOCK_OFFSET."""
+        offset = self.clock_offset
+        if not offset:
+            return time.time
+        return lambda: time.time() + offset
 
 
 @lru_cache

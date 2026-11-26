@@ -779,6 +779,7 @@ async def test_openapi_lists_every_endpoint(api):
         "/api/v1/alerts",
         "/api/v1/alerts/{alert_key}",
         "/api/v1/health",
+        "/api/v1/metrics",
     } == set(paths)
 
 
@@ -1002,3 +1003,40 @@ async def test_trip_live_reads_postgres_and_redis_at_once(api_ctx, monkeypatch):
     monkeypatch.setattr(ctx.redis, "mget", down)
     assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 503
     assert (await api.get("/trips/kmk_t:20261025:nope/live")).status_code == 404  # a missing trip still is a 404
+
+
+# ------------------------------------------------------------------------------------------------- metrics
+
+
+async def test_metrics_count_requests_by_route_template_across_app_instances(loaded):
+    """Each process flushes its histograms to Redis (at the latest when it stops); /metrics adds up all of them."""
+    r = Redis.from_url(TEST_REDIS_URL)
+    try:
+        await r.delete(*[k async for k in r.scan_iter(match="metrics:*")] or ["metrics:none"])
+        settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+        app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c,
+        ):
+            v = (await c.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"][0]
+            assert (await c.get(f"/trips/{v['trip_key']}/live")).status_code == 200
+            assert (await c.get("/trips/kmk_t:20261025:nope/live")).status_code == 404
+            assert (await c.get("/nothing/here")).status_code == 404
+        app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)  # another process reads them
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c,
+        ):
+            body = (await c.get("/metrics?window=120")).json()
+            assert (await c.get("/metrics?window=10")).status_code == 422
+    finally:
+        await r.aclose()
+    routes = {e["route"]: e for e in body["endpoints"]}
+    assert routes["GET /api/v1/vehicles"]["count"] == 1
+    live = routes["GET /api/v1/trips/{trip_key}/live"]  # the template, never the trip key
+    assert live["count"] == 2 and live["status"] == {"2xx": 1, "4xx": 1}
+    assert routes["GET (no route)"]["status"] == {"4xx": 1}
+    assert all(v["trip_key"] not in route for route in routes)
+    assert 0 < live["p50_ms"] <= live["p90_ms"] <= live["p99_ms"] <= live["max_ms"]
+    assert body["window_s"] == 120 and body["bucket_error"] == 0.091

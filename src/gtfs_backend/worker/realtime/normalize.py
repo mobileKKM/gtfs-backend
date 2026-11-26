@@ -9,12 +9,16 @@ Rules (see the plan, "Realtime ingestion flow"):
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import date
 
+from google.transit import gtfs_realtime_pb2 as pb
+
 from gtfs_backend.live_layout import LiveAlert, LiveTrip, LiveVehicle, UnmatchedVehicle
 from gtfs_backend.worker.realtime.alerts import build_alert
+from gtfs_backend.worker.realtime.blocks import block_overruns
 from gtfs_backend.worker.realtime.motion import FORGET_S, MotionTracker
 from gtfs_backend.worker.realtime.resolve import EARLY_WINDOW_S, LATE_WINDOW_S, TripRef, resolve, start_date
 from gtfs_backend.worker.realtime.trip_index import TripIndex
@@ -46,6 +50,20 @@ class Result:
     unmatched_alert_entities: list[str] = field(default_factory=list)  # "{alert id}: route X"
     entities: int = 0
     mismatches: int = 0
+    # GTFS-RT schedule_relationship of every trip update (matched or not) and of every stop time update in them
+    trip_relationships: Counter[str] = field(default_factory=Counter)
+    stop_relationships: Counter[str] = field(default_factory=Counter)
+    # trips predicted at their last stop after the next trip of their block is due (blocks.block_overruns)
+    block_late_next: int = 0
+    block_late_next_without_update: int = 0
+
+
+def _relationship(enum, value: int) -> str:
+    """The enum name; the number for a value these bindings don't know."""
+    try:
+        return enum.Name(value)
+    except ValueError:
+        return str(value)
 
 
 async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealtimeState, load: Loader, now: float) -> Result:
@@ -79,8 +97,12 @@ async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealti
     await load({(r.info.version, r.info.trip_id) for r in refs.values() if r})
 
     # 2. trip updates
+    trip_refs: list[tuple[TripRef, LiveTrip]] = []
     for e in tus:
         tu = e.trip_update
+        res.trip_relationships[_relationship(pb.TripDescriptor.ScheduleRelationship, tu.trip.schedule_relationship)] += 1
+        for u in tu.stop_time_update:
+            res.stop_relationships[_relationship(pb.TripUpdate.StopTimeUpdate.ScheduleRelationship, u.schedule_relationship)] += 1
         ref = refs.get(ref_key(tu.trip))
         if ref is None:
             res.unmatched_trips.append(tu.trip.trip_id or f"<entity {e.id}>")
@@ -89,7 +111,9 @@ async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealti
             res.mismatches += 1
         trip = build_trip(feed_id, ref, tu, index.stop_times.get((ref.info.version, ref.info.trip_id), []), index, now, ts)
         res.trips.append(trip)
+        trip_refs.append((ref, trip))
         state.trip_delays[trip["key"]] = (trip["delay_s"], ts)
+    res.block_late_next, res.block_late_next_without_update = block_overruns(feed_id, index, trip_refs)
 
     # 3. vehicles
     for e in vps:

@@ -235,3 +235,11 @@ class PollMeta(TypedDict):
     unmatched_sample: NotRequired[list[str]]
     route_mismatches: NotRequired[int]
     median_delay_s: NotRequired[float | None]
+    # GTFS-RT schedule_relationship -> count in the last update: of its trip updates (matched or not; CANCELED, NEW,
+    # DUPLICATED, ...) and of their stop time updates (SKIPPED, NO_DATA, ...)
+    trip_relationships: NotRequired[dict[str, int]]
+    stop_relationships: NotRequired[dict[str, int]]
+    # trips predicted at their last stop after the next trip of their block is due, and of those, how many next trips
+    # had no trip update of their own (worker/realtime/blocks.py)
+    block_late_next: NotRequired[int]
+    block_late_next_without_update: NotRequired[int]

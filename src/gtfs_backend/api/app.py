@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import time
+import contextvars
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
 from redis.asyncio import BlockingConnectionPool, Redis
 
-from gtfs_backend import live_layout
+from gtfs_backend import live_layout, metrics
 from gtfs_backend.api import errors
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog, Clock
+from gtfs_backend.api.metrics import RequestMetricsMiddleware
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
+from gtfs_backend.api.routers import metrics as metrics_router
 from gtfs_backend.api.settings import ApiSettings, get_api_settings
 from gtfs_backend.api.timing import ServerTimingMiddleware, TimedConnection, TimedPool, TimedRedis
 from gtfs_backend.db import async_pool
@@ -54,10 +56,16 @@ unset). Responses carry `ETag`; live ones are `no-cache`, so poll them (about ev
 Errors are `{"error": {"code", "message"}}`."""
 
 
-def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None = None, clock: Clock = time.time) -> FastAPI:
-    """Called once in every API process (API_WORKERS), so each sets up its own logging, pools and catalog."""
+def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None = None, clock: Clock | None = None) -> FastAPI:
+    """Called once in every API process (API_WORKERS), so each sets up its own logging, pools and catalog.
+    `clock`: default time.time(), shifted by CLOCK_OFFSET (benchmark replays)."""
     settings = settings or get_api_settings()
     setup_logging(settings.log_level)
+    if clock is None:
+        clock = settings.clock()
+        if settings.clock_offset:
+            log.warning("clock_offset", seconds=settings.clock_offset)
+    recorder = metrics.Recorder()  # this process's request latencies (gtfs_backend/metrics.py)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -86,12 +94,15 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             log.warning("catalog_warmup_failed", error=str(exc))
         app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings)
         listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
+        # a context of its own: flushing is no request's work (api/timing.py)
+        flusher = asyncio.create_task(recorder.run(redis), context=contextvars.Context())
         try:
             yield
         finally:
-            listener.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await listener
+            for task in (listener, flusher):  # the flusher sends what is left when cancelled, so before Redis closes
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await catalog.close()
             await redis.aclose()
             await pool.close()
@@ -109,9 +120,11 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
     # 5.5 ms instead of 19.7 ms, 77 kB instead of 73 kB)
     app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=GZIP_LEVEL)
     if settings.server_timing:
-        app.add_middleware(ServerTimingMiddleware)  # outermost: its `total` includes gzip
+        app.add_middleware(ServerTimingMiddleware)  # outside gzip: its `total` includes it
+    if settings.request_metrics:
+        app.add_middleware(RequestMetricsMiddleware, recorder=recorder)  # outermost: times everything
     errors.install(app)
 
-    for module in (vehicles, stops, trips, routes, alerts, health):
+    for module in (vehicles, stops, trips, routes, alerts, health, metrics_router):
         app.include_router(module.router, responses=errors.ERROR_RESPONSES)
     return app

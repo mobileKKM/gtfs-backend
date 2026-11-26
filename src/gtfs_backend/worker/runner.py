@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from redis.asyncio import Redis
 
-from gtfs_backend import live_layout
+from gtfs_backend import live_layout, metrics
 from gtfs_backend.db import async_pool, connect
 from gtfs_backend.feeds import FeedConfig, load_feeds
 from gtfs_backend.logs import log
@@ -26,7 +26,7 @@ from gtfs_backend.worker.realtime.store import RealtimeStore, TTLs
 from gtfs_backend.worker.settings import WorkerSettings
 from gtfs_backend.worker.static.fetch import PREVIOUSLY_FAILED, check_static, import_order
 from gtfs_backend.worker.static.stops.osm import fetch_osm_poles, file_age_s
-from gtfs_backend.worker.static.versions import RetirementBusy, retire_versions
+from gtfs_backend.worker.static.versions import RetirementBusy, feed_today, retire_versions
 
 # Touched every HEARTBEAT_INTERVAL_S while every realtime task keeps finishing polls; the healthcheck in
 # docker-compose.yml reads its age (and hardcodes this path).
@@ -62,6 +62,10 @@ class Worker:
             self.osm_ready.set()
         self.realtime_tasks: list[RealtimeTask] = []
         self.exit_code = 0
+        self.clock = settings.clock()  # time.time() unless CLOCK_OFFSET (benchmark replays)
+        self.recorder = metrics.Recorder()  # data age per realtime file, flushed to Redis (gtfs_backend/metrics.py)
+        if settings.clock_offset:
+            log.warning("clock_offset", seconds=settings.clock_offset)
 
     async def run(self) -> int:
         """Until SIGINT/SIGTERM, or until a task ends (a bug: every loop catches its own errors) or gets stuck.
@@ -128,6 +132,8 @@ class Worker:
                     retries=s.http_retries,
                     retry_delay=s.http_retry_delay,
                     attempt_timeout=min(s.realtime_fetch_timeout, max(interval, MIN_FETCH_ATTEMPT_S)),
+                    clock=self.clock,
+                    recorder=self.recorder,
                 )
                 self.realtime_tasks.append(task)
                 tasks.append(asyncio.create_task(task.run(), name=f"realtime:{task.name}"))
@@ -135,6 +141,7 @@ class Worker:
             tasks.append(asyncio.create_task(self._osm_loop(), name="osm"))
         tasks.append(asyncio.create_task(self._maintenance_loop(), name="maintenance"))
         tasks.append(asyncio.create_task(self._heartbeat_loop(), name="heartbeat"))
+        tasks.append(asyncio.create_task(self.recorder.run(self.redis), name="metrics"))
         log.info("worker_started", tasks=[t.get_name() for t in tasks])
         return tasks
 
@@ -233,10 +240,11 @@ class Worker:
     def _retire_all(self) -> tuple[dict[str, list[int]], list[str]]:
         """(retired version numbers per feed, feeds whose tables were busy)."""
         retired, busy = {}, []
+        now = datetime.fromtimestamp(self.clock(), MAINTENANCE_TZ)
         with connect(self.settings.database_url) as conn, conn.transaction():
             for feed in self.feeds.feeds:
                 try:
-                    retired[feed.feed_id] = retire_versions(conn, feed.feed_id)
+                    retired[feed.feed_id] = retire_versions(conn, feed.feed_id, feed_today(conn, feed.feed_id, now))
                 except RetirementBusy:
                     busy.append(feed.feed_id)
         return retired, busy
@@ -261,7 +269,7 @@ class Worker:
         last_retire = None
         while True:
             await asyncio.sleep(MAINTENANCE_CHECK_INTERVAL_S)
-            now = datetime.now(MAINTENANCE_TZ)
+            now = datetime.fromtimestamp(self.clock(), MAINTENANCE_TZ)
             if now.time() >= self.settings.retire_at and last_retire != now.date() and await self._retire_once():
                 last_retire = now.date()
 

@@ -23,6 +23,8 @@ class ApiSettings(Settings):
 
     # `Server-Timing` header on every response: time in Postgres, Redis, serializing (api/timing.py)
     server_timing: bool = True
+    # latency histograms per endpoint, added up in Redis across processes: GET /api/v1/metrics (api/metrics.py)
+    request_metrics: bool = True
 
     # Cache-Control max-age of public responses, for clients and proxies (the API caches nothing; live ones are
     # no-cache): stops, search, trips, route shapes / alerts

@@ -117,9 +117,10 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | `rt:tripstate:{feed_id}` | hash: trip key → `[version, canceled, vehicle_id, timestamp]` of every trip in `rt:trip` (TTL `TRIP_TTL`) |
 | `rt:stop:{feed_id}:{public_stop_id}` | hash: `{stop_sequence}\|{trip key}` → `[predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure]`: the trips' rows of `rt:trip` at this stop, so a board reads its stops, not whole trips. Written with `rt:trip` (only changed fields); only valid for trips in `rt:tripstate` with the same version; rewritten in full when the worker starts or finds `rt:tripstate` gone |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
-| `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s` |
+| `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s`, `trip_relationships`/`stop_relationships` (GTFS-RT `schedule_relationship` counts: `CANCELED`, `NEW`, `DUPLICATED`, `SKIPPED`, `NO_DATA`, ...), `block_late_next` (trips predicted at their last stop after the next trip of their block is due) and `block_late_next_without_update` (of those, next trips without an update of their own) |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
 | pub/sub `rt:updated`, `static:updated` | change notifications |
+| `metrics:{epoch minute}` | latency (API, per route template) and data age (worker, per realtime file) histograms of all processes, for `/metrics` (`gtfs_backend/metrics.py`, kept 2 h) |
 
 Rules:
 
@@ -187,6 +188,7 @@ of the request, so their ETag only changes with the data.
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
+| `GET /metrics[?window=300]` | p50/p90/p99 per endpoint (route template, all API processes) and each realtime file's data age (now minus its feed header timestamp), over the last `window` seconds (60–3600) |
 
 **Errors**: `{"error": {"code": "not_found" | "invalid_input" | "method_not_allowed" | …, "message": "…"}}`: 404
 unknown things, 422 malformed keys/dates/boxes/times, unknown feeds, 503 `unavailable` with `Retry-After` when connections are
@@ -253,6 +255,12 @@ Notes:
   browser dev tools show it. Concurrent work adds up, so the parts can exceed `total`.
 - Queries name one feed version per block: joining `feed_version_id` across tables defeats partition pruning
   (a 20 ms board became 1.5 s).
+
+## Benchmarks
+
+Micro benchmarks (`uv run pytest bench/micro`), a load test replaying recorded feeds (`bench/replay.py`,
+`bench/k6/rest_mix.js`) and the server's `/metrics`: see [docs/benchmark.md](docs/benchmark.md). `CLOCK_OFFSET` (seconds)
+lets the worker and the API run at a recording's time; it is 0 in production.
 
 ## Tests
 

@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -90,10 +91,23 @@ def stop(procs: list[subprocess.Popen]) -> None:
             os.killpg(p.pid, signal.SIGKILL)
 
 
-def replay_feeds(recording: Path, out: Path) -> Path:
+def replay_feeds(recording: Path, out: Path, code: Path) -> Path:
+    """The tested checkout's feeds.yml (its poll intervals) with the URLs pointing at the replay server."""
     feeds = out / "feeds.replay.yml"
+    base = code / "feeds.yml"
     subprocess.run(
-        [sys.executable, str(ROOT / "bench" / "replay.py"), "feeds", str(recording), "--url", REPLAY, "-o", str(feeds)],
+        [
+            sys.executable,
+            str(ROOT / "bench" / "replay.py"),
+            "feeds",
+            str(recording),
+            "--base",
+            str(base),
+            "--url",
+            REPLAY,
+            "-o",
+            str(feeds),
+        ],
         check=True,
         stdout=subprocess.DEVNULL,
     )
@@ -136,7 +150,7 @@ def sample(pids: list[int]) -> tuple[float, int]:
 def cmd_import(args) -> None:
     out = ROOT / "bench" / "out" / "import"
     out.mkdir(parents=True, exist_ok=True)
-    feeds = replay_feeds(args.recording, out)
+    feeds = replay_feeds(args.recording, out, args.code)
     server, _ = serve(args.recording, out)
     try:
         subprocess.run(["uv", "run", "gtfs-worker", "import-static", "--all"], cwd=args.code, env=env(feeds), check=True)
@@ -147,7 +161,8 @@ def cmd_import(args) -> None:
 def cmd_run(args) -> None:
     out: Path = args.out
     out.mkdir(parents=True, exist_ok=True)
-    feeds = replay_feeds(args.recording, out)
+    feeds = replay_feeds(args.recording, out, args.code)
+    shutil.rmtree(ROOT / "bench" / "out" / "snapshot", ignore_errors=True)  # built by this run's worker, if at all
     subprocess.run(
         ["uv", "run", "python", "-c", f"import redis; redis.Redis.from_url({REDIS_URL!r}).flushdb()"], cwd=ROOT, check=True
     )
@@ -233,6 +248,8 @@ def main() -> None:
     args = parser.parse_args()
     args.recording = args.recording.resolve()
     args.code = args.code.resolve()
+    if getattr(args, "out", None) is not None:
+        args.out = args.out.resolve()  # the worker and the API run in --code: their paths must not be relative
     {"import": cmd_import, "run": cmd_run}[args.command](args)
 
 

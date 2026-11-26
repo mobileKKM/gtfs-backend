@@ -13,6 +13,7 @@ from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Day
 from gtfs_backend.api.data.geo import bbox_of, encode_polyline
+from gtfs_backend.api.data.live import PID, SCHED, SCHED_ARR, SEQ, STOPS, extra_of
 from gtfs_backend.api.data.realtime import StopUpdate, TripUpdate
 from gtfs_backend.api.data.timetable import NOT_COVERED, TripStatic
 from gtfs_backend.api.errors import NotFound
@@ -139,8 +140,50 @@ def _snapshot_stops(ctx: Context, static: TripStatic, day: Day) -> list[TripStop
     return out
 
 
+def _extra(ctx: Context, key: str) -> list | None:
+    """The live state's trip, if it is one no timetable has (GTFS-RT NEW, DUPLICATED, ...)."""
+    live = ctx.live_state
+    return live.trips.get(key) if live is not None and live.ready and extra_of(live.trips.get(key)) else None
+
+
+def _extra_view(ctx: Context, trip: list) -> tuple:
+    """(route_id, headsign, direction_id, polyline, bbox, stops) of an extra trip, from realtime: drawn through its stops."""
+    route_id, headsign = extra_of(trip)
+    entries = trip[STOPS]
+    by_id = ctx.catalog.stops.stops_by_id({e[PID] for e in entries if e[PID]})
+    stops = []
+    for e in entries:
+        stop = by_id.get(e[PID]) if e[PID] else None
+        stops.append(
+            TripStop(
+                stop_sequence=e[SEQ],
+                stop=StopRef(key=stop.key, name=stop.name, group_key=stop.group_key, platform_code=stop.platform_code)
+                if stop
+                else None,
+                lat=stop.lat if stop else None,
+                lon=stop.lon if stop else None,
+                scheduled_arrival=e[SCHED_ARR] if len(e) > SCHED_ARR else None,
+                scheduled_departure=e[SCHED],
+                on_demand=False,
+            )
+        )
+    return route_id, headsign, None, None, None, stops
+
+
 async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> TripView:
     day = await _day(ctx, feed_id, service_date)
+    if (extra := _extra(ctx, keys.trip_key(feed_id, service_date, trip_id))) is not None:
+        route_id, headsign, direction_id, polyline, bbox, stops = _extra_view(ctx, extra)
+        info = await ctx.catalog.route(day.feed_version_id, route_id) if route_id else None
+        return TripView(
+            key=keys.trip_key(feed_id, service_date, trip_id),
+            service_date=keys.service_date_str(service_date),
+            route=info.model() if info else None,
+            headsign=headsign,
+            direction_id=None,
+            shape=_shape(None, None, stops),
+            stops=stops,
+        )
     static = _static(ctx, day, trip_id)
     stops = _snapshot_stops(ctx, static, day) if static is not NOT_COVERED else None
     if stops is not None:
@@ -196,9 +239,13 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     day = await _day(ctx, feed_id, service_date)
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     key = keys.trip_key(feed_id, service_date, trip_id)
-    static = _static(ctx, day, trip_id)
     live_state = ctx.live
-    if static is not NOT_COVERED:
+    extra = _extra(ctx, key)
+    static = NOT_COVERED if extra is not None else _static(ctx, day, trip_id)
+    if extra is not None:
+        route_id, direction_id = extra_of(extra)[0], None
+        seqs, pids = [e[SEQ] for e in extra[STOPS]], [e[PID] for e in extra[STOPS]]
+    elif static is not NOT_COVERED:
         route_id, direction_id = static.route_id, static.direction_id
         seqs, pids = [st[0] for st in static.stops], [st[4] for st in static.stops]
     else:

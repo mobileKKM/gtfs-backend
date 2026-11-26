@@ -32,6 +32,7 @@ def trip(key, *stops, version=1, vehicle="V1", relationship="SCHEDULED"):
                 "predicted_departure": t,
                 "predicted_arrival": None,
                 "scheduled_departure": t - 60,
+                "scheduled_arrival": t - 60,
                 "delay_s": 60,
                 "schedule_relationship": "SCHEDULED",
                 "propagated": q > 1,  # only the first stop's time from the feed
@@ -95,15 +96,8 @@ async def test_trip_states_and_changes_follow_the_trips(redis_url):
     a, b = "kmk_t:20261025:a", "kmk_t:20261025:b"
     changes = await store.write_trips("kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 20)), trip(b, (1, "pb", 30))]))
     assert sorted(changes["set"]) == [a, b] and changes["del"] == []
-    assert changes["set"][a] == [
-        1,
-        False,
-        "V1",
-        1000,
-        False,
-        60,
-        [[1, "pa", None, 10, 60, False, -50, False], [2, "pb", None, 20, 60, False, -40, True]],
-    ]
+    stops = [[1, "pa", None, 10, 60, False, -50, False, -50], [2, "pb", None, 20, 60, False, -40, True, -40]]
+    assert changes["set"][a] == [1, False, "V1", 1000, False, 60, stops, None]  # no extra: a timetabled trip
     # a's time at pb changed; b canceled, and the feed dropped its stop (kept with its last time, as in rt:trip)
     changes = await store.write_trips(
         "kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 25)), trip(b, relationship="CANCELED")])

@@ -21,6 +21,7 @@ from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Catalog, Day, RouteInfo
+from gtfs_backend.api.data.live import PID, SCHED, SEQ
 from gtfs_backend.api.data.realtime import TripState, TripUpdate
 from gtfs_backend.api.data.sql import union_per_version
 from gtfs_backend.api.data.stopdata import Hourly
@@ -163,6 +164,35 @@ async def timetable(
         return await scheduled(conn, days, public_stop_ids, start, end, lookback)
 
 
+def _extra_rows(live_data, days: list[Day], lo: int, hi: int) -> list[Scheduled]:
+    """The departures of trips no timetable has (GTFS-RT NEW, DUPLICATED, ...) from the live state, as timetable rows
+    of the day they run on (one of `days`, in the version realtime has)."""
+    by_date = {(d.feed_id, d.date): d for d in days}
+    out = []
+    for key, e, (route_id, headsign) in live_data.extra_departures(lo, hi):
+        feed_id, service_date, trip_id = keys.parse_trip_key(key)
+        day = by_date.get((feed_id, service_date))
+        if day is None or (state := live_data.state(key)) is None or state.version != day.version:
+            continue
+        out.append(
+            Scheduled(
+                feed_id,
+                day.feed_version_id,
+                day.version,
+                service_date,
+                trip_id,
+                e[SEQ],
+                e[PID],
+                e[SCHED],
+                headsign,
+                route_id or "",
+                False,
+                key,
+            )
+        )
+    return out
+
+
 def runs(vehicle: dict | None, s: Scheduled) -> bool:
     """Whether the vehicle is on this trip (it may have moved on to the next one) in this timetable version."""
     return vehicle is not None and vehicle["trip"]["key"] == s.trip_key and vehicle["trip"]["version"] == s.version
@@ -259,7 +289,7 @@ async def _page(
         else:
             first, lookback = fetched_to + 1, 0
         days = [d for d in await ctx.catalog.days_between(first, hi) if not feeds or d.feed_id in feeds]
-        found = await timetable(ctx, days, pids, first, hi, lookback)
+        found = await timetable(ctx, days, pids, first, hi, lookback) + _extra_rows(live_data, days, first - lookback, hi)
         fetched_to = hi
         refs |= await ctx.catalog.route_refs({(f.feed_version_id, f.route_id) for f in found})
         if route_names:

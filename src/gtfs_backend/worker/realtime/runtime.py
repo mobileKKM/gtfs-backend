@@ -15,6 +15,7 @@ from psycopg_pool import AsyncConnectionPool
 from gtfs_backend.feeds import FeedConfig
 from gtfs_backend.logs import log
 from gtfs_backend.servicetime import local_date
+from gtfs_backend.worker.realtime.extra import KINDS
 from gtfs_backend.worker.realtime.normalize import FeedRealtimeState
 from gtfs_backend.worker.realtime.trip_index import TripIndex, ensure_stop_times, load_index
 
@@ -41,7 +42,9 @@ class FeedRuntime:
         """`max_age`: the feed's realtime max age (vehicles with older positions are dropped); default: the feed's own."""
         self.feed = feed
         self.pool = pool
-        self.state = state or FeedRealtimeState(ignore_service_suffix=feed.ignore_service_suffix)
+        self.state = state or FeedRealtimeState(
+            ignore_service_suffix=feed.ignore_service_suffix, extra_kinds=frozenset(KINDS[k] for k in feed.extra_trips)
+        )
         if max_age is not None:
             self.state.max_age_s = max_age
         self.index: TripIndex | None = None

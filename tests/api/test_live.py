@@ -41,6 +41,7 @@ def trip(key, *stops, relationship="SCHEDULED"):
                 "predicted_arrival": None,
                 "predicted_departure": t,
                 "scheduled_departure": t - 60,
+                "scheduled_arrival": t - 60,
                 "delay_s": 60,
                 "schedule_relationship": "SCHEDULED",
                 "propagated": False,

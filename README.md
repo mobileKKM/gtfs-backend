@@ -145,8 +145,14 @@ Rules:
   would pick the service day (none sends one yet).
 - **Unmatched means not shown**: unknown trips, trips outside their service window and idle vehicles never reach
   the map or departures. Nor do trips that aren't the timetabled trip their id names (GTFS-RT `NEW`, `ADDED`,
-  `DUPLICATED`: counted as unmatched with their kind, and a `/health` problem) until they are supported.
+  `DUPLICATED`) unless the feed shows them (below): counted as unmatched with their kind, and a `/health` problem.
   `CANCELED` trips show as canceled; `DELETED` ones (and their vehicles) aren't shown at all.
+- **Extra trips** (`worker/realtime/extra.py`, feeds.yml `extra_trips`, default `new` and `duplicated`; `added` opt-in,
+  as GTFS-RT never said what it means): a `NEW` trip comes from its update (its stops, absolute times, the descriptor's
+  route and trip_properties' headsign; scheduled = predicted), a `DUPLICATED` one is the original trip shifted to the
+  copy's start time under its own key (`trip_properties.trip_id`, else `{trip_id}#{date}T{start_time}`), so it never
+  overwrites the original. Their vehicles are matched to them. Marked `extra`, boards take their departures from the
+  live data (the timetable lacks them), and their trip views are drawn through their stops.
 - **Counted, not used yet** (`rt:meta`): `schedule_relationship` values, and how often a late trip runs into the next
   trip of its block (GTFS-RT asks producers to send the next trips' updates; ZTP does).
 - **Delays are recomputed** as predicted − scheduled, scheduled = the feed's day start + GTFS time (noon minus 12 h

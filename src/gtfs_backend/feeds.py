@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
@@ -72,6 +73,10 @@ class FeedConfig(BaseModel):
     # live while the file doesn't change (default REALTIME_MAX_AGE). Slow feeds need a longer max age.
     realtime_poll_interval: float | None = Field(default=None, gt=0)
     realtime_max_age: int | None = Field(default=None, ge=1)
+    # Trips the feed sends that aren't a timetabled trip as it is, shown (built from the update: worker/realtime/
+    # extra.py): GTFS-RT NEW, DUPLICATED, and ADDED (deprecated, its meaning unspecified: only where it is known to mean
+    # an extra trip). Others are counted as unmatched.
+    extra_trips: list[Literal["new", "duplicated", "added"]] = Field(default_factory=lambda: ["new", "duplicated"])
 
     @field_validator("stop_code_pattern")
     @classmethod

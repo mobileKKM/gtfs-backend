@@ -28,9 +28,14 @@ GRID_DEG = 0.01  # vehicle grid cells for box queries: ~1.1 km x 0.7 km at 50 N
 RETRY_S = 2  # after a lost subscription or a failed load
 
 # CompactTrip fields (live_layout.compact_trip)
-VERSION, CANCELED, VEHICLE, TIMESTAMP, DELETED, DELAY, STOPS = range(7)
+VERSION, CANCELED, VEHICLE, TIMESTAMP, DELETED, DELAY, STOPS, EXTRA = range(8)
 # StopEntry fields
-SEQ, PID, ARR, DEP, SDELAY, SKIPPED, SCHED, PROPAGATED = range(8)
+SEQ, PID, ARR, DEP, SDELAY, SKIPPED, SCHED, PROPAGATED, SCHED_ARR = range(9)
+
+
+def extra_of(trip: list | None) -> list | None:
+    """[route_id, headsign] of a trip no timetable has (GTFS-RT NEW, ADDED, DUPLICATED), else None."""
+    return trip[EXTRA] if trip is not None and len(trip) > EXTRA else None
 
 
 def cell(lat: float, lon: float) -> tuple[int, int]:
@@ -256,6 +261,20 @@ class LiveBoard:
 
     def states(self, trip_keys) -> dict[str, TripState]:
         return {k: state for k in trip_keys if (state := self.state(k)) is not None}
+
+    def extra_departures(self, lo: int, hi: int) -> list[tuple[str, list, list]]:
+        """(trip key, StopEntry, [route_id, headsign]) of the trips no timetable has, departing from the board's stops
+        between lo and hi (epochs): the rows a board takes from realtime."""
+        out = []
+        for key, indexes in self._entries.items():
+            trip = self._live.trips.get(key)
+            if (extra := extra_of(trip)) is None or self.state(key) is None:
+                continue
+            for i in indexes:
+                e = trip[STOPS][i]
+                if e[SCHED] is not None and lo <= e[SCHED] <= hi:
+                    out.append((key, e, extra))
+        return out
 
     def earliest_early(self, after: int, since: int) -> int | None:
         """As BoardRealtime.earliest_early: the earliest prediction, from `since` on, of a trip scheduled at one of the

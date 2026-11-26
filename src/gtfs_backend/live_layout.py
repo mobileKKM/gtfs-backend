@@ -101,6 +101,7 @@ class StopRow(TypedDict):
 class LiveTrip(TripFields):
     """rt:trip:{trip_key}"""
 
+    extra: NotRequired[bool]  # no timetable has it (GTFS-RT NEW, ADDED, DUPLICATED): boards take it from realtime
     vehicle_id: str | None
     delay_s: int | None  # at the next stop, else the last known one
     timestamp: int  # when the feed measured it
@@ -113,9 +114,10 @@ class LiveTrip(TripFields):
 # removed and not to be shown at all, also canceled. Readers accept the 4-element form of older workers.
 TripState = tuple[int, bool, str | None, int, bool]
 # A trip as the API keeps it in memory (change messages and its first load from rt:trip):
-# [version, canceled, vehicle_id, timestamp, deleted, delay_s, [StopEntry, ...]], with
+# [version, canceled, vehicle_id, timestamp, deleted, delay_s, [StopEntry, ...], extra], with
 # StopEntry = [stop_sequence, public_stop_id, predicted_arrival, predicted_departure, delay_s, skipped,
-#              scheduled_departure, propagated]
+#              scheduled_departure, propagated, scheduled_arrival]
+# and extra = [route_id, headsign] for a trip no timetable has (worker/realtime/extra.py), else None
 CompactTrip = list
 StopEntry = list
 
@@ -132,10 +134,12 @@ def compact_trip(trip: LiveTrip) -> CompactTrip:
             r["schedule_relationship"] == "SKIPPED",
             r["scheduled_departure"],
             r["propagated"],
+            r["scheduled_arrival"],
         ]
         for r in trip["stops"]
     ]
-    return [version, canceled, vehicle_id, timestamp, deleted, trip["delay_s"], stops]
+    extra = [trip["route_id"], trip["headsign"]] if trip.get("extra") else None
+    return [version, canceled, vehicle_id, timestamp, deleted, trip["delay_s"], stops, extra]
 
 
 class LiveChanges(TypedDict):

@@ -1427,5 +1427,42 @@ async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served
 
         await ws.send(json.dumps({"op": "unsubscribe", "topics": topics}))
         await ws.send("not json")
-        (error,) = await receive(ws, 1)
+        for _ in range(10):  # updates of the topics still on their way may come first
+            (error,) = await receive(ws, 1)
+            if error["type"] == "error":
+                break
         assert error["type"] == "error" and error["topic"] is None
+
+
+async def test_extra_trips_come_from_realtime_onto_boards_and_trip_views(api_ctx, sql, monkeypatch):
+    """A trip no timetable has (GTFS-RT NEW, built by the worker): its departures on boards, its view and live state."""
+    api, ctx = api_ctx
+    gid = group_id(sql, "802")
+    tram = next(d for d in (await api.get(f"/stops/{gid}/departures?limit=60")).json()["departures"] if feed_of(d) == "kmk_t")
+    route_id = tram["route"]["key"].split(":", 1)[1]
+    pole, other = ident(tram["stop"]), stop_by_code(sql, "125-01")
+    key = "kmk_t:20261025:extra_1"
+    at = NOW + 600
+    entries = [[1, pole, at, at, None, False, at, False, at], [2, other, at + 300, None, None, False, None, False, at + 300]]
+    live = ctx.live
+    monkeypatch.setattr(live, "trips", {**live.trips, key: [1, False, None, NOW, False, None, entries, [route_id, "Extra"]]})
+    at_stop = {k: set(v) for k, v in live._at_stop.items()}
+    at_stop.setdefault(pole, set()).add((key, 0))
+    at_stop.setdefault(other, set()).add((key, 1))
+    monkeypatch.setattr(live, "_at_stop", at_stop)
+
+    board = (await api.get(f"/stops/{gid}/departures?limit=60")).json()["departures"]
+    (extra,) = [d for d in board if d["trip_key"] == key]
+    assert (extra["time"], extra["status"], extra["headsign"], extra["route"]["key"]) == (
+        at,
+        "live",
+        "Extra",
+        tram["route"]["key"],
+    )
+    assert extra["scheduled"] == at and extra["delay_s"] is None
+    view = (await api.get(f"/trips/{key}")).json()
+    assert view["headsign"] == "Extra" and view["route"]["key"] == tram["route"]["key"] and view["shape"]["source"] == "stops"
+    assert [(s["stop_sequence"], s["scheduled_departure"]) for s in view["stops"]] == [(1, at), (2, None)]
+    assert view["stops"][0]["stop"]["key"] == tram["stop"]["key"]
+    trip_live = (await api.get(f"/trips/{key}/live")).json()
+    assert trip_live["status"] == "live" and [s["status"] for s in trip_live["stops"]] == ["live", "live"]

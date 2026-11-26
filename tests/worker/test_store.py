@@ -123,7 +123,7 @@ async def test_touch_refreshes_the_ttls_of_the_last_update(redis_url):
     res = Result(vehicles=[vehicle("T1")], trips=[trip("km_kolej:x:20261025", (1, "pa", 1))], alerts=[])
     await store.write_vehicles("km_kolej", res)
     await store.write_trips("km_kolej", res)
-    await store.write_alerts("km_kolej", res)
+    assert await store.write_alerts("km_kolej", res) == {"timestamp": 0, "alerts": []}
     keys = ["rt:vehicles:km_kolej", "rt:trips:km_kolej", "rt:alerts:km_kolej"]
     for key in keys:
         await r.expire(key, 5)
@@ -197,4 +197,14 @@ async def test_vehicle_changes_and_published_messages(redis_url):
     sent = messages[2]["trips"]["set"]["kmk_t:20261025:a"]
     assert msgspec.convert(sent, TripState) == trips["set"]["kmk_t:20261025:a"]
     assert await r.get("rt:seq:kmk_t:vehicle_positions") == f"{store.run}:2"
+    await r.aclose()
+
+
+async def test_a_lost_write_makes_the_next_message_skip_a_number(redis_url):
+    r = Redis.from_url(redis_url, decode_responses=True)
+    store = RealtimeStore(r, TTLS)
+    await store.publish("kmk_t", "vehicle_positions", 1000)
+    store.lost("kmk_t", "vehicle_positions")
+    await store.publish("kmk_t", "vehicle_positions", 1010)
+    assert await r.get("rt:seq:kmk_t:vehicle_positions") == f"{store.run}:3"  # readers that had 1 load the feed
     await r.aclose()

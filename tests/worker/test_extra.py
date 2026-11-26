@@ -137,13 +137,31 @@ async def test_a_duplicated_trip_is_the_original_shifted_under_its_own_key():
     copy = trips["kmk_a:20261126:T1#20261126T09:00:00"]
     assert copy["extra"] is True and copy["schedule_relationship"] == "DUPLICATED" and copy["route_id"] == "R1"
     by_seq = {s["stop_sequence"]: s for s in copy["stops"]}
+    assert sorted(by_seq) == [1, 2, 3]  # every stop: no timetable has the copy
+    assert by_seq[1]["scheduled_departure"] == BASE + hms(9) and by_seq[1]["predicted_departure"] is None  # no update
     assert by_seq[2]["scheduled_departure"] == BASE + hms(9, 20) and by_seq[2]["delay_s"] == 180
     assert by_seq[3]["scheduled_arrival"] == BASE + hms(9, 40)  # propagated on, shifted like the rest
+    assert by_seq[3]["scheduled_departure"] is None  # its last stop: not a departure
     # the original keeps its own realtime
     assert trips["kmk_a:20261126:T1"]["stops"][0]["delay_s"] == 60 and "extra" not in trips["kmk_a:20261126:T1"]
     # the copy's vehicle names the original and its start time
     res = await run(st, vehicle("T1", "v7", TD.DUPLICATED, "09:00:00"), at=hms(6, 10))
     assert [v["trip"]["key"] for v in res.vehicles] == ["kmk_a:20261126:T1#20261126T09:00:00"]
+    (v7,) = res.vehicles
+    assert v7["delay_s"] == 180  # its trip's
+    assert v7["timestamp"] == BASE + hms(6, 10)  # no time of its own: the feed's
+
+
+async def test_a_duplicated_trip_without_stop_updates_runs_as_its_timetable():
+    plain = duplicate()
+    del plain.trip_update.stop_time_update[:]
+    res = await run(state("duplicated"), plain, at=hms(6, 10))
+    (copy,) = res.trips
+    assert [(s["stop_sequence"], s["scheduled_arrival"], s["predicted_arrival"]) for s in copy["stops"]] == [
+        (1, BASE + hms(9), None),
+        (2, BASE + hms(9, 20), None),
+        (3, BASE + hms(9, 40), None),
+    ]
 
 
 async def test_a_duplicated_trip_takes_the_feeds_id_and_needs_a_start_time():

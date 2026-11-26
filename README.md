@@ -121,7 +121,7 @@ stays, hidden once older than the feed's max age. The layout lives in `gtfs_back
 |---|---|
 | `rt:vehicles:{feed_id}` | the feed's vehicles, `{vehicle key: vehicle}`: trip, route, headsign, delay, stop (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trips:{feed_id}` | the feed's trips, `{trip key: trip}`: per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times (TTL `TRIP_TTL`) |
-| `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
+| `rt:alerts:{feed_id}` | `{"timestamp", "alerts"}`: service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group), and the feed header time they are as of (hidden, like vehicles and trips, once older than the feed's max age) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s`, `trip_relationships`/`stop_relationships` (GTFS-RT `schedule_relationship` counts: `CANCELED`, `NEW`, `DUPLICATED`, `SKIPPED`, `NO_DATA`, ...), `block_late_next` (trips predicted at their last stop after the next trip of their block is due) and `block_late_next_without_update` (of those, next trips without an update of their own) |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
 | `rt:seq:{feed_id}:{kind}` | `{run}:{seq}` of the file's last change message: what an API process loading from Redis already has |

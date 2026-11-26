@@ -171,9 +171,11 @@ class RealtimeTask:
         msg = fetched.value
         ts = int(msg.header.timestamp)
         if ts and ts <= self.last_ts and not self._went_back(ts):
-            # data we have, under a new ETag (ZTP rewrites its files between timestamp changes): asking with this one
-            # gets a 304 next time instead of the whole file
-            self.etag, self.last_modified = fetched.etag, fetched.last_modified
+            if ts == self.last_ts:
+                # data we have, under a new ETag (ZTP rewrites its files between timestamp changes): asking with this
+                # one gets a 304 next time instead of the whole file. Not for an older copy: that one is looked at
+                # again until _went_back takes it
+                self.etag, self.last_modified = fetched.etag, fetched.last_modified
             return await self._unchanged_or_reindexed()
         res = await self._process(msg, ts, fetched.size)
         if res is not None:
@@ -214,14 +216,19 @@ class RealtimeTask:
         t2 = time.perf_counter()
         res = await process_message(self.feed_id, msg, index, self.runtime.state, load, now)
         t3 = time.perf_counter()
-        changes = await self._store(res)
+        try:
+            changes = await self._store(res)
+        except BaseException:
+            self.store.lost(self.feed_id, self.kind.value)
+            raise
         t4 = time.perf_counter()
+        await self.store.publish(self.feed_id, self.kind.value, ts, changes)
+        # only now: a failed write or publish processes this update again at the next poll
         self.last_msg, self.last_size, self.written_generation = msg, size, index.generation
         self.last_ts = ts
         if not again:  # the data itself didn't change: its age (max_age) counts from when it did
             self.last_change = time.monotonic()
         self._record_change(size, ts, res, index_s=t2 - t1, process_s=t3 - t2, write_s=t4 - t3)
-        await self.store.publish(self.feed_id, self.kind.value, ts, changes)
         return res
 
     async def _store(self, res: Result) -> dict:

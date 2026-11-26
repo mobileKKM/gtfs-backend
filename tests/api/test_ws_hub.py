@@ -23,9 +23,15 @@ class Stops:
         return ["p1", "p2"] if stop.id == "g1" else [stop.id]
 
 
+class Catalog:
+    stops = Stops()
+
+    async def ensure_fresh(self):
+        pass
+
+
 def make_hub():
-    ctx = SimpleNamespace(catalog=SimpleNamespace(stops=Stops()))
-    return Hub(ctx)
+    return Hub(SimpleNamespace(catalog=Catalog()))
 
 
 def subscribe(hub, name, conn=None):
@@ -65,8 +71,9 @@ async def test_vehicles_send_a_snapshot_then_only_what_changed(monkeypatch):
     hub, conn = make_hub(), Connection(ws=None)
     state = subscribe(hub, VEHICLES, conn)
     await hub._compute(state)
-    assert json.loads(state.data) == {"timestamp": 1000, "vehicles": [{"key": "a", "lat": 1}, {"key": "b", "lat": 2}]}
-    assert conn._pending == {}  # the first state is what subscribing sends
+    first = json.loads(conn._pending.pop(VEHICLES))
+    assert first["type"] == "snapshot"
+    assert first["data"] == {"timestamp": 1000, "vehicles": [{"key": "a", "lat": 1}, {"key": "b", "lat": 2}]}
 
     city.update(a=b'{"key":"a","lat":1.5}', c=b'{"key":"c","lat":3}')
     del city["b"]
@@ -89,6 +96,7 @@ async def test_a_client_behind_on_vehicles_gets_a_snapshot_instead_of_an_update(
     hub, conn = make_hub(), Connection(ws=None)
     state = subscribe(hub, VEHICLES, conn)
     await hub._compute(state)
+    conn._pending.clear()  # the snapshot was sent
     city["a"] = b'{"key":"a","lat":2}'
     await hub._compute(state)  # an update, not sent yet
     city["b"] = b'{"key":"b","lat":3}'
@@ -122,3 +130,20 @@ def test_a_slow_client_gets_the_latest_message_per_topic():
     conn.push(VEHICLES, "update 1")
     conn.push("stop:g1", "new board")
     assert conn._pending == {"stop:g1": "new board", VEHICLES: "update 1"}
+
+
+async def test_subscribers_get_a_snapshot_once_a_failed_first_computation_succeeds(monkeypatch):
+    calls = []
+
+    async def current(ctx):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("redis down")
+        return 1000, {"a": b'{"key":"a"}'}
+
+    monkeypatch.setattr(vehicles, "city", current)
+    hub, conn = make_hub(), Connection(ws=None)
+    await hub.subscribe(conn, VEHICLES)
+    assert conn._pending == {}  # nothing to send yet
+    await hub._compute(hub.topics[VEHICLES])  # the next try (a change or the sweep)
+    assert json.loads(conn._pending[VEHICLES])["type"] == "snapshot"

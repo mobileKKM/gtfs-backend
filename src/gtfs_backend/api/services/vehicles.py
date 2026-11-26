@@ -122,22 +122,23 @@ async def _pieces(ctx: Context, found: list[tuple[str, dict]]) -> list[Piece]:
     """Each vehicle's Piece, built once per position: the live state keeps it (vehicle_pieces) until the vehicle
     changes, so the next ~thousand requests of the map only filter and join. One whose route isn't known yet (its
     version's routes not loaded) isn't kept."""
-    kept = ctx.live.vehicle_pieces
-    missing = [(key, raw) for key, raw in found if key not in kept]
-    built = await models(ctx, [raw for _, raw in missing]) if missing else []
-    new: dict[str, Piece] = {}
-    for (key, _), model in zip(missing, built, strict=True):
-        new[key] = piece = Piece(
-            feed_id=key.split(":", 1)[0],
-            lat=model.lat,
-            lon=model.lon,
-            mode=model.route.mode if model.route else None,
-            route_name=model.route.name if model.route else None,
-            timestamp=model.timestamp,
-            model=model,
-            json=model.model_dump_json().encode(),
-            stream_json=model.model_dump_json(exclude=STREAM_EXCLUDE).encode(),
-        )
-        if model.route is not None:
-            kept[key] = piece
-    return [kept.get(key) or new[key] for key, _ in found]
+    live = ctx.live
+    pieces = {key: piece for key, _ in found if (piece := live.vehicle_pieces.get(key)) is not None}
+    missing = [(key, raw) for key, raw in found if key not in pieces]
+    if missing:
+        built = await models(ctx, [raw for _, raw in missing])  # may wait for routes: the live state can change
+        for (key, raw), model in zip(missing, built, strict=True):
+            pieces[key] = piece = Piece(
+                feed_id=key.split(":", 1)[0],
+                lat=model.lat,
+                lon=model.lon,
+                mode=model.route.mode if model.route else None,
+                route_name=model.route.name if model.route else None,
+                timestamp=model.timestamp,
+                model=model,
+                json=model.model_dump_json().encode(),
+                stream_json=model.model_dump_json(exclude=STREAM_EXCLUDE).encode(),
+            )
+            if model.route is not None and live.vehicles.get(key) is raw:  # kept only while it is the current one
+                live.vehicle_pieces[key] = piece
+    return [pieces[key] for key, _ in found]

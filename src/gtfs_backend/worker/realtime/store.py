@@ -78,10 +78,11 @@ class RealtimeStore:
             "del": sorted(last.keys() - merged.keys()),
         }
 
-    async def write_alerts(self, feed_id: str, res: Result) -> list:
-        """Write the feed's alerts; returns them (all: a change message carries the whole list)."""
-        await self.redis.set(live_layout.alerts(feed_id), _dumps(res.alerts), ex=self.ttls.alert)
-        return res.alerts
+    async def write_alerts(self, feed_id: str, res: Result) -> live_layout.LiveAlerts:
+        """Write the feed's alerts; returns them (all of them: a change message carries the whole value)."""
+        value: live_layout.LiveAlerts = {"timestamp": res.timestamp, "alerts": res.alerts}
+        await self.redis.set(live_layout.alerts(feed_id), _dumps(value), ex=self.ttls.alert)
+        return value
 
     async def write_unmatched(self, feed_id: str, kind: str, res: Result) -> None:
         if res.unmatched_trips or res.unmatched_vehicles or res.unmatched_alert_entities:
@@ -106,9 +107,15 @@ class RealtimeStore:
     async def write_meta(self, feed_id: str, kind: str, meta: live_layout.PollMeta) -> None:
         await self.redis.set(live_layout.meta(feed_id, kind), _dumps(meta))
 
+    def lost(self, feed_id: str, kind: str) -> None:
+        """Part of a poll was written but its changes won't be published (a later write failed): the next message skips
+        a number, so readers load the feed from Redis instead of missing what was written."""
+        self._seq[(feed_id, kind)] = self._seq.get((feed_id, kind), 0) + 1
+
     async def publish(self, feed_id: str, kind: str, ts: int, changes: dict | None = None) -> None:
         """What one poll of a file changed (live_layout.LiveChanges), numbered per file: on rt:updated, and its number in
-        rt:seq so a reader loading from Redis knows which messages it has."""
+        rt:seq so a reader loading from Redis knows which messages it has. The number counts even if this fails, so
+        the next message tells readers they missed one."""
         seq = self._seq[(feed_id, kind)] = self._seq.get((feed_id, kind), 0) + 1
         message: live_layout.LiveChanges = {
             "run": self.run,

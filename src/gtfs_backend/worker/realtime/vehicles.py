@@ -42,7 +42,7 @@ def vehicle_for(
         "lon": pos.longitude,
         "bearing": bearing,
         "speed": speed,
-        "timestamp": int(vp.timestamp) or None,
+        "timestamp": int(vp.timestamp) or ts,  # without its own: as old as the feed (the API hides old data by it)
         "current_status": _enum_name(vp, "current_status", pb.VehiclePosition.VehicleStopStatus),
         "current_stop_sequence": vp.current_stop_sequence if vp.HasField("current_stop_sequence") else None,
         "stop_id": vp.stop_id or None,

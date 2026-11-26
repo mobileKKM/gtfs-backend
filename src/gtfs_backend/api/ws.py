@@ -167,8 +167,8 @@ class Hub:
         state.subscribers.add(conn)
         conn.topics.add(topic.name)
         if state.data is None:
-            await self._compute(state)
-        if state.data is not None and topic.name in self.topics:
+            await self._compute(state)  # its first state goes to every subscriber as a snapshot
+        else:
             conn.push(topic.name, envelope(topic.name, "snapshot", state.data))
 
     def unsubscribe(self, conn: Connection, name: str) -> None:
@@ -220,10 +220,12 @@ class Hub:
     # --------------------------------------------------------------------------------------- computing
 
     async def _compute(self, state: TopicState) -> None:
-        """The topic's current state; what changed goes to its subscribers."""
+        """The topic's current state; what changed goes to its subscribers (all of it, the first time: also those
+        that subscribed while it failed)."""
         topic = state.topic
         state.computed_at = time.monotonic()
         try:
+            await self.ctx.catalog.ensure_fresh()  # as REST requests do (deps.py): a new import, a new day
             if topic.kind == VEHICLES:
                 await self._compute_vehicles(state)
             else:
@@ -247,12 +249,11 @@ class Hub:
         body = model.model_dump_json().encode()
         if body == state.data:
             return
-        first = state.data is None
+        kind = "snapshot" if state.data is None else "update"
         state.data = body
-        if not first:
-            text = envelope(state.topic.name, "update", body)
-            for conn in state.subscribers:
-                conn.push(state.topic.name, text)
+        text = envelope(state.topic.name, kind, body)
+        for conn in state.subscribers:
+            conn.push(state.topic.name, text)
 
     async def _compute_vehicles(self, state: TopicState) -> None:
         """The city's vehicles: an update with those that changed since the last one, and those that went."""
@@ -264,7 +265,12 @@ class Hub:
         first = state.data is None
         state.sent = current
         state.data = msgspec.json.encode({"timestamp": newest, "vehicles": [msgspec.Raw(j) for j in current.values()]})
-        if first or not (upsert or remove):
+        if first:
+            snapshot = envelope(VEHICLES, "snapshot", state.data)
+            for conn in state.subscribers:
+                conn.push(VEHICLES, snapshot)
+            return
+        if not (upsert or remove):
             return
         update = envelope(VEHICLES, "update", msgspec.json.encode({"timestamp": newest, "upsert": upsert, "remove": remove}))
         snapshot = None

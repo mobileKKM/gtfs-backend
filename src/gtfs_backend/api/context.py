@@ -48,8 +48,9 @@ class Context:
         return {feed_id: now - age for feed_id, age in self._max_age.items()}
 
     def fresh(self, feed_id: str, timestamp: int | None, since: dict[str, int] | None = None) -> bool:
-        """Whether realtime measured at `timestamp` is still shown (no timestamp: it is, the TTLs decide). Trip
-        updates and vehicles measured longer ago are ignored, so nothing stale stays when the worker or a feed stops."""
+        """Whether realtime measured at `timestamp` is still shown. Trip updates, vehicles and alerts measured longer
+        ago are ignored, so nothing stale stays when the worker or a feed stops (the worker gives each one a time: the
+        feed header's where it has none of its own)."""
         if timestamp is None:
             return True
         since = since if since is not None else self.fresh_since()

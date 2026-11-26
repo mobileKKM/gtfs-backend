@@ -20,6 +20,7 @@ class FakeStore:
         self.meta: dict = {}
         self.published = 0
         self.touched = 0
+        self.lost_count = 0
 
     async def write_meta(self, feed_id, kind, meta):
         self.meta = dict(meta)
@@ -30,6 +31,9 @@ class FakeStore:
 
     async def touch(self, feed_id, kind):
         self.touched += 1
+
+    def lost(self, feed_id, kind):
+        self.lost_count += 1
 
     async def write_trips(self, feed_id, res): ...
 
@@ -223,3 +227,37 @@ async def test_a_new_index_rewrites_the_last_update_at_the_next_poll(monkeypatch
     assert task.last_change == changed_at  # the data itself is as old as before
     await task.cycle()  # nothing new: kept alive only
     assert store.published == 2 and store.touched == 1
+
+
+async def test_a_failed_write_or_publish_is_processed_and_published_again(monkeypatch):
+    """Readers would otherwise miss what was written: a failed write makes the next message skip a number (they load
+    the feed from Redis), and nothing counts as done until it is published."""
+    task, store = make_task(monkeypatch, *(Fetched(False, MSG, etag='"v1"') for _ in range(3)))
+    real_unmatched, real_publish = store.write_unmatched, store.publish
+
+    async def broken(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(store, "write_unmatched", broken)  # after the trips were written
+    await task.cycle()
+    assert store.lost_count == 1 and store.published == 0 and task.last_ts == 0 and task.etag is None
+
+    monkeypatch.setattr(store, "write_unmatched", real_unmatched)
+    monkeypatch.setattr(store, "publish", broken)
+    await task.cycle()
+    assert task.last_ts == 0 and task.etag is None  # the same file again next time
+
+    monkeypatch.setattr(store, "publish", real_publish)
+    await task.cycle()
+    assert store.published == 1 and task.last_ts == MSG.header.timestamp and task.etag == '"v1"'
+
+
+async def test_an_older_copys_etag_is_not_kept(monkeypatch):
+    task, store = make_task(
+        monkeypatch,
+        Fetched(False, MSG, etag='"v1"'),
+        Fetched(False, older(MSG, 30), etag='"v0"'),  # a cache's older copy: ignored, and asked for again
+    )
+    await task.cycle()
+    await task.cycle()
+    assert task.etag == '"v1"' and store.published == 1

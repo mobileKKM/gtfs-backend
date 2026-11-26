@@ -23,7 +23,7 @@ from gtfs_backend.worker.realtime.extra import build_new_trip, copy_descriptor, 
 from gtfs_backend.worker.realtime.motion import FORGET_S, MotionTracker
 from gtfs_backend.worker.realtime.resolve import EARLY_WINDOW_S, LATE_WINDOW_S, TripRef, resolve, start_date
 from gtfs_backend.worker.realtime.trip_index import TripIndex
-from gtfs_backend.worker.realtime.trip_updates import build_trip, trip_fields
+from gtfs_backend.worker.realtime.trip_updates import build_trip, trip_fields, with_timetable
 from gtfs_backend.worker.realtime.vehicles import build_vehicle, vehicle_for
 
 Loader = Callable[[set[tuple[int, str]]], Awaitable[None]]  # loads the stop times of (version, trip_id)s
@@ -59,6 +59,7 @@ class FeedRealtimeState:
 
 @dataclass
 class Result:
+    timestamp: int = 0  # the feed header's (else when processed): how old this data is
     vehicles: list[LiveVehicle] = field(default_factory=list)
     trips: list[LiveTrip] = field(default_factory=list)
     alerts: list[LiveAlert] = field(default_factory=list)
@@ -85,8 +86,8 @@ def _relationship(enum, value: int) -> str:
 
 
 async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealtimeState, load: Loader, now: float) -> Result:
-    res = Result(entities=len(msg.entity))
     ts = int(msg.header.timestamp) or int(now)
+    res = Result(timestamp=ts, entities=len(msg.entity))
 
     tus = [e for e in msg.entity if e.HasField("trip_update") and not e.is_deleted]
     vps = [e for e in msg.entity if e.HasField("vehicle") and not e.is_deleted]
@@ -137,7 +138,10 @@ async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealti
                 copy, descriptor = copies[e.id]
                 original = index.stop_times.get((copy.info.version, descriptor.trip_id), [])
                 if original:
-                    trip = {**build_trip(feed_id, copy, tu, original, index, now, ts), "extra": True}
+                    trip = build_trip(feed_id, copy, tu, original, index, now, ts)
+                    # no timetable has the copy: every stop of the shifted original, predicted or not
+                    trip = {**trip, "stops": with_timetable(copy, index, original, trip["stops"]), "extra": True}
+                    state.trip_delays[trip["key"]] = (trip["delay_s"], ts)  # for its vehicle
                     found = (trip_fields(feed_id, copy), copy.info.version, ts)
                     # its vehicle names the original and the copy's start time, the date maybe not
                     state.extra_trips[("dup", descriptor.trip_id, descriptor.start_date, descriptor.start_time)] = found

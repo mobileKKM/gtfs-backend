@@ -6,7 +6,7 @@ values below only when it starts, or when it missed a message. Each is the whole
 rt:vehicles:{feed_id}               JSON {vehicle key: LiveVehicle} (TTL VEHICLE_TTL)
 rt:trips:{feed_id}                  JSON {trip key: LiveTrip}: per-stop predictions, incl. stops the feed has already
                                     dropped (their last known times) (TTL TRIP_TTL)
-rt:alerts:{feed_id}                 JSON [LiveAlert] (TTL ALERT_TTL)
+rt:alerts:{feed_id}                 JSON {"timestamp": feed header time, "alerts": [LiveAlert]} (TTL ALERT_TTL)
 rt:seq:{feed_id}:{kind}             "{run}:{seq}" of the last change message of this file (see LiveChanges)
 rt:unmatched:{feed_id}:{kind}       unmatched trip ids / vehicles for debugging (TTL UNMATCHED_TTL), never shown
 rt:meta:{feed_id}:{kind}            poll stats: last poll, last data change, timings, counters
@@ -171,7 +171,7 @@ class LiveChanges(TypedDict):
     ts: int  # the feed header timestamp
     vehicles: NotRequired[dict]  # {"set": {vehicle key: LiveVehicle}, "del": [vehicle key]}
     trips: NotRequired[dict]  # {"set": {trip key: TripState}, "del": [trip key]}
-    alerts: NotRequired[list]  # the feed's alerts (LiveAlert), all of them
+    alerts: NotRequired[dict]  # the feed's alerts, all of them, as rt:alerts holds them (LiveAlerts)
 
 
 class LiveVehicle(TypedDict):
@@ -185,7 +185,7 @@ class LiveVehicle(TypedDict):
     lon: float
     bearing: float | None  # filled from the previous fix when the feed leaves it out
     speed: float | None  # m/s, filled likewise
-    timestamp: int | None
+    timestamp: int  # when the feed measured the position (without its own: the feed header's)
     current_status: str | None  # INCOMING_AT, STOPPED_AT, IN_TRANSIT_TO
     current_stop_sequence: int | None
     stop_id: str | None
@@ -213,8 +213,15 @@ class ActivePeriod(TypedDict):
     end: int | None
 
 
+class LiveAlerts(TypedDict):
+    """rt:alerts:{feed_id}: a feed's alerts and how old they are (alerts have no time of their own)."""
+
+    timestamp: int
+    alerts: list[LiveAlert]
+
+
 class LiveAlert(TypedDict):
-    """An element of rt:alerts:{feed_id} (a JSON list)."""
+    """One alert of LiveAlerts."""
 
     feed_id: str
     id: str

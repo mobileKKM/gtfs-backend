@@ -4,7 +4,7 @@ it, never Redis; it follows the worker's change messages (rt:updated, live_layou
 Each process loads every feed from Redis when it starts, then applies the messages. A feed is loaded again when a
 message of it is missing (its `seq` jumps) or comes from another worker process (`run`), and every feed when the
 subscription was lost. What the worker stops updating isn't removed here: the freshness rule (Context.fresh) hides
-trip updates and vehicles measured longer ago than the feed's max age.
+trip updates, vehicles and alerts measured longer ago than the feed's max age.
 
 Listeners (the WebSocket hub) are told what each applied message touched (Changed).
 """
@@ -23,7 +23,7 @@ import orjson
 from redis.asyncio import Redis
 
 from gtfs_backend import live_layout
-from gtfs_backend.live_layout import LiveVehicle, StopState, TripState
+from gtfs_backend.live_layout import LiveAlerts, LiveVehicle, StopState, TripState
 from gtfs_backend.logs import log
 
 GRID_DEG = 0.01  # vehicle grid cells for box queries: ~1.1 km x 0.7 km at 50 N
@@ -62,7 +62,7 @@ class LiveState:
         # services/vehicles.py's model and JSON of each vehicle, dropped whenever the vehicle changes
         self.vehicle_pieces: dict[str, object] = {}
         self.trips: dict[str, TripState] = {}
-        self.alerts: dict[str, list[dict]] = {}  # feed_id -> LiveAlert list
+        self.alerts: dict[str, LiveAlerts] = {}
         self._grid: dict[tuple[int, int], set[str]] = defaultdict(set)  # cell -> vehicle keys
         self._at_stop: dict[str, set[tuple[str, int]]] = defaultdict(set)  # public_stop_id -> (trip key, stop index)
         self._seq: dict[tuple[str, str], tuple[str, int]] = {}  # (feed, kind) -> (run, seq) last applied
@@ -84,8 +84,14 @@ class LiveState:
     def vehicle(self, key: str) -> LiveVehicle | None:
         return self.vehicles.get(key)
 
-    def alerts_of(self, feed_ids: list[str]) -> list[dict]:
-        return [a for f in feed_ids for a in self.alerts.get(f, ())]
+    def alerts_of(self, feed_ids: list[str], fresh_since: dict[str, int]) -> list[dict]:
+        """The alerts of these feeds whose file isn't older than its max age (Context.fresh_since)."""
+        out = []
+        for f in feed_ids:
+            value = self.alerts.get(f)
+            if value is not None and value["timestamp"] >= fresh_since.get(f, value["timestamp"]):
+                out += value["alerts"]
+        return out
 
     def board(self, feed_ids: list[str], public_stop_ids: list[str], fresh_since: dict[str, int]) -> LiveBoard:
         return LiveBoard(self, set(feed_ids), public_stop_ids, fresh_since)
@@ -183,7 +189,10 @@ class LiveState:
             self._drop_trip(key, changed)
         for key, trip in (orjson.loads(trips) if trips else {}).items():
             self._set_trip(key, live_layout.trip_state(trip), changed)
-        self.alerts[feed_id] = orjson.loads(alerts) if alerts else []
+        if alerts:
+            self.alerts[feed_id] = orjson.loads(alerts)
+        else:
+            self.alerts.pop(feed_id, None)
         for kind, value in zip(kinds, seqs, strict=True):
             if value:
                 run, _, n = value.rpartition(":")
@@ -238,22 +247,23 @@ class LiveState:
 
 class LiveBoard:
     """The live state as one board reads it: the trips of its feeds measured recently enough, and their predictions
-    at the board's stops."""
+    at the board's stops. Taken when the board starts: messages applied while it awaits the timetable don't mix in."""
 
     def __init__(self, live: LiveState, feed_ids: set[str], public_stop_ids: list[str], fresh_since: dict[str, int]):
         self._live = live
         self._feeds = feed_ids
         self._fresh_since = fresh_since
+        self._trips: dict[str, TripState] = {}  # the trips at these stops, as they were
         self._stops: dict[tuple[str, int], StopState] = {}  # (trip key, stop_sequence) -> its stop, at these stops
         for pid in public_stop_ids:
             for key, i in live._at_stop.get(pid, ()):
-                if self.trip(key) is not None:
-                    stop = live.trips[key].stops[i]
-                    self._stops[(key, stop.stop_sequence)] = stop
+                if (trip := self.trip(key)) is not None:
+                    self._trips[key] = trip
+                    self._stops[(key, trip.stops[i].stop_sequence)] = trip.stops[i]
 
     def trip(self, trip_key: str) -> TripState | None:
         """The trip's state, if it is of the board's feeds and fresh (also one without stops here: a canceled trip)."""
-        trip = self._live.trips.get(trip_key)
+        trip = self._trips.get(trip_key) or self._live.trips.get(trip_key)
         feed_id = feed_of(trip_key)
         if trip is None or feed_id not in self._feeds:
             return None
@@ -269,7 +279,7 @@ class LiveBoard:
         (epochs): the rows a board takes from realtime."""
         out = []
         for (key, _), stop in self._stops.items():
-            trip = self._live.trips[key]
+            trip = self._trips[key]
             if trip.extra is not None and stop.scheduled_departure is not None and lo <= stop.scheduled_departure <= hi:
                 out.append((key, stop, trip))
         return out

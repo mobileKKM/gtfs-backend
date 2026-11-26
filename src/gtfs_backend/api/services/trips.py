@@ -192,7 +192,7 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
         seqs, pids = [s.stop_sequence for s in extra.stops], [s.public_stop_id for s in extra.stops]
     else:
         route_id, direction_id, seqs, pids = await _row(ctx, LIVE_SQL, params)
-    alert_raws = live_state.alerts_of(ctx.feed_ids)
+    alert_raws = live_state.alerts_of(ctx.feed_ids, ctx.fresh_since())
     rows = list(zip(seqs or [], pids or [], strict=True))
     update = live_state.trips.get(key)
     if update is not None and update.version != day.version:

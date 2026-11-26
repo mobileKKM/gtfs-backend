@@ -687,7 +687,7 @@ async def alerts_in_redis(api, sql):
         alert("other_direction", route_id=tram["route_id"], direction_id=1 - (tram["direction_id"] or 0)),
     ]
     r = Redis.from_url(TEST_REDIS_URL)
-    await r.set("rt:alerts:kmk_t", json.dumps(raws))
+    await r.set("rt:alerts:kmk_t", json.dumps({"timestamp": NOW, "alerts": raws}))
     await reload_live(api)
     yield {"raws": raws, "tram": tram, "pid": pid, "group": group, "far": far}
     await r.delete("rt:alerts:kmk_t")
@@ -854,7 +854,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
     ]
     current = {"always", "now", "open_end", "soon", "over_and_soon"}
     r = Redis.from_url(TEST_REDIS_URL)
-    await r.set("rt:alerts:kmk_t", json.dumps(raws))
+    await r.set("rt:alerts:kmk_t", json.dumps({"timestamp": NOW, "alerts": raws}))
     await reload_live(api)
     try:
         board = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()

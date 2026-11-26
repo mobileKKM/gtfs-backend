@@ -8,7 +8,7 @@ from conftest import TTLS
 from redis.asyncio import Redis
 
 from gtfs_backend.api.data.geo import Bbox
-from gtfs_backend.api.data.live import GRID_DEG, LiveState
+from gtfs_backend.api.data.live import GRID_DEG, Changed, LiveState
 from gtfs_backend.worker.realtime.normalize import Result
 from gtfs_backend.worker.realtime.store import RealtimeStore
 
@@ -77,7 +77,7 @@ async def poll(store, feed_id, kind, res):
 
 
 async def test_follows_the_workers_changes(redis):
-    store = RealtimeStore(redis, ["kmk_t", "kmk_a"], TTLS)
+    store = RealtimeStore(redis, TTLS)
     await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("735")]))  # before the API starts
     live = LiveState(redis, ["kmk_t", "kmk_a"], KINDS)
     live.start()
@@ -90,7 +90,8 @@ async def test_follows_the_workers_changes(redis):
         await poll(store, "kmk_t", "trip_updates", Result(trips=[trip("kmk_t:20261025:a", (1, "pa", 100), (2, "pb", 200))]))
         await until(lambda: "kmk_t:20261025:a" in live.trips)
         board = live.board(["kmk_t"], ["pb"], {})
-        assert board.state("kmk_t:20261025:a").stop(2).predicted == 200 and board.state("kmk_t:20261025:a").stop(1) is None
+        assert board.trip("kmk_t:20261025:a").version == 1
+        assert board.stop("kmk_t:20261025:a", 2).predicted == 200 and board.stop("kmk_t:20261025:a", 1) is None
         await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("302")]))  # 735 left
         await until(lambda: live.vehicle("kmk_t:735") is None)
         await poll(store, "kmk_t", "trip_updates", Result())
@@ -101,7 +102,7 @@ async def test_follows_the_workers_changes(redis):
 
 
 async def test_a_missed_message_or_another_worker_loads_the_feed_again(redis):
-    store = RealtimeStore(redis, ["kmk_t"], TTLS)
+    store = RealtimeStore(redis, TTLS)
     await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("735")]))
     live = LiveState(redis, ["kmk_t"], KINDS)
     await live.load()
@@ -130,20 +131,34 @@ def test_boxes_find_exactly_the_vehicles_inside():
     live = LiveState(redis=None, feed_ids=["kmk_t"], kinds={})
     rng = random.Random(5)
     for i in range(500):
-        v = vehicle(str(i), lat=rng.uniform(49.95, 50.15), lon=rng.uniform(19.75, 20.2))
-        live._set_vehicle(f"kmk_t:{i}", str(i), v)
+        live._set_vehicle(f"kmk_t:{i}", vehicle(str(i), lat=rng.uniform(49.95, 50.15), lon=rng.uniform(19.75, 20.2)), Changed())
     for _ in range(50):
         lat, lon, h, w = rng.uniform(49.95, 50.1), rng.uniform(19.75, 20.1), rng.uniform(0, 0.08), rng.uniform(0, 0.1)
         box = Bbox(lon, lat, lon + w + 1e-9, lat + h + 1e-9)
-        found = {
-            live.vehicles[k][1]["vehicle_id"]
-            for k in sorted(live.vehicles)
-            if live.vehicles[k][0] in set(live.vehicle_values(box))
-        }
-        inside = {v["vehicle_id"] for _, v in live.vehicles.values() if box.contains(v["lat"], v["lon"])}
+        found = {v["vehicle_id"] for _, v in live.vehicles_in(box)}
+        inside = {v["vehicle_id"] for v in live.vehicles.values() if box.contains(v["lat"], v["lon"])}
         assert inside <= found  # the cells the box touches: a superset, cut exactly by the caller
-        assert all(abs(live.vehicles[f"kmk_t:{i}"][1]["lat"] - lat) < h + 2 * GRID_DEG for i in found)
-    live._set_vehicle("kmk_t:0", "0", vehicle("0", lat=50.0, lon=19.9))  # moved: in one cell only
+        assert all(abs(live.vehicles[f"kmk_t:{i}"]["lat"] - lat) < h + 2 * GRID_DEG for i in found)
+    live._set_vehicle("kmk_t:0", vehicle("0", lat=50.0, lon=19.9), Changed())  # moved: in one cell only
     assert sum("kmk_t:0" in keys for keys in live._grid.values()) == 1
-    live._drop_vehicle("kmk_t:0")
+    live._drop_vehicle("kmk_t:0", Changed())
     assert all("kmk_t:0" not in keys for keys in live._grid.values())
+
+
+def test_changes_say_what_they_touched():
+    live = LiveState(redis=None, feed_ids=["kmk_t"], kinds={})
+    told = []
+    live.listeners.append(told.append)
+    base = {"run": "r", "feed_id": "kmk_t", "kind": "vehicle_positions", "ts": 0}
+    a = [1, False, False, "735", 1000, 0, [[1, "pa", None, 10, 0, False, 10, False, 10]]]
+    live.apply({**base, "kind": "trip_updates", "seq": 1, "trips": {"set": {"kmk_t:20261025:735": a}, "del": []}})
+    assert told[-1] == Changed(trips={"kmk_t:20261025:735"}, stops={"pa"})
+    live.apply({**base, "seq": 1, "vehicles": {"set": {"kmk_t:735": vehicle("735")}, "del": []}})
+    assert told[-1] == Changed(positions=[(50.06, 19.94)], trips={"kmk_t:20261025:735"}, stops={"pa"})  # its trip's boards
+    live.apply({**base, "seq": 2, "vehicles": {"set": {"kmk_t:735": vehicle("735", lat=50.07)}, "del": []}})
+    assert told[-1].positions == [(50.06, 19.94), (50.07, 19.94)]  # where it was and where it is
+    b = [1, False, False, "735", 1000, 0, [[1, "pb", None, 10, 0, False, 10, False, 10]]]
+    live.apply({**base, "kind": "trip_updates", "seq": 2, "trips": {"set": {"kmk_t:20261025:735": b}, "del": []}})
+    assert told[-1].stops == {"pa", "pb"}  # it left pa's board
+    live.apply({**base, "kind": "alerts", "seq": 1, "alerts": []})
+    assert told[-1] == Changed(alerts=True)

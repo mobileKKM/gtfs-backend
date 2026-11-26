@@ -9,7 +9,6 @@ requires-python = ">=3.12"
 # Shared by the worker and the API (the modules at the gtfs_backend root).
 dependencies = [
     "msgspec>=0.19",
-    "numpy>=2.3",
     "orjson>=3.11",
     "psycopg[binary,pool]>=3.3.6",
     "pydantic-settings>=2.16.1",

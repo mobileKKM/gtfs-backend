@@ -30,9 +30,6 @@ class Settings(BaseSettings):
         """A feed's (FeedConfig) realtime max age."""
         return feed.realtime_max_age or self.realtime_max_age
 
-    # The timetable snapshot (gtfs_backend/snapshot.py): the worker writes it here, the API maps it (boards and trip
-    # views read it instead of Postgres). Both need the same folder (docker-compose.yml shares it).
-    snapshot_dir: Path = Path("data/snapshot")
     # Benchmark replays only (docs/benchmark.md): the worker and the API run as if it were this many seconds later
     # (negative: earlier), so a recorded realtime feed meets the timetable day it was recorded on. 0 in production.
     clock_offset: float = 0

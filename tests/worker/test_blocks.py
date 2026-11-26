@@ -140,7 +140,8 @@ async def test_deleted_trips_and_their_vehicles_are_not_shown():
     assert [(t["key"], t["schedule_relationship"]) for t in res.trips] == [("kmk_a:20261126:T1", "DELETED")]
     from gtfs_backend.live_layout import trip_state
 
-    assert trip_state(res.trips[0])[1:] == (True, None, now, True)  # canceled and deleted
+    deleted = trip_state(res.trips[0])
+    assert (deleted.canceled, deleted.vehicle_id, deleted.timestamp, deleted.deleted) == (True, None, now, True)
     # its vehicle comes in another file: not shown either
     res = await process_message("kmk_a", feed(vehicle("T1", "v1"), vehicle("T2", "v2"), ts=now), idx, state, noop, now)
     assert [v["vehicle_id"] for v in res.vehicles] == ["v2"]

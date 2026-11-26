@@ -143,17 +143,14 @@ def live_trips(rng):
     return _live_trips(rng)
 
 
-def test_worker_trip_states_and_changes_of_a_big_feed(benchmark, live_trips):
-    """What the worker builds every trip-updates poll besides rt:trip: rt:tripstate and the compact trips of the change
-    message (one feed, 300 trips x 25 stops)."""
-    import orjson
-
-    from gtfs_backend.worker.realtime.store import _trip_states
+def test_worker_trip_states_of_a_big_feed(benchmark, live_trips):
+    """What the worker builds every trip-updates poll besides rt:trips: each trip's TripState and its JSON, which tell
+    what the change message carries (one feed, 300 trips x 25 stops)."""
+    import msgspec
 
     def build():
-        states = _trip_states(live_trips["kmk_a"])
-        encoded = {key: orjson.dumps(live_layout.compact_trip(t)) for key, t in live_trips["kmk_a"].items()}
-        return states, encoded
+        states = {key: live_layout.trip_state(t) for key, t in live_trips["kmk_a"].items()}
+        return {key: msgspec.json.encode(state) for key, state in states.items()}
 
     assert benchmark(build)
 
@@ -161,12 +158,12 @@ def test_worker_trip_states_and_changes_of_a_big_feed(benchmark, live_trips):
 @pytest.fixture(scope="module")
 def live_state(live_trips):
     """The API's live state with every feed's trips (what a board reads its realtime from)."""
-    from gtfs_backend.api.data.live import LiveState
+    from gtfs_backend.api.data.live import Changed, LiveState
 
     live = LiveState(redis=None, feed_ids=FEEDS, kinds={})
     for trips in live_trips.values():
         for key, trip in trips.items():
-            live._set_trip(key, live_layout.compact_trip(trip))
+            live._set_trip(key, live_layout.trip_state(trip), Changed())
     return live
 
 
@@ -176,7 +173,7 @@ def test_board_realtime_decode(benchmark, live_state, live_trips):
 
     def decode():
         board = live_state.board(FEEDS, POLES, {})
-        board.states(shown)
+        [board.trip(k) for k in shown]
         return board.earliest_early(NOW + 1800, NOW - 30)
 
     benchmark(decode)
@@ -205,24 +202,27 @@ def test_board_overlay_and_select(benchmark, rng):
         )
     states = {}
     for s in rows[::2]:
-        state = departures.TripState(3, False, f"v{s.trip_id}", NOW - 5)
-        state._stops[11] = departures.realtime.StopUpdate(s.scheduled_departure + 120, s.scheduled_departure + 120, 120, False)
-        states[s.trip_key] = state
+        at = s.scheduled_departure + 120
+        stop = live_layout.StopState(11, s.public_stop_id, at, at, 120, False, s.scheduled_departure, False, None)
+        states[s.trip_key] = live_layout.TripState(3, False, False, f"v{s.trip_id}", NOW - 5, 120, [stop])
 
     def page():
-        out = [departures.Row(s, departures.overlay(s, states.get(s.trip_key), NOW)) for s in rows]
+        out = []
+        for s in rows:
+            trip = states.get(s.trip_key)
+            out.append(departures.Row(s, departures.overlay(s, trip, trip.stops[0] if trip else None, NOW)))
         return departures.select(out, NOW, 20, NOW - 30, NOW + 3600, True)
 
     assert len(benchmark(page)) == 20
 
 
 def test_vehicles_city_wide_response_from_pieces(benchmark, vehicle_raws):
-    """GET /vehicles since phase 3: each vehicle's JSON is built once per Redis value (VehiclePieces), so a request
-    filters and joins kept pieces, then hashes and gzips as before."""
+    """GET /vehicles since phase 3: each vehicle's JSON is built once per position (kept in the live state until the
+    vehicle changes), so a request filters and joins kept pieces, then hashes and gzips as before."""
     import asyncio
     from types import SimpleNamespace
 
-    from gtfs_backend.api.services.vehicles import VehiclePieces
+    from gtfs_backend.api.data.live import LiveState
 
     refs = {
         (keys.version_id(f, 3), f"r{i}"): RouteRef(key=f"{f}:r{i}", name=str(i), mode="bus") for f in FEEDS for i in range(150)
@@ -231,12 +231,12 @@ def test_vehicles_city_wide_response_from_pieces(benchmark, vehicle_raws):
     async def route_refs(wanted):
         return {k: refs[k] for k in wanted if k in refs}
 
-    ctx = SimpleNamespace(catalog=SimpleNamespace(route_refs=route_refs))
-    pieces = VehiclePieces()
-    asyncio.run(pieces.get(ctx, vehicle_raws))  # the first request after a poll builds them
+    found = [(keys.vehicle_key(v["feed_id"], v["vehicle_id"]), v) for v in map(json.loads, vehicle_raws)]
+    ctx = SimpleNamespace(catalog=SimpleNamespace(route_refs=route_refs), live=LiveState(None, FEEDS, {}))
+    asyncio.run(vehicles._pieces(ctx, found))  # the first request after a poll builds them
 
     def respond():
-        kept = asyncio.run(pieces.get(ctx, vehicle_raws))
+        kept = asyncio.run(vehicles._pieces(ctx, found))
         shown = [p for p in kept if 19.0 <= p.lon <= 21.0]
         body = b'{"timestamp":1,"vehicles":[' + b",".join(p.json for p in shown) + b"]}"
         _etag(body)

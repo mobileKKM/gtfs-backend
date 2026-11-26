@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,7 +19,6 @@ from gtfs_backend.api.metrics import RequestMetricsMiddleware
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
 from gtfs_backend.api.routers import metrics as metrics_router
 from gtfs_backend.api.settings import ApiSettings, get_api_settings
-from gtfs_backend.api.timing import ServerTimingMiddleware, TimedConnection, TimedPool, TimedRedis
 from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
@@ -30,18 +28,13 @@ LIVE_WARMUP_S = 10  # how long the start waits for the live data's first load
 
 
 async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
-    """The worker publishes `static:updated` after an import (reload the catalog, which reloads the snapshot too) and
-    `snapshot:updated` after a new day's snapshot (reload only that)."""
+    """The worker publishes `static:updated` after an import: reload the catalog."""
     while True:
         try:
             async with redis.pubsub() as ps:
-                await ps.subscribe(live_layout.STATIC_UPDATED, live_layout.SNAPSHOT_UPDATED)
+                await ps.subscribe(live_layout.STATIC_UPDATED)
                 async for msg in ps.listen():
-                    if msg["type"] != "message":
-                        continue
-                    if msg["channel"] == live_layout.SNAPSHOT_UPDATED:
-                        catalog.timetable_changed()
-                    else:
+                    if msg["type"] == "message":
                         catalog.invalidate()
         except asyncio.CancelledError:
             raise
@@ -76,16 +69,10 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        pool = async_pool(
-            settings.database_url,
-            max_size=settings.db_pool_max_size,
-            timeout=settings.db_pool_timeout,
-            pool_class=TimedPool,
-            connection_class=TimedConnection,
-        )
+        pool = async_pool(settings.database_url, max_size=settings.db_pool_max_size, timeout=settings.db_pool_timeout)
         await pool.open()
         # bounded: under load requests wait for a connection (then 503) instead of opening ever more
-        redis = TimedRedis(
+        redis = Redis(
             connection_pool=BlockingConnectionPool.from_url(
                 settings.redis_url,
                 decode_responses=True,
@@ -94,9 +81,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             )
         )
         feeds_file = feeds or load_feeds(settings.feeds_config)
-        catalog = Catalog(
-            pool, feeds_file, clock, refresh_s=settings.catalog_refresh_interval, snapshot_dir=settings.snapshot_dir
-        )
+        catalog = Catalog(pool, feeds_file, clock, refresh_s=settings.catalog_refresh_interval)
         try:  # warm up, so the first requests don't all wait for it; they retry if the database is down
             await catalog.ensure_fresh()
         except Exception as exc:  # noqa: BLE001
@@ -114,8 +99,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
         live.listeners.append(hub.on_change)
         hub.start()
         listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
-        # a context of its own: flushing is no request's work (api/timing.py)
-        flusher = asyncio.create_task(recorder.run(redis), context=contextvars.Context())
+        flusher = asyncio.create_task(recorder.run(redis))
         try:
             yield
         finally:
@@ -141,8 +125,6 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
     # level 6 (zlib's default), not Starlette's 9: about a quarter of the time for a 5 % bigger body (640 kB of JSON:
     # 5.5 ms instead of 19.7 ms, 77 kB instead of 73 kB)
     app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=GZIP_LEVEL)
-    if settings.server_timing:
-        app.add_middleware(ServerTimingMiddleware)  # outside gzip: its `total` includes it
     if settings.request_metrics:
         app.add_middleware(RequestMetricsMiddleware, recorder=recorder)  # outermost: times everything
     errors.install(app)

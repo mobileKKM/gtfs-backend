@@ -1,5 +1,5 @@
-"""Departure boards: the timetable from the snapshot (api/data/timetable.py; Postgres' core.stop_departure for days it
-doesn't have) with the realtime predictions at the board's stops from the process's live state (api/data/live.py).
+"""Departure boards: the timetable from Postgres (core.stop_departure) with the realtime predictions at the board's stops
+from the process's live state (api/data/live.py).
 
 The timetable query covers every authoritative service day that can run in the window (a night trip of
 yesterday's service can still be running) and reaches back LOOKBACK_S so delayed trips stay on the board until
@@ -21,14 +21,14 @@ from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Catalog, Day, RouteInfo
-from gtfs_backend.api.data.live import PID, SCHED, SEQ
-from gtfs_backend.api.data.realtime import TripState, TripUpdate
+from gtfs_backend.api.data.live import LiveBoard
 from gtfs_backend.api.data.sql import union_per_version
 from gtfs_backend.api.data.stopdata import Hourly
 from gtfs_backend.api.errors import InvalidInput
 from gtfs_backend.api.schemas import Departure, DepartureBoard, DepartureStatus, RouteRef
 from gtfs_backend.api.schemas.departures import VehicleState
 from gtfs_backend.api.services import alerts, stops, vehicles
+from gtfs_backend.live_layout import StopState, TripState
 
 LOOKBACK_S = 60 * 60  # delayed departures stay this long past their time
 GRACE_S = 30  # keep a departure this long after it leaves
@@ -137,43 +137,22 @@ async def scheduled(
 async def timetable(
     ctx: Context, days: list[Day], public_stop_ids: list[str], start: int, end: int, lookback: int = LOOKBACK_S
 ) -> list[Scheduled]:
-    """scheduled(), from the snapshot when it has each of these days in the catalog's version, else from Postgres."""
-    tt = ctx.catalog.timetable
-    if tt is not None and (by_index := tt.days_for(days)) is not None:
-        # trip keys from one prefix per day (formatting the date for every row costs more than the rest of a row)
-        prefixes = {(d.feed_id, d.date): keys.trip_key(d.feed_id, d.date, "") for d in by_index.values()}
-        return [
-            Scheduled(
-                r.day.feed_id,
-                r.day.feed_version_id,
-                r.day.version,
-                r.day.date,
-                r.trip_id,
-                r.stop_sequence,
-                r.public_stop_id,
-                r.epoch,
-                r.headsign,
-                r.route_id,
-                r.on_demand,
-                prefixes[(r.day.feed_id, r.day.date)] + r.trip_id,
-            )
-            for r in tt.departures(by_index, public_stop_ids, start - lookback, end)
-        ]
-    # a connection only for the query: held across the Redis calls after it, boards would queue for the pool
+    """scheduled() on a connection held only for the query."""
     async with ctx.pool.connection() as conn:
         return await scheduled(conn, days, public_stop_ids, start, end, lookback)
 
 
-def _extra_rows(live_data, days: list[Day], lo: int, hi: int) -> list[Scheduled]:
+def _extra_rows(live_data: LiveBoard, days: list[Day], lo: int, hi: int) -> list[Scheduled]:
     """The departures of trips no timetable has (GTFS-RT NEW, DUPLICATED, ...) from the live state, as timetable rows
     of the day they run on (one of `days`, in the version realtime has)."""
     by_date = {(d.feed_id, d.date): d for d in days}
     out = []
-    for key, e, (route_id, headsign) in live_data.extra_departures(lo, hi):
+    for key, stop, trip in live_data.extra_departures(lo, hi):
         feed_id, service_date, trip_id = keys.parse_trip_key(key)
         day = by_date.get((feed_id, service_date))
-        if day is None or (state := live_data.state(key)) is None or state.version != day.version:
+        if day is None or trip.version != day.version:
             continue
+        route_id, headsign = trip.extra
         out.append(
             Scheduled(
                 feed_id,
@@ -181,9 +160,9 @@ def _extra_rows(live_data, days: list[Day], lo: int, hi: int) -> list[Scheduled]
                 day.version,
                 service_date,
                 trip_id,
-                e[SEQ],
-                e[PID],
-                e[SCHED],
+                stop.stop_sequence,
+                stop.public_stop_id,
+                stop.scheduled_departure,
                 headsign,
                 route_id or "",
                 False,
@@ -199,22 +178,26 @@ def runs(vehicle: dict | None, s: Scheduled) -> bool:
 
 
 def overlay(
-    s: Scheduled, update: TripUpdate | TripState | None, now: int, vehicle: dict | None = None, grace: int = GRACE_S
+    s: Scheduled,
+    trip: TripState | None,
+    stop: StopState | None,
+    now: int,
+    vehicle: dict | None = None,
+    grace: int = GRACE_S,
 ) -> Live:
-    """Realtime state of one scheduled departure.
+    """Realtime state of one scheduled departure: `trip`'s state and its `stop` at this departure's stop (if any).
 
     `status`: `canceled` (the trip), `skipped` (this stop), `live` (the feed predicts this stop), `predicted` (a delay
     carried over from an earlier stop), else `scheduled`. `departed` once the vehicle reports a later stop of the trip
-    (GTFS-RT VehiclePosition.current_stop_sequence), or, without that, once its time is `grace` past. A TripUpdate says
+    (GTFS-RT VehiclePosition.current_stop_sequence), or, without that, once its time is `grace` past. A trip update says
     nothing about passed stops: it only lists predictions, so a stop it doesn't list isn't taken as passed.
     """
-    if update is not None and update.version != s.version:
-        update = None  # computed for another timetable version: stop sequences differ
-    stop = update.stop(s.stop_sequence) if update else None
+    if trip is None or trip.version != s.version:
+        trip = stop = None  # none, or computed for another timetable version: stop sequences differ
     estimated = stop.predicted if stop else None
     delay = stop.delay_s if stop else None
     is_live = estimated is not None
-    if update is not None and update.canceled:
+    if trip is not None and trip.canceled:
         status = "canceled"
     elif stop is not None and stop.skipped:
         status = "skipped"
@@ -223,9 +206,9 @@ def overlay(
     else:
         status = "scheduled"
     departed = _vehicle_past(vehicle, s) or (estimated or s.scheduled_departure) + grace < now
-    if update is None:
+    if trip is None:
         return Live(estimated, delay, is_live, status, departed, None)
-    return Live(estimated, delay, is_live, status, departed, update.vehicle_id, update.timestamp)
+    return Live(estimated, delay, is_live, status, departed, trip.vehicle_id, trip.timestamp)
 
 
 def _vehicle_past(vehicle: dict | None, s: Scheduled) -> bool:
@@ -294,17 +277,17 @@ async def _page(
         refs |= await ctx.catalog.route_refs({(f.feed_version_id, f.route_id) for f in found})
         if route_names:
             found = [f for f in found if (ref := refs.get((f.feed_version_id, f.route_id))) and ref.name in route_names]
-        # only what these stops need of each trip, not whole trips
-        states = live_data.states({f.trip_key for f in found})
+        states = {k: trip for k in {f.trip_key for f in found} if (trip := live_data.trip(k)) is not None}
         # the feed deleted the trip (GTFS-RT DELETED, unlike CANCELED): not shown at all
         found = [f for f in found if not ((st := states.get(f.trip_key)) and st.deleted and st.version == f.version)]
         # the hour before `lo` only for delays: without realtime (of its version) such a departure has left (live)
         # or is before the board's start (with a time), so it can't be on the page. Most of that hour is gone here.
         found = [f for f in found if f.scheduled_departure >= lo or _realtime_of(states, f)]
         by_vehicle = await _vehicles(ctx, found, states)
-        rows += [
-            Row(f, overlay(f, states.get(f.trip_key), now, by_vehicle.get(f.trip_key)), by_vehicle.get(f.trip_key)) for f in found
-        ]
+        for f in found:
+            vehicle = by_vehicle.get(f.trip_key)
+            shown = overlay(f, states.get(f.trip_key), live_data.stop(f.trip_key, f.stop_sequence), now, vehicle)
+            rows.append(Row(f, shown, vehicle))
         page = select(rows, now, limit, lo, hi, live)
         # full, unless a trip scheduled after the window runs early enough to come before its last departure
         if len(page) >= limit and ((early := live_data.earliest_early(hi, lo)) is None or early > page[-1].time):

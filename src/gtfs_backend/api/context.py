@@ -24,9 +24,6 @@ class Context:
     settings: ApiSettings
     live_state: LiveState | None = None  # the live data in memory (api/data/live.py)
     _max_age: dict[str, int] = field(init=False, repr=False)
-    # what services keep between requests of this process, built from data that doesn't change while kept (the JSON
-    # of a vehicle per Redis value, ...): never a response
-    memo: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         self._max_age = {f.feed_id: self.settings.max_age(f) for f in self.feeds.feeds}

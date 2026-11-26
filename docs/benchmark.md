@@ -24,10 +24,8 @@ uv run pytest bench/micro --benchmark-compare      # against the last saved run
 | `vehicles_city_wide_response` | `/vehicles` after its MGET: 1,000 vehicles decoded, built, serialized, hashed, gzipped |
 | `board_realtime_decode` | a board's realtime from the live state: the states of 60 shown trips, and the scan for trips running early (a busy group of 8 poles, ~300 trips) |
 | `board_overlay_and_select` | realtime laid over 600 timetable rows, page of 20 picked |
-| `worker_trip_states_and_changes_of_a_big_feed` | what the worker builds every trip-updates poll besides `rt:trip`: `rt:tripstate` and the change message's compact trips (300 trips x 25 stops) |
+| `worker_trip_states_of_a_big_feed` | what the worker builds every trip-updates poll besides `rt:trips`: each trip's `TripState` and its JSON, which tell what the change message carries (300 trips x 25 stops) |
 | `vehicles_city_wide_response_from_pieces` | `/vehicles` since phase 3: kept per-vehicle JSON filtered and joined, hashed, gzipped |
-| `board_rows_from_the_snapshot` | a board's timetable rows (8 poles, 90 min) from a 1.35 M-row snapshot: what was a Postgres query |
-| `stop_search[...]` | stop search in memory over the fixtures' stop names |
 
 ## Load: record once, replay as often as needed
 
@@ -66,15 +64,15 @@ a board, a trip). Both modes sample, every second, how old the newest realtime d
 `--code PATH` runs another checkout's worker and API with the same load (a git worktree of the commit before a
 change: `git worktree add ../wt-before <commit>`). The load always comes from this checkout's `bench/loadgen.py`.
 
-The mix (`bench/loadgen.py`, the same as `bench/k6/rest_mix.js`): every client has its own connection and opens a
+The mix (`bench/loadgen.py`): every client has its own connection and opens a
 view, polling it every 10 s with `If-None-Match`: the map 50 % (`/stops?bbox` once, then `/vehicles?bbox` for a 2–8
 km box), a board 30 %, a trip 15 % (`/trips/{key}` once, then `/live`), a followed vehicle 5 %, plus a stop search
 before 10 % of views. Latency is until the whole body arrived, steady state only (after the ramp); 404s of trips and
 vehicles that left the feed count as answered. The generator reports its own event loop lag, which would inflate
 the latencies if it got high.
 
-k6 (`bench/k6/rest_mix.js`) does the same from a k6 install; run in Docker on macOS it loses connections in Docker's
-network (`dial: i/o timeout` from 200 clients on), so `bench/load.py` uses the Python generator.
+The generator is Python rather than k6: k6 in Docker on macOS loses connections in Docker's network (`dial: i/o
+timeout` from 200 clients on).
 
 ## Server: `/api/v1/metrics`
 
@@ -85,6 +83,13 @@ endpoint adds up all processes over the last `window` seconds (60–3600, whole 
 bucket's upper bound: up to 9 % (`bucket_error`) above the real one.
 
 ## Results
+
+These are the phases of PR #3 as measured. Afterwards (2026-11-26) the parts that cost more than they gave were taken
+out again, to keep the code small: the timetable snapshot (phase 2: boards and trips read their timetable from Postgres
+again, about 1 ms of the board's p50 at this load, and ~350 MB less API memory), the in-memory stop search (search is
+one Postgres query again), tile diffs on the WebSocket (tiles are sent whole, like boards), `Server-Timing` (`/metrics`
+remains), and the per-vehicle / per-trip Redis keys (one value per feed now; only an API process starting or catching
+up reads it). The live state in memory (phase 4a), where most of the gain came from, stays.
 
 **Load** on the 2026-11-26 morning peak (recorded 06:40–07:20, `manifest.json` sha256 `0e8e46d7…`), Apple M4 Pro
 (12 cores), Python 3.14.5, `API_WORKERS=4`, 2,000 clients, 60 s ramp, 300 s measured, one run each, back to back,
@@ -125,6 +130,6 @@ every second.
 | vehicles_city_wide_response (old path) → …_from_pieces | 10.1 ms | 2.9 ms |
 | board realtime decode (Redis values → live state) | 0.67 ms | 0.32 ms |
 | worker per-poll derived work (rt:stop index → states + changes) | 5.8 ms | 1.2 ms |
-| board timetable rows (Postgres query → snapshot) | ~1–3 ms + pool | 0.16 ms |
+| board timetable rows (Postgres query → snapshot; Postgres again since) | ~1–3 ms + pool | 0.16 ms |
 | board_overlay_and_select | 0.58 ms | 0.60 ms |
-| stop search (Postgres → memory) | a query | 0.15–0.68 ms |
+| stop search (Postgres → memory; Postgres again since) | a query | 0.15–0.68 ms |

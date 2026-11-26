@@ -1,13 +1,9 @@
-"""Live vehicles (Redis only)."""
+"""Live vehicles, from the process's live state (api/data/live.py)."""
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
-import orjson
-
-from gtfs_backend.api import timing
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.geo import Bbox
@@ -71,21 +67,19 @@ async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[st
 
 
 async def in_bbox_json(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[str]) -> bytes:
-    """GET /vehicles: a VehicleList body, joined from each vehicle's JSON (built once per Redis value, VehiclePieces):
+    """GET /vehicles: a VehicleList body, joined from each vehicle's JSON (built once per position, _pieces):
     byte for byte what in_bbox(...).model_dump_json() gives."""
     pieces = await _in_bbox(ctx, bbox, modes, route_names)
-    with timing.serializing():
-        newest = realtime.newest(p.timestamp for p in pieces)
-        head = b'{"timestamp":' + (b"null" if newest is None else str(newest).encode()) + b',"vehicles":['
-        return head + b",".join(p.json for p in pieces) + b"]}"
+    newest = realtime.newest(p.timestamp for p in pieces)
+    head = b'{"timestamp":' + (b"null" if newest is None else str(newest).encode()) + b',"vehicles":['
+    return head + b",".join(p.json for p in pieces) + b"]}"
 
 
 async def _in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[str]) -> list[Piece]:
     width, height = bbox.size_km()
     if max(width, height) > MAX_BBOX_KM:
         raise InvalidInput(f"bbox is larger than {MAX_BBOX_KM:g} km")
-    values = ctx.live.vehicle_values(bbox)  # the grid cells the box touches: cut exactly below
-    pieces = await ctx.memo.setdefault("vehicles", VehiclePieces()).get(ctx, values)
+    pieces = await _pieces(ctx, ctx.live.vehicles_in(bbox))  # the grid cells the box touches: cut exactly below
     since = ctx.fresh_since()
     return [
         p
@@ -111,39 +105,25 @@ class Piece:
     json: bytes
 
 
-class VehiclePieces:
-    """Each vehicle's model and JSON, built once per distinct rt:veh value (a new one comes when the vehicle moves, every
-    few seconds) and kept while requests still see that value: the next ~thousand requests of the map only filter and
-    join. A value whose route isn't known yet (its version's routes not loaded) isn't kept."""
-
-    SWEEP_S = 30  # values not seen for this long are dropped
-
-    def __init__(self, clock=time.monotonic):
-        self.clock = clock
-        self._pieces: dict[str, Piece] = {}
-        self._seen: set[str] = set()
-        self._swept = clock()
-
-    async def get(self, ctx: Context, values: list[str]) -> list[Piece]:
-        missing = [v for v in dict.fromkeys(values) if v not in self._pieces]
-        new: dict[str, Piece] = {}
-        if missing:
-            for value, model in zip(missing, await models(ctx, [orjson.loads(v) for v in missing]), strict=True):
-                new[value] = piece = Piece(
-                    feed_id=model.key.split(":", 1)[0],
-                    lat=model.lat,
-                    lon=model.lon,
-                    mode=model.route.mode if model.route else None,
-                    route_name=model.route.name if model.route else None,
-                    timestamp=model.timestamp,
-                    model=model,
-                    json=model.model_dump_json().encode(),
-                )
-                if model.route is not None:
-                    self._pieces[value] = piece
-        out = [self._pieces.get(v) or new[v] for v in values]
-        self._seen.update(values)
-        if self.clock() - self._swept > self.SWEEP_S:
-            self._pieces = {v: p for v, p in self._pieces.items() if v in self._seen}
-            self._seen, self._swept = set(), self.clock()
-        return out
+async def _pieces(ctx: Context, found: list[tuple[str, dict]]) -> list[Piece]:
+    """Each vehicle's Piece, built once per position: the live state keeps it (vehicle_pieces) until the vehicle
+    changes, so the next ~thousand requests of the map only filter and join. One whose route isn't known yet (its
+    version's routes not loaded) isn't kept."""
+    kept = ctx.live.vehicle_pieces
+    missing = [(key, raw) for key, raw in found if key not in kept]
+    built = await models(ctx, [raw for _, raw in missing]) if missing else []
+    new: dict[str, Piece] = {}
+    for (key, _), model in zip(missing, built, strict=True):
+        new[key] = piece = Piece(
+            feed_id=key.split(":", 1)[0],
+            lat=model.lat,
+            lon=model.lon,
+            mode=model.route.mode if model.route else None,
+            route_name=model.route.name if model.route else None,
+            timestamp=model.timestamp,
+            model=model,
+            json=model.model_dump_json().encode(),
+        )
+        if model.route is not None:
+            kept[key] = piece
+    return [kept.get(key) or new[key] for key, _ in found]

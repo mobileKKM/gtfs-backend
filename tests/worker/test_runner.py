@@ -225,37 +225,3 @@ async def test_static_updated_does_not_wait_for_ever(monkeypatch):
     assert time.monotonic() - started < 2
     worker.runtimes = {feed.feed_id: FakeRuntime(ok=False)}  # no new index: nothing to wait for
     await worker._rewrite_realtime(feed)
-
-
-async def test_the_snapshot_is_built_once_the_feeds_were_checked_and_again_on_a_new_day(monkeypatch):
-    worker = _worker()
-    now = [1_795_000_000.0]  # 2026-11-18 ~ 10:06 Warsaw
-    worker.clock = lambda: now[0]
-    built, published = [], []
-
-    async def build():
-        built.append(now[0])
-        worker.snapshot_date = runner.datetime.fromtimestamp(now[0], runner.MAINTENANCE_TZ).date()
-        return True
-
-    class Redis:
-        async def publish(self, channel, message):
-            published.append((channel, message))
-
-    worker.redis = Redis()
-    monkeypatch.setattr(worker, "_build_snapshot", build)
-    monkeypatch.setattr(runner, "MAINTENANCE_CHECK_INTERVAL_S", 0.01)
-    loop = runner.asyncio.create_task(worker._snapshot_loop())
-    await runner.asyncio.sleep(0.05)
-    assert built == []  # the feeds' first static checks first
-    for event in worker.first_check.values():
-        event.set()
-    await runner.asyncio.sleep(0.05)
-    assert len(built) == 1 and published == [("snapshot:updated", "2026-11-18")]
-    now[0] += 3600  # the same day: nothing
-    await runner.asyncio.sleep(0.05)
-    assert len(built) == 1
-    now[0] += 86400
-    await runner.asyncio.sleep(0.05)
-    assert len(built) == 2 and published[-1] == ("snapshot:updated", "2026-11-19")
-    loop.cancel()

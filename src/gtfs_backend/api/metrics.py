@@ -25,7 +25,7 @@ def route_template(scope) -> str:
 
 class RequestMetricsMiddleware:
     """Pure ASGI. Add it last, so it is the outermost middleware: it times each HTTP request from its arrival until the
-    app has sent the whole response (gzip and Server-Timing included)."""
+    app has sent the whole response (gzip included)."""
 
     def __init__(self, app, recorder: metrics.Recorder):
         self.app = app

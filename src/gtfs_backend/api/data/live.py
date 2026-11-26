@@ -1,12 +1,12 @@
 """The live data in this API process's memory: vehicles, trips with their per-stop predictions, alerts. Requests read
-it instead of Redis; it follows the worker's change messages (rt:updated, live_layout.LiveChanges).
+it, never Redis; it follows the worker's change messages (rt:updated, live_layout.LiveChanges).
 
 Each process loads every feed from Redis when it starts, then applies the messages. A feed is loaded again when a
 message of it is missing (its `seq` jumps) or comes from another worker process (`run`), and every feed when the
 subscription was lost. What the worker stops updating isn't removed here: the freshness rule (Context.fresh) hides
-trip updates and vehicles measured longer ago than the feed's max age, as it did for Redis.
+trip updates and vehicles measured longer ago than the feed's max age.
 
-Listeners (the WebSocket hub) get each applied message after it was applied.
+Listeners (the WebSocket hub) are told what each applied message touched (Changed).
 """
 
 from __future__ import annotations
@@ -16,30 +16,39 @@ import contextlib
 import math
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass, field
 
+import msgspec
 import orjson
 from redis.asyncio import Redis
 
 from gtfs_backend import live_layout
-from gtfs_backend.api.data.realtime import StopUpdate, TripState, TripUpdate
+from gtfs_backend.live_layout import LiveVehicle, StopState, TripState
 from gtfs_backend.logs import log
 
 GRID_DEG = 0.01  # vehicle grid cells for box queries: ~1.1 km x 0.7 km at 50 N
 RETRY_S = 2  # after a lost subscription or a failed load
 
-# CompactTrip fields (live_layout.compact_trip)
-VERSION, CANCELED, VEHICLE, TIMESTAMP, DELETED, DELAY, STOPS, EXTRA = range(8)
-# StopEntry fields
-SEQ, PID, ARR, DEP, SDELAY, SKIPPED, SCHED, PROPAGATED, SCHED_ARR = range(9)
-
-
-def extra_of(trip: list | None) -> list | None:
-    """[route_id, headsign] of a trip no timetable has (GTFS-RT NEW, ADDED, DUPLICATED), else None."""
-    return trip[EXTRA] if trip is not None and len(trip) > EXTRA else None
-
 
 def cell(lat: float, lon: float) -> tuple[int, int]:
     return math.floor(lat / GRID_DEG), math.floor(lon / GRID_DEG)
+
+
+def feed_of(key: str) -> str:
+    """The feed of a vehicle or trip key."""
+    return key.split(":", 1)[0]
+
+
+@dataclass
+class Changed:
+    """What an applied message touched: vehicle positions (before and after), trips (changed ones, and those of moved
+    vehicles), the stops of those trips (before and after), alerts. `everything`: a feed was loaded again."""
+
+    positions: list[tuple[float, float]] = field(default_factory=list)
+    trips: set[str] = field(default_factory=set)
+    stops: set[str] = field(default_factory=set)
+    alerts: bool = False
+    everything: bool = False
 
 
 class LiveState:
@@ -49,42 +58,31 @@ class LiveState:
         self.feed_ids = feed_ids
         self.kinds = kinds
         self.ready = False  # every feed loaded once
-        self.vehicles: dict[str, tuple[str, dict]] = {}  # vehicle key -> (LiveVehicle JSON, decoded)
-        self._grid: dict[tuple[int, int], set[str]] = defaultdict(set)
-        self._cell_of: dict[str, tuple[int, int]] = {}
-        self.trips: dict[str, list] = {}  # trip key -> CompactTrip
-        self._at_stop: dict[str, set[tuple[str, int]]] = defaultdict(set)  # public_stop_id -> (trip key, entry index)
+        self.vehicles: dict[str, LiveVehicle] = {}  # vehicle key -> its LiveVehicle
+        # services/vehicles.py's model and JSON of each vehicle, dropped whenever the vehicle changes
+        self.vehicle_pieces: dict[str, object] = {}
+        self.trips: dict[str, TripState] = {}
         self.alerts: dict[str, list[dict]] = {}  # feed_id -> LiveAlert list
+        self._grid: dict[tuple[int, int], set[str]] = defaultdict(set)  # cell -> vehicle keys
+        self._at_stop: dict[str, set[tuple[str, int]]] = defaultdict(set)  # public_stop_id -> (trip key, stop index)
         self._seq: dict[tuple[str, str], tuple[str, int]] = {}  # (feed, kind) -> (run, seq) last applied
-        self.listeners: list[Callable[[dict], None]] = []
+        self.listeners: list[Callable[[Changed], None]] = []
         self._task: asyncio.Task | None = None
         self._loaded = asyncio.Event()
 
     # ------------------------------------------------------------------------------------------- reading
 
-    def vehicle_values(self, bbox) -> list[str]:
-        """JSON values of the vehicles inside a box (geo.Bbox), by vehicle key."""
+    def vehicles_in(self, bbox) -> list[tuple[str, LiveVehicle]]:
+        """(key, vehicle) of the vehicles in the grid cells a box (geo.Bbox) touches, by key: cut exactly by callers."""
         lo, hi = cell(bbox.min_lat, bbox.min_lon), cell(bbox.max_lat, bbox.max_lon)
         found = []
         for la in range(lo[0], hi[0] + 1):
             for lo_ in range(lo[1], hi[1] + 1):
                 found.extend(self._grid.get((la, lo_), ()))
-        return [self.vehicles[k][0] for k in sorted(found)]
+        return [(k, self.vehicles[k]) for k in sorted(found)]
 
-    def vehicle(self, key: str) -> dict | None:
-        entry = self.vehicles.get(key)
-        return entry[1] if entry else None
-
-    def vehicle_value(self, key: str) -> str | None:
-        entry = self.vehicles.get(key)
-        return entry[0] if entry else None
-
-    def trip_update(self, trip_key: str) -> TripUpdate | None:
-        trip = self.trips.get(trip_key)
-        if trip is None:
-            return None
-        stops = {e[SEQ]: StopUpdate(e[ARR], e[DEP], e[SDELAY], bool(e[SKIPPED]), bool(e[PROPAGATED])) for e in trip[STOPS]}
-        return TripUpdate.of(trip[VERSION], trip[CANCELED], trip[DELETED], trip[VEHICLE], trip[TIMESTAMP], trip[DELAY], stops)
+    def vehicle(self, key: str) -> LiveVehicle | None:
+        return self.vehicles.get(key)
 
     def alerts_of(self, feed_ids: list[str]) -> list[dict]:
         return [a for f in feed_ids for a in self.alerts.get(f, ())]
@@ -94,35 +92,45 @@ class LiveState:
 
     # ------------------------------------------------------------------------------------------- changing
 
-    def _set_vehicle(self, key: str, value: str, v: dict) -> None:
-        self._drop_vehicle(key)
-        self.vehicles[key] = (value, v)
-        c = self._cell_of[key] = cell(v["lat"], v["lon"])
-        self._grid[c].add(key)
+    def _set_vehicle(self, key: str, v: LiveVehicle, changed: Changed) -> None:
+        self._drop_vehicle(key, changed)
+        self.vehicles[key] = v
+        self._grid[cell(v["lat"], v["lon"])].add(key)
+        changed.positions.append((v["lat"], v["lon"]))
+        changed.trips.add(v["trip"]["key"])
 
-    def _drop_vehicle(self, key: str) -> None:
-        if self.vehicles.pop(key, None) is not None:
-            c = self._cell_of.pop(key)
-            self._grid[c].discard(key)
-            if not self._grid[c]:
-                del self._grid[c]
+    def _drop_vehicle(self, key: str, changed: Changed) -> None:
+        self.vehicle_pieces.pop(key, None)
+        v = self.vehicles.pop(key, None)
+        if v is None:
+            return
+        c = cell(v["lat"], v["lon"])
+        self._grid[c].discard(key)
+        if not self._grid[c]:
+            del self._grid[c]
+        changed.positions.append((v["lat"], v["lon"]))
+        changed.trips.add(v["trip"]["key"])
 
-    def _set_trip(self, key: str, trip: list) -> None:
-        self._drop_trip(key)
+    def _set_trip(self, key: str, trip: TripState, changed: Changed) -> None:
+        self._drop_trip(key, changed)
         self.trips[key] = trip
-        for i, e in enumerate(trip[STOPS]):
-            if e[PID] is not None:
-                self._at_stop[e[PID]].add((key, i))
+        for i, stop in enumerate(trip.stops):
+            if stop.public_stop_id is not None:
+                self._at_stop[stop.public_stop_id].add((key, i))
+        changed.trips.add(key)
 
-    def _drop_trip(self, key: str) -> None:
+    def _drop_trip(self, key: str, changed: Changed) -> None:
         trip = self.trips.pop(key, None)
         if trip is None:
             return
-        for i, e in enumerate(trip[STOPS]):
-            if e[PID] is not None and (entries := self._at_stop.get(e[PID])) is not None:
+        for i, stop in enumerate(trip.stops):
+            pid = stop.public_stop_id
+            if pid is not None and (entries := self._at_stop.get(pid)) is not None:
                 entries.discard((key, i))
                 if not entries:
-                    del self._at_stop[e[PID]]
+                    del self._at_stop[pid]
+                changed.stops.add(pid)
+        changed.trips.add(key)
 
     def apply(self, message: dict) -> bool:
         """Apply one change message; False if it can't be (a gap or another worker run): the feed needs loading."""
@@ -134,51 +142,55 @@ class LiveState:
         if last is not None and (last[0] != run or seq != last[1] + 1):
             return False
         self._seq[(feed, kind)] = (run, seq)
+        changed = Changed()
         if (vehicles := message.get("vehicles")) is not None:
             for key in vehicles.get("del", ()):
-                self._drop_vehicle(key)
+                self._drop_vehicle(key, changed)
             for key, v in vehicles.get("set", {}).items():
-                self._set_vehicle(key, orjson.dumps(v).decode(), v)  # the worker's own JSON (both orjson)
+                self._set_vehicle(key, v, changed)
         if (trips := message.get("trips")) is not None:
             for key in trips.get("del", ()):
-                self._drop_trip(key)
+                self._drop_trip(key, changed)
             for key, trip in trips.get("set", {}).items():
-                self._set_trip(key, trip)
+                self._set_trip(key, msgspec.convert(trip, TripState), changed)
         if (alerts := message.get("alerts")) is not None:
             self.alerts[feed] = alerts
-        for listener in self.listeners:
-            listener(message)
+            changed.alerts = True
+        for key in changed.trips:  # a vehicle shows on its trip's boards too
+            if (trip := self.trips.get(key)) is not None:
+                changed.stops.update(s.public_stop_id for s in trip.stops if s.public_stop_id is not None)
+        self._tell(changed)
         return True
 
+    def _tell(self, changed: Changed) -> None:
+        for listener in self.listeners:
+            listener(changed)
+
     async def load_feed(self, feed_id: str) -> None:
-        """Everything of a feed from Redis, replacing what was here, and the message numbers it includes."""
-        r = self.redis
-        seqs = await r.mget([live_layout.seq(feed_id, k) for k in self.kinds.get(feed_id, [])])
-        members = await r.zrange(live_layout.vehicles_geo(feed_id), 0, -1)
-        values = await r.mget([live_layout.vehicle(m) for m in members]) if members else []
-        trip_keys = list(await r.hkeys(live_layout.trip_states(feed_id)))
-        trips = await r.mget([live_layout.trip(k) for k in trip_keys]) if trip_keys else []
-        alerts = await r.get(live_layout.alerts(feed_id))
-        prefix = f"{feed_id}:"
-        for key in [k for k in self.vehicles if k.startswith(prefix)]:
-            self._drop_vehicle(key)
-        for key, value in zip(members, values, strict=True):
-            if value:
-                self._set_vehicle(key, value, orjson.loads(value))
-        for key in [k for k in self.trips if k.startswith(prefix)]:
-            self._drop_trip(key)
-        for key, value in zip(trip_keys, trips, strict=True):
-            if value:
-                self._set_trip(key, live_layout.compact_trip(orjson.loads(value)))
+        """Everything of a feed from Redis, replacing what was here, and the message numbers it includes (one MGET:
+        Redis answers it at one moment)."""
+        kinds = self.kinds.get(feed_id, [])
+        *seqs, vehicles, trips, alerts = await self.redis.mget(
+            [*(live_layout.seq(feed_id, k) for k in kinds), live_layout.vehicles(feed_id), live_layout.trips(feed_id),
+             live_layout.alerts(feed_id)]
+        )  # fmt: skip
+        changed = Changed(everything=True)
+        for key in [k for k in self.vehicles if feed_of(k) == feed_id]:
+            self._drop_vehicle(key, changed)
+        for key, v in (orjson.loads(vehicles) if vehicles else {}).items():
+            self._set_vehicle(key, v, changed)
+        for key in [k for k in self.trips if feed_of(k) == feed_id]:
+            self._drop_trip(key, changed)
+        for key, trip in (orjson.loads(trips) if trips else {}).items():
+            self._set_trip(key, live_layout.trip_state(trip), changed)
         self.alerts[feed_id] = orjson.loads(alerts) if alerts else []
-        for kind, value in zip(self.kinds.get(feed_id, []), seqs, strict=True):
+        for kind, value in zip(kinds, seqs, strict=True):
             if value:
                 run, _, n = value.rpartition(":")
                 self._seq[(feed_id, kind)] = (run, int(n))
             else:
                 self._seq.pop((feed_id, kind), None)
-        for listener in self.listeners:
-            listener({"feed_id": feed_id, "loaded": True})
+        self._tell(changed)
 
     async def load(self) -> None:
         for feed_id in self.feed_ids:
@@ -214,12 +226,8 @@ class LiveState:
                         if msg["type"] != "message":
                             continue
                         message = orjson.loads(msg["data"])
-                        if "run" not in message:  # an older worker's notification, without the changes
-                            continue
-                        if message.get("feed_id") in self.feed_ids and not self.apply(message):
-                            log.info(
-                                "live_feed_reload", feed=message["feed_id"], kind=message.get("kind"), seq=message.get("seq")
-                            )
+                        if message["feed_id"] in self.feed_ids and not self.apply(message):
+                            log.info("live_feed_reload", feed=message["feed_id"], kind=message["kind"], seq=message["seq"])
                             await self.load_feed(message["feed_id"])
             except asyncio.CancelledError:
                 raise
@@ -229,64 +237,52 @@ class LiveState:
 
 
 class LiveBoard:
-    """A board's realtime from the live state, read like data/realtime.BoardRealtime (which read it from Redis): the
-    trip states with their predictions at the board's stops, and trips running early."""
+    """The live state as one board reads it: the trips of its feeds measured recently enough, and their predictions
+    at the board's stops."""
 
     def __init__(self, live: LiveState, feed_ids: set[str], public_stop_ids: list[str], fresh_since: dict[str, int]):
         self._live = live
         self._feeds = feed_ids
         self._fresh_since = fresh_since
-        self._entries: dict[str, list[int]] = defaultdict(list)  # trip key -> its entry indexes at the board's stops
+        self._stops: dict[tuple[str, int], StopState] = {}  # (trip key, stop_sequence) -> its stop, at these stops
         for pid in public_stop_ids:
             for key, i in live._at_stop.get(pid, ()):
-                if key.split(":", 1)[0] in feed_ids:
-                    self._entries[key].append(i)
-        self._decoded: dict[str, TripState | None] = {}
+                if self.trip(key) is not None:
+                    stop = live.trips[key].stops[i]
+                    self._stops[(key, stop.stop_sequence)] = stop
 
-    def state(self, trip_key: str) -> TripState | None:
-        if trip_key in self._decoded:
-            return self._decoded[trip_key]
+    def trip(self, trip_key: str) -> TripState | None:
+        """The trip's state, if it is of the board's feeds and fresh (also one without stops here: a canceled trip)."""
         trip = self._live.trips.get(trip_key)
-        feed_id = trip_key.split(":", 1)[0]
-        state = None
-        if trip is not None and feed_id in self._feeds:
-            ts = trip[TIMESTAMP]
-            if ts is None or ts >= self._fresh_since.get(feed_id, ts):
-                state = TripState(trip[VERSION], trip[CANCELED], trip[VEHICLE], ts, trip[DELETED])
-                for i in self._entries.get(trip_key, ()):
-                    e = trip[STOPS][i]
-                    state._stops[e[SEQ]] = StopUpdate(e[ARR], e[DEP], e[SDELAY], bool(e[SKIPPED]), bool(e[PROPAGATED]))
-        self._decoded[trip_key] = state
-        return state
+        feed_id = feed_of(trip_key)
+        if trip is None or feed_id not in self._feeds:
+            return None
+        if trip.timestamp is not None and trip.timestamp < self._fresh_since.get(feed_id, trip.timestamp):
+            return None
+        return trip
 
-    def states(self, trip_keys) -> dict[str, TripState]:
-        return {k: state for k in trip_keys if (state := self.state(k)) is not None}
+    def stop(self, trip_key: str, stop_sequence: int) -> StopState | None:
+        return self._stops.get((trip_key, stop_sequence))
 
-    def extra_departures(self, lo: int, hi: int) -> list[tuple[str, list, list]]:
-        """(trip key, StopEntry, [route_id, headsign]) of the trips no timetable has, departing from the board's stops
-        between lo and hi (epochs): the rows a board takes from realtime."""
+    def extra_departures(self, lo: int, hi: int) -> list[tuple[str, StopState, TripState]]:
+        """(trip key, stop, trip) of the trips no timetable has, departing from the board's stops between lo and hi
+        (epochs): the rows a board takes from realtime."""
         out = []
-        for key, indexes in self._entries.items():
-            trip = self._live.trips.get(key)
-            if (extra := extra_of(trip)) is None or self.state(key) is None:
-                continue
-            for i in indexes:
-                e = trip[STOPS][i]
-                if e[SCHED] is not None and lo <= e[SCHED] <= hi:
-                    out.append((key, e, extra))
+        for (key, _), stop in self._stops.items():
+            trip = self._live.trips[key]
+            if trip.extra is not None and stop.scheduled_departure is not None and lo <= stop.scheduled_departure <= hi:
+                out.append((key, stop, trip))
         return out
 
     def earliest_early(self, after: int, since: int) -> int | None:
-        """As BoardRealtime.earliest_early: the earliest prediction, from `since` on, of a trip scheduled at one of the
-        board's stops after `after`; None without one."""
-        best = None
-        for key, indexes in self._entries.items():
-            trip = self._live.trips.get(key)
-            if trip is None or self.state(key) is None:
-                continue
-            for i in indexes:
-                e = trip[STOPS][i]
-                predicted = e[DEP] or e[ARR]
-                if predicted is not None and e[SCHED] is not None and e[SCHED] > after and predicted >= since:
-                    best = predicted if best is None else min(best, predicted)
-        return best
+        """The earliest prediction, from `since` on, of a trip scheduled at one of the board's stops after `after`; None
+        without one."""
+        times = [
+            stop.predicted
+            for stop in self._stops.values()
+            if stop.predicted is not None
+            and stop.scheduled_departure is not None
+            and stop.scheduled_departure > after
+            and stop.predicted >= since
+        ]
+        return min(times, default=None)

@@ -1,21 +1,17 @@
-"""Redis layout for live data: the worker writes it, the API reads it. Timetables stay in Postgres.
+"""Live data in Redis: the worker writes it, the API reads it. Timetables stay in Postgres.
 
-Every key carries the feed_id, because trip and vehicle ids are only unique within a feed (see keys.py).
+The API keeps the live data in memory (api/data/live.py) and follows the change messages on rt:updated; it reads the
+values below only when it starts, or when it missed a message. Each is the whole of a feed's data, written at once.
 
-rt:veh:geo                          GEO set of all feeds' vehicles (member = vehicle key), the union of:
-rt:veh:geo:{feed_id}                GEO set per feed, replaced atomically on every vehicle poll
-rt:veh:{vehicle_key}                vehicle JSON (TTL VEHICLE_TTL)
-rt:trip:{trip_key}                  trip update JSON with per-stop predictions, incl. stops the feed has
-                                    already dropped (their last known times); the JSON has the version.
-                                    Removed when the trip leaves the feed (TTL TRIP_TTL as a fallback)
-rt:tripstate:{feed_id}              HASH trip key -> TripState of every trip in rt:trip (TTL TRIP_TTL)
-rt:alerts:{feed_id}                 alerts JSON (TTL ALERT_TTL)
+rt:vehicles:{feed_id}               JSON {vehicle key: LiveVehicle} (TTL VEHICLE_TTL)
+rt:trips:{feed_id}                  JSON {trip key: LiveTrip}: per-stop predictions, incl. stops the feed has already
+                                    dropped (their last known times) (TTL TRIP_TTL)
+rt:alerts:{feed_id}                 JSON [LiveAlert] (TTL ALERT_TTL)
+rt:seq:{feed_id}:{kind}             "{run}:{seq}" of the last change message of this file (see LiveChanges)
 rt:unmatched:{feed_id}:{kind}       unmatched trip ids / vehicles for debugging (TTL UNMATCHED_TTL), never shown
 rt:meta:{feed_id}:{kind}            poll stats: last poll, last data change, timings, counters
-rt:seq:{feed_id}:{kind}             "{run}:{seq}" of the last change message of this file (see rt:updated)
-pub/sub rt:updated                  after each write, what changed (LiveChanges): the API's live state follows it
-pub/sub static:updated              feed_id, after a static import became ready (and its snapshot was written)
-pub/sub snapshot:updated            generation, after the timetable snapshot was rebuilt for a new day
+pub/sub rt:updated                  after each write, what changed (LiveChanges)
+pub/sub static:updated              feed_id, after a static import became ready
 
 The JSON values are typed below (LiveVehicle, LiveTrip, LiveAlert, Unmatched, PollMeta): the worker builds exactly
 these, the API reads them. Times are epoch seconds, delays seconds; enums are GTFS-RT names (alerts: lowercase).
@@ -25,26 +21,18 @@ from __future__ import annotations
 
 from typing import NotRequired, TypedDict
 
-VEHICLES_GEO = "rt:veh:geo"
+import msgspec
+
 REALTIME_UPDATED = "rt:updated"
 STATIC_UPDATED = "static:updated"
-SNAPSHOT_UPDATED = "snapshot:updated"
 
 
-def vehicles_geo(feed_id: str) -> str:
-    return f"{VEHICLES_GEO}:{feed_id}"
+def vehicles(feed_id: str) -> str:
+    return f"rt:vehicles:{feed_id}"
 
 
-def vehicle(vehicle_key: str) -> str:
-    return f"rt:veh:{vehicle_key}"
-
-
-def trip(trip_key: str) -> str:
-    return f"rt:trip:{trip_key}"
-
-
-def trip_states(feed_id: str) -> str:
-    return f"rt:tripstate:{feed_id}"
+def trips(feed_id: str) -> str:
+    return f"rt:trips:{feed_id}"
 
 
 def alerts(feed_id: str) -> str:
@@ -99,7 +87,7 @@ class StopRow(TypedDict):
 
 
 class LiveTrip(TripFields):
-    """rt:trip:{trip_key}"""
+    """A trip of rt:trips:{feed_id}"""
 
     extra: NotRequired[bool]  # no timetable has it (GTFS-RT NEW, ADDED, DUPLICATED): boards take it from realtime
     vehicle_id: str | None
@@ -109,23 +97,44 @@ class LiveTrip(TripFields):
     stops: list[StopRow]  # incl. stops the feed has dropped since (their last known times)
 
 
-# JSON arrays, not objects: boards read thousands of them.
-# rt:tripstate value: [version, canceled, vehicle_id, timestamp, deleted], from the LiveTrip. Deleted (GTFS-RT DELETED):
-# removed and not to be shown at all, also canceled. Readers accept the 4-element form of older workers.
-TripState = tuple[int, bool, str | None, int, bool]
-# A trip as the API keeps it in memory (change messages and its first load from rt:trip):
-# [version, canceled, vehicle_id, timestamp, deleted, delay_s, [StopEntry, ...], extra], with
-# StopEntry = [stop_sequence, public_stop_id, predicted_arrival, predicted_departure, delay_s, skipped,
-#              scheduled_departure, propagated, scheduled_arrival]
-# and extra = [route_id, headsign] for a trip no timetable has (worker/realtime/extra.py), else None
-CompactTrip = list
-StopEntry = list
+class StopState(msgspec.Struct, array_like=True, frozen=True):
+    """One stop of a TripState."""
+
+    stop_sequence: int
+    public_stop_id: str | None
+    predicted_arrival: int | None
+    predicted_departure: int | None
+    delay_s: int | None
+    skipped: bool
+    scheduled_departure: int | None
+    propagated: bool  # no time from the feed for this stop: the delay of an earlier one carried over
+    scheduled_arrival: int | None
+
+    @property
+    def predicted(self) -> int | None:
+        """When the vehicle leaves (or arrives, where only that is known)."""
+        return self.predicted_departure or self.predicted_arrival
 
 
-def compact_trip(trip: LiveTrip) -> CompactTrip:
-    version, canceled, vehicle_id, timestamp, deleted = trip_state(trip)
+class TripState(msgspec.Struct, array_like=True, frozen=True):
+    """A trip's realtime as the API keeps it in memory and the change messages carry it: what the API needs of a
+    LiveTrip. Encoded as a JSON array (msgspec array_like), not an object: messages carry hundreds of them."""
+
+    version: int  # the timetable version it was computed for: stop sequences only compare within one
+    canceled: bool  # also when deleted
+    deleted: bool  # GTFS-RT DELETED: not to be shown at all
+    vehicle_id: str | None
+    timestamp: int | None  # when the feed measured it
+    delay_s: int | None
+    stops: list[StopState]
+    extra: tuple[str | None, str | None] | None = None  # (route_id, headsign) of a trip no timetable has (extra.py)
+
+
+def trip_state(trip: LiveTrip) -> TripState:
+    relationship = trip["schedule_relationship"]
+    deleted = relationship == "DELETED"
     stops = [
-        [
+        StopState(
             r["stop_sequence"],
             r["public_stop_id"],
             r["predicted_arrival"],
@@ -135,11 +144,20 @@ def compact_trip(trip: LiveTrip) -> CompactTrip:
             r["scheduled_departure"],
             r["propagated"],
             r["scheduled_arrival"],
-        ]
+        )
         for r in trip["stops"]
     ]
-    extra = [trip["route_id"], trip["headsign"]] if trip.get("extra") else None
-    return [version, canceled, vehicle_id, timestamp, deleted, trip["delay_s"], stops, extra]
+    extra = (trip["route_id"], trip["headsign"]) if trip.get("extra") else None
+    return TripState(
+        trip["version"],
+        deleted or relationship == "CANCELED",
+        deleted,
+        trip["vehicle_id"],
+        trip["timestamp"],
+        trip["delay_s"],
+        stops,
+        extra,
+    )
 
 
 class LiveChanges(TypedDict):
@@ -152,14 +170,8 @@ class LiveChanges(TypedDict):
     seq: int
     ts: int  # the feed header timestamp
     vehicles: NotRequired[dict]  # {"set": {vehicle key: LiveVehicle}, "del": [vehicle key]}
-    trips: NotRequired[dict]  # {"set": {trip key: CompactTrip}, "del": [trip key]}
+    trips: NotRequired[dict]  # {"set": {trip key: TripState}, "del": [trip key]}
     alerts: NotRequired[list]  # the feed's alerts (LiveAlert), all of them
-
-
-def trip_state(trip: LiveTrip) -> TripState:
-    relationship = trip["schedule_relationship"]
-    deleted = relationship == "DELETED"
-    return trip["version"], deleted or relationship == "CANCELED", trip["vehicle_id"], trip["timestamp"], deleted
 
 
 class LiveVehicle(TypedDict):

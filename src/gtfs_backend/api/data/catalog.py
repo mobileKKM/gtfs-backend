@@ -11,17 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from psycopg_pool import AsyncConnectionPool
 
-from gtfs_backend.api.data.search import StopSearch
 from gtfs_backend.api.data.stopdata import StopData, load_stop_data
 from gtfs_backend.api.schemas import Route, RouteRef
 from gtfs_backend.feeds import FeedsFile
@@ -100,20 +97,10 @@ class Catalog:
     what is loaded (a slow or unreachable database never holds a request up). A failed refresh is retried after
     RETRY_S. Feed versions never change once ready, so routes are kept until their version is no longer ready."""
 
-    def __init__(
-        self,
-        pool: AsyncConnectionPool,
-        feeds: FeedsFile,
-        clock: Clock = time.time,
-        refresh_s: float = REFRESH_S,
-        snapshot_dir: Path | None = None,
-    ):
+    def __init__(self, pool: AsyncConnectionPool, feeds: FeedsFile, clock: Clock = time.time, refresh_s: float = REFRESH_S):
         self.pool = pool
-        self.snapshot_dir = snapshot_dir  # the worker's timetable snapshot (gtfs_backend/snapshot.py); None: not used
-        self.timetable = None  # api/data/timetable.Timetable of the current snapshot, once loaded
         self.refresh_s = refresh_s
         self.config = {f.feed_id: f for f in feeds.enabled}
-        self.search_namespaces = feeds.searchable_namespaces
         self.clock = clock
         self.feeds: dict[str, FeedInfo] = {}
         self._routes: dict[str, dict[str, RouteInfo]] = {}  # feed_version_id -> route_id -> info
@@ -125,11 +112,8 @@ class Catalog:
         self._loaded_generation = -1  # -1: never loaded
         self._lock = asyncio.Lock()
         self._refresh: asyncio.Task | None = None
-        self._timetable_lock = asyncio.Lock()
-        self._timetable_tasks: set[asyncio.Task] = set()
         self._retry_at = 0.0  # time.monotonic()
         self.stops = StopData.empty()  # stops, groups, today's directions (api/data/stopdata.py)
-        self.search = StopSearch([])  # stop search over self.stops (api/data/search.py)
 
     @property
     def loaded(self) -> bool:
@@ -160,8 +144,7 @@ class Catalog:
             return
         if time.monotonic() < self._retry_at:
             return
-        # a context of its own: the refresh is no request's work (api/timing.py)
-        self._refresh = asyncio.create_task(self._refresh_now(), context=contextvars.Context())
+        self._refresh = asyncio.create_task(self._refresh_now())
 
     async def _refresh_now(self) -> None:
         try:
@@ -219,8 +202,6 @@ class Catalog:
         for feed_id, info in feeds.items():
             info.covered = frozenset(wanted[feed_id])
         self.feeds = feeds
-        if stops is not self.stops:
-            self.search = StopSearch(stops.searchable_groups(self.search_namespaces))
         self.stops = stops
         self._loaded_for = {f: local_date(now, info.tz) for f, info in feeds.items()}
         self._routes = {v: routes for v, routes in self._routes.items() if v in ready}  # retired ones go
@@ -230,37 +211,6 @@ class Catalog:
                 await self._load_routes(missing)
         self._loaded_at = now
         self._loaded_generation = generation
-        await self.load_timetable()
-
-    def timetable_changed(self) -> None:
-        """The worker wrote a new snapshot: load it in the background."""
-        task = asyncio.create_task(self.load_timetable(), context=contextvars.Context())
-        self._timetable_tasks.add(task)
-        task.add_done_callback(self._timetable_tasks.discard)
-
-    async def load_timetable(self) -> None:
-        """Load the snapshot `current` points at, if it isn't the loaded one (in a thread: its tables take a moment).
-        A broken or missing snapshot leaves the loaded one (or none: boards then read Postgres)."""
-        if self.snapshot_dir is None:
-            return
-        from gtfs_backend.api.data.timetable import Timetable  # it builds on Day, defined here
-        from gtfs_backend.snapshot import CURRENT, Snapshot
-
-        async with self._timetable_lock:
-            link = self.snapshot_dir / CURRENT
-            try:
-                target = link.resolve(strict=True)
-            except OSError:
-                return
-            if self.timetable is not None and self.timetable.generation == target.name:
-                return
-            try:
-                snapshot = await asyncio.to_thread(Snapshot, target)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("snapshot_load_failed", generation=target.name, error=f"{type(exc).__name__}: {exc}")
-                return
-            self.timetable = Timetable(snapshot)
-            log.info("snapshot_loaded", generation=target.name, **snapshot.manifest.get("counts", {}))
 
     # ------------------------------------------------------------------------------------------- days
 

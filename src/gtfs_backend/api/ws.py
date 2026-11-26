@@ -3,25 +3,24 @@
 Client -> server (JSON text):   {"op": "subscribe" | "unsubscribe", "topics": ["tile:14/9093/5555", "stop:{key}", ...]}
 Server -> client (JSON text):   {"topic", "type": "snapshot" | "update", "data"} | {"type": "error", "topic", "error"}
 
-    tile:{z}/{x}/{y}    vehicles in a map tile (slippy map numbering, z 10-16). snapshot: as GET /vehicles for the
-                        tile's box; update: {"timestamp", "upsert": [Vehicle], "remove": [vehicle key]}
-    stop:{stop key}     the departure board (as GET /stops/{key}/departures, the next 20): snapshot, then the whole
-                        board again whenever it changed
-    trip:{trip key}     the trip's live state (as GET /trips/{key}/live): likewise
+`data` is always the whole current state, the body the REST endpoint would return: `snapshot` right after
+subscribing, `update` whenever it changed.
 
-The hub follows the process's live state (api/data/live.py): every change message marks the topics it touches
-dirty (a moved vehicle its old and new tile and its trip's board and trip; a changed trip the boards of its stops
-and itself; alerts every board and trip), and every SWEEP_S all of them (departures leave, data gets old). A dirty
-topic is computed again at most every MIN_INTERVAL_S of its kind, serialized once, and the same text goes to every
-subscriber. A connection keeps only the latest message per topic: a slow client gets the newest state, not a queue
-(for a tile whose update it hasn't received yet, the current snapshot instead of a second one).
+    tile:{z}/{x}/{y}    vehicles in a map tile (slippy map numbering, z 10-16), as GET /vehicles for the tile's box
+    stop:{stop key}     the departure board, as GET /stops/{key}/departures (the next 20)
+    trip:{trip key}     the trip's live state, as GET /trips/{key}/live
+
+The hub follows the process's live state (api/data/live.py): what each change touched (live.Changed) marks topics
+dirty (vehicle positions their tiles; trips themselves; stops their boards; alerts every board and trip), and every
+SWEEP_S all of them are (departures leave, data gets old). A dirty topic is computed again at most every
+MIN_INTERVAL_S of its kind, serialized once, and the same text goes to every subscriber. A connection keeps only the
+latest message per topic: a slow client gets the newest state, not a queue.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import math
 import time
 from dataclasses import dataclass, field
@@ -33,6 +32,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from gtfs_backend import keys
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.geo import Bbox
+from gtfs_backend.api.data.live import Changed
 from gtfs_backend.api.errors import ServiceError
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.logs import log
@@ -123,9 +123,6 @@ class Connection:
         self._pending[topic] = text
         self._wake.set()
 
-    def has_pending(self, topic: str) -> bool:
-        return topic in self._pending
-
     async def send_loop(self) -> None:
         while not self.closed:
             await self._wake.wait()
@@ -148,9 +145,7 @@ def error_message(topic: str | None, code: str, message: str) -> str:
 class TopicState:
     topic: Topic
     subscribers: set[Connection] = field(default_factory=set)
-    snapshot: str | None = None  # the current state as a snapshot message, for new subscribers
-    data: bytes | None = None  # stops and trips: the last body sent
-    pieces: dict[str, bytes] = field(default_factory=dict)  # tiles: vehicle key -> its JSON as last sent
+    data: bytes | None = None  # the current body, as last sent
     computed_at: float = 0.0
 
 
@@ -166,9 +161,6 @@ class Hub:
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self.connections: set[Connection] = set()
-        # what the change messages said last, to know what they move away from
-        self._vehicle_at: dict[str, tuple[float, float, str | None]] = {}  # vehicle key -> (lat, lon, trip key)
-        self._trip_pids: dict[str, frozenset[str]] = {}  # trip key -> its stops
         self._stop_topics: dict[str, set[str]] = {}  # public_stop_id -> stop topics covering it
         self._zooms: dict[int, int] = {}  # tile zoom -> subscribed tiles
 
@@ -191,10 +183,10 @@ class Hub:
             self._index(topic, add=True)
         state.subscribers.add(conn)
         conn.topics.add(topic.name)
-        if state.snapshot is None:
+        if state.data is None:
             await self._compute(state)
-        if state.snapshot is not None and topic.name in self.topics:
-            conn.push(topic.name, state.snapshot)
+        if state.data is not None and topic.name in self.topics:
+            conn.push(topic.name, envelope(topic.name, "snapshot", state.data))
 
     def unsubscribe(self, conn: Connection, name: str) -> None:
         conn.topics.discard(name)
@@ -229,133 +221,67 @@ class Hub:
 
     # --------------------------------------------------------------------------------------- changes
 
-    def on_change(self, message: dict) -> None:
+    def on_change(self, changed: Changed) -> None:
         """LiveState listener: called after a change message (or a feed's load) was applied."""
-        self._changes.append(message)
+        self._changes.append(changed)
         self._wake.set()
 
-    def _mark(self, message: dict) -> None:
-        live = self.ctx.live_state
-        if message.get("loaded") or live is None:  # a whole feed was loaded again: everything may have changed
-            self._rebuild()
+    def _mark(self, changed: Changed) -> None:
+        if changed.everything:
             self.dirty.update(self.topics)
             return
-        if (vehicles := message.get("vehicles")) is not None:
-            for key in [*vehicles.get("set", {}), *vehicles.get("del", ())]:
-                old = self._vehicle_at.pop(key, None)
-                v = live.vehicle(key)
-                new = (v["lat"], v["lon"], v["trip"]["key"]) if v else None
-                if new is not None:
-                    self._vehicle_at[key] = new
-                for pos in (old, new):
-                    if pos is None:
-                        continue
-                    for z in self._zooms:
-                        x, y = tile_of(pos[0], pos[1], z)
-                        self.dirty.add(f"tile:{z}/{x}/{y}")
-                    self._trip_touched(pos[2])
-        if (trips := message.get("trips")) is not None:
-            for key in [*trips.get("set", {}), *trips.get("del", ())]:
-                self._trip_touched(key, reindex=True)
-        if message.get("alerts") is not None:
+        for lat, lon in changed.positions:
+            for z in self._zooms:
+                x, y = tile_of(lat, lon, z)
+                self.dirty.add(f"tile:{z}/{x}/{y}")
+        self.dirty.update(f"trip:{key}" for key in changed.trips)
+        for pid in changed.stops:
+            self.dirty.update(self._stop_topics.get(pid, ()))
+        if changed.alerts:
             self.dirty.update(n for n, s in self.topics.items() if s.topic.kind in ("stop", "trip"))
         self.dirty &= self.topics.keys()
-
-    def _trip_touched(self, trip_key: str | None, reindex: bool = False) -> None:
-        if trip_key is None:
-            return
-        old = self._trip_pids.get(trip_key, frozenset())
-        if reindex:
-            trip = self.ctx.live_state.trips.get(trip_key)
-            new = frozenset(e[1] for e in trip[6] if e[1]) if trip else frozenset()
-            if new:
-                self._trip_pids[trip_key] = new
-            else:
-                self._trip_pids.pop(trip_key, None)
-            pids = old | new
-        else:
-            pids = old
-        for pid in pids:
-            self.dirty.update(self._stop_topics.get(pid, ()))
-        self.dirty.add(f"trip:{trip_key}")
-
-    def _rebuild(self) -> None:
-        live = self.ctx.live_state
-        self._vehicle_at = {k: (v["lat"], v["lon"], v["trip"]["key"]) for k, (_, v) in live.vehicles.items()}
-        self._trip_pids = {k: frozenset(e[1] for e in t[6] if e[1]) for k, t in live.trips.items()}
 
     # --------------------------------------------------------------------------------------- computing
 
     async def _compute(self, state: TopicState) -> None:
-        """The topic's current state; pushes an update to its subscribers if it changed."""
+        """The topic's current body; pushed to its subscribers if it changed."""
         topic = state.topic
         state.computed_at = time.monotonic()
         try:
-            if topic.kind == "tile":
-                await self._compute_tile(state)
-            else:
-                await self._compute_body(state)
+            body = await self._body(topic)
         except ServiceError as exc:  # the stop or trip doesn't exist (any more)
             text = error_message(topic.name, exc.code, str(exc))
             for conn in list(state.subscribers):
                 conn.push(f"error:{topic.name}", text)
                 self.unsubscribe(conn, topic.name)
-        except Exception as exc:  # noqa: BLE001 - a store down: the next change tries again
+            return
+        except Exception as exc:  # noqa: BLE001 - the next change tries again
             log.warning("ws_topic_failed", kind=topic.kind, error=f"{type(exc).__name__}: {exc}")
-
-    async def _compute_tile(self, state: TopicState) -> None:
-        from gtfs_backend.api.services import vehicles
-
-        bbox = tile_bbox(*state.topic.zxy)
-        pieces = await vehicles._in_bbox(self.ctx, bbox, set(), set())
-        current = {p.model.key: p.json for p in pieces}
-        newest = max((p.timestamp for p in pieces if p.timestamp is not None), default=None)
-        body = (
-            b'{"timestamp":'
-            + (b"null" if newest is None else str(newest).encode())
-            + b',"vehicles":['
-            + b",".join(current.values())
-            + b"]}"
-        )
-        first = state.snapshot is None
-        state.snapshot = envelope(state.topic.name, "snapshot", body)
-        if first:
-            state.pieces = current
             return
-        upsert = [msgspec.Raw(j) for k, j in current.items() if state.pieces.get(k) != j]
-        remove = sorted(state.pieces.keys() - current.keys())
-        state.pieces = current
-        if not upsert and not remove:
-            return
-        update = envelope(
-            state.topic.name, "update", msgspec.json.encode({"timestamp": newest, "upsert": upsert, "remove": remove})
-        )
-        for conn in state.subscribers:
-            # a client that hasn't got the last update yet gets the whole tile instead: diffs never pile up
-            conn.push(state.topic.name, state.snapshot if conn.has_pending(state.topic.name) else update)
-
-    async def _compute_body(self, state: TopicState) -> None:
-        from gtfs_backend.api.services import departures, trips
-
-        if state.topic.kind == "stop":
-            model = await departures.board(self.ctx, state.topic.key, None, set(), set(), BOARD_LIMIT)
-        else:
-            model = await trips.live_by_key(self.ctx, state.topic.key)
-        body = model.model_dump_json().encode()
         if body == state.data:
             return
         first = state.data is None
         state.data = body
-        state.snapshot = envelope(state.topic.name, "snapshot", body)
         if not first:
-            text = envelope(state.topic.name, "update", body)
+            text = envelope(topic.name, "update", body)
             for conn in state.subscribers:
-                conn.push(state.topic.name, text)
+                conn.push(topic.name, text)
+
+    async def _body(self, topic: Topic) -> bytes:
+        from gtfs_backend.api.services import departures, trips, vehicles
+
+        if topic.kind == "tile":
+            return await vehicles.in_bbox_json(self.ctx, tile_bbox(*topic.zxy), set(), set())
+        if topic.kind == "stop":
+            model = await departures.board(self.ctx, topic.key, None, set(), set(), BOARD_LIMIT)
+        else:
+            model = await trips.live_by_key(self.ctx, topic.key)
+        return model.model_dump_json().encode()
 
     # --------------------------------------------------------------------------------------- running
 
     def start(self) -> None:
-        self._task = asyncio.create_task(self._run(), context=contextvars.Context())
+        self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
         if self._task is not None:

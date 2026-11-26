@@ -40,7 +40,7 @@ def env(feeds: Path, offset: float | None = None, **extra) -> dict:
         REDIS_URL=REDIS_URL,
         FEEDS_CONFIG=str(feeds),
         ARCHIVE_DIR=str(ROOT / "bench" / "out" / "archive"),
-        SNAPSHOT_DIR=str(ROOT / "bench" / "out" / "snapshot"),
+        SNAPSHOT_DIR=str(ROOT / "bench" / "out" / "snapshot"),  # only checkouts of PR #3's phases 2-4 (--code) use it
         OSM_REFRESH_INTERVAL="0",  # the OSM poles file that is there; never a download
         OSM_STOPS_FILE=str(ROOT / "data" / "osm" / "stops.json"),
         LOG_LEVEL="WARNING",
@@ -162,7 +162,7 @@ def cmd_run(args) -> None:
     out: Path = args.out
     out.mkdir(parents=True, exist_ok=True)
     feeds = replay_feeds(args.recording, out, args.code)
-    shutil.rmtree(ROOT / "bench" / "out" / "snapshot", ignore_errors=True)  # built by this run's worker, if at all
+    shutil.rmtree(ROOT / "bench" / "out" / "snapshot", ignore_errors=True)  # an older checkout's timetable snapshot
     subprocess.run(
         ["uv", "run", "python", "-c", f"import redis; redis.Redis.from_url({REDIS_URL!r}).flushdb()"], cwd=ROOT, check=True
     )

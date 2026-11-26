@@ -8,9 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import date, timedelta
-from pathlib import Path
 
-import numpy as np
 import psycopg
 import pytest
 import redis
@@ -23,6 +21,7 @@ from gtfs_backend.api.app import create_app
 from gtfs_backend.api.settings import ApiSettings
 from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedConfig, FeedsFile
+from gtfs_backend.live_layout import StopState, TripState
 from gtfs_backend.worker.feed_sync import sync_feeds
 from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, process_message
 from gtfs_backend.worker.realtime.store import RealtimeStore
@@ -46,14 +45,13 @@ NOW = message("TripUpdates", "T").header.timestamp
 # The snapshot's bus files were saved ~220 s before the tram files (NOW): the API, which ignores realtime measured
 # longer ago than a feed's max age, gets one that covers that (test_stale_realtime_is_not_shown checks the default).
 FIXTURE_MAX_AGE = 600
-NO_SNAPSHOT = Path("/nonexistent/gtfs-test-snapshot")  # boards read Postgres unless a test builds one
 
 
 async def _load_realtime(database_url: str) -> None:
     pool = async_pool(database_url)
     await pool.open()
     r = Redis.from_url(TEST_REDIS_URL)
-    store = RealtimeStore(r, list(SUFFIX), TTLS)
+    store = RealtimeStore(r, TTLS)
     try:
         for f in FEEDS.feeds:
             index = await load_index(pool, f.feed_id, NOW, f.day_start)
@@ -98,9 +96,7 @@ def loaded(database_url):
 
 @pytest.fixture
 async def api(loaded):
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
-    )
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         c.ctx = app.state.ctx  # for tests that change Redis: the app's live state reloads it (reload_live)
@@ -291,9 +287,7 @@ async def test_stops_without_trips_are_never_returned(api_ctx, sql, loaded):
 
 async def test_stop_search_covers_only_search_namespaces(loaded, sql):
     """Search is limited to feeds.yml `search_namespaces` (ZTP); the map and the stop itself are not."""
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
-    )
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     feeds = FEEDS.model_copy(update={"search_namespaces": ["km_kolej"]})  # no stops loaded there; skips validation
     app = create_app(settings, feeds=feeds, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
@@ -440,9 +434,7 @@ async def test_departure_board_stop_and_other_days(api, sql):
 async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
     """Responses carry the time of their data, not of the request: a later poll of unchanged data is a 304."""
     clock = [NOW]
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
-    )
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: clock[0])
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         vehicles = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()
@@ -490,11 +482,12 @@ async def test_departure_board_widens_for_early_trips(api_ctx, sql, monkeypatch,
         return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
 
     if arrival_only:  # its delay is against the scheduled arrival
-        entry = [1, pid, predicted, None, predicted - scheduled_arrival, False, early.scheduled_departure, False]
+        entry = StopState(1, pid, predicted, None, predicted - scheduled_arrival, False, early.scheduled_departure, False, None)
     else:
-        entry = [1, pid, None, predicted, predicted - early.scheduled_departure, False, early.scheduled_departure, False]
+        delay = predicted - early.scheduled_departure
+        entry = StopState(1, pid, None, predicted, delay, False, early.scheduled_departure, False, None)
     live = ctx.live
-    monkeypatch.setattr(live, "trips", {early.trip_key: [1, False, None, NOW, False, None, [entry]]})
+    monkeypatch.setattr(live, "trips", {early.trip_key: TripState(1, False, False, None, NOW, None, [entry])})
     monkeypatch.setattr(live, "_at_stop", {pid: {(early.trip_key, 0)}})
     monkeypatch.setattr(departures, "scheduled", scheduled)
     monkeypatch.setattr(departures, "expected_span", lambda *_: departures.WINDOWS_S[0])  # whatever the stop's profile
@@ -589,8 +582,9 @@ async def test_trip_without_realtime_or_shape(api, sql, loaded):
         "AND sd.service_id = t.service_id AND sd.date = '2026-10-25' WHERE t.feed_version_id = 'kmk_t_v1' ORDER BY 1"
     )
     r = redis.Redis.from_url(TEST_REDIS_URL)
-    trip_id = next(t for (t,) in candidates if not r.exists(f"rt:trip:kmk_t:20261025:{t}"))
+    with_realtime = json.loads(r.get("rt:trips:kmk_t"))
     r.close()
+    trip_id = next(t for (t,) in candidates if f"kmk_t:20261025:{t}" not in with_realtime)
     key = f"kmk_t:20261025:{trip_id}"
     live = (await api.get(f"/trips/{key}/live")).json()
     assert live["status"] == "scheduled" and live["vehicle"] is None
@@ -880,9 +874,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
 @pytest.fixture
 async def api_no_raise(loaded):
     """Like `api`, but app exceptions become responses (as in production) instead of reaching the test."""
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
-    )
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     transport = ASGITransport(app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app), AsyncClient(transport=transport, base_url="http://test/api/v1") as c:
@@ -908,57 +900,16 @@ async def test_unexpected_errors_keep_the_error_body(api_no_raise, monkeypatch):
     assert r.json()["error"]["code"] == "unavailable" and "10.0.0.5" not in r.text
 
 
-# ------------------------------------------------------------------------------------------------- catalog, timing
+# ------------------------------------------------------------------------------------------------- catalog
 
 
 @pytest.fixture
 async def api_ctx(loaded):
     """Like `api`, with the app's context."""
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
-    )
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c, app.state.ctx
-
-
-def server_timing(response) -> dict[str, dict[str, str]]:
-    """`db;dur=1.2;desc="3 queries", total;dur=4.0` -> {"db": {"dur": "1.2", "desc": "3 queries"}, "total": {...}}"""
-    out = {}
-    for metric in response.headers["server-timing"].split(", "):
-        name, *params = metric.split(";")
-        out[name] = {k: v.strip('"') for k, v in (p.split("=", 1) for p in params)}
-    return out
-
-
-async def test_server_timing(api_ctx, sql):
-    api, _ = api_ctx
-    r = await api.get(f"/stops/{group_id(sql, '802')}/departures")
-    timing = server_timing(r)
-    assert set(timing) == {"db", "db-wait", "redis", "serialize", "total"}
-    # the timetable from Postgres (no snapshot here), realtime from memory: no Redis call
-    assert int(timing["db"]["desc"].split()[0]) > 0 and timing["redis"]["desc"] == "0 calls"
-    assert all(float(m["dur"]) >= 0 for m in timing.values())
-    assert float(timing["total"]["dur"]) >= float(timing["serialize"]["dur"])
-    # an answer without the database: none counted, and nothing left over from the request before
-    timing = server_timing(await api.get(f"/vehicles?bbox={CITY_BBOX}"))
-    assert timing["db"]["desc"] == "0 queries" and float(timing["serialize"]["dur"]) > 0
-    # what still asks Redis: health
-    assert server_timing(await api.get("/health"))["redis"]["desc"] != "0 calls"
-
-
-async def test_server_timing_off(loaded):
-    settings = ApiSettings(
-        _env_file=None,
-        database_url=loaded,
-        redis_url=TEST_REDIS_URL,
-        realtime_max_age=FIXTURE_MAX_AGE,
-        snapshot_dir=NO_SNAPSHOT,
-        server_timing=False,
-    )
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        assert "server-timing" not in (await c.get(f"/vehicles?bbox={CITY_BBOX}")).headers
 
 
 async def test_catalog_refreshes_in_the_background(api_ctx, sql, monkeypatch):
@@ -1068,7 +1019,6 @@ async def test_metrics_count_requests_by_route_template_across_app_instances(loa
             database_url=loaded,
             redis_url=TEST_REDIS_URL,
             realtime_max_age=FIXTURE_MAX_AGE,
-            snapshot_dir=NO_SNAPSHOT,
         )
         app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
         async with (
@@ -1101,9 +1051,7 @@ async def test_metrics_count_requests_by_route_template_across_app_instances(loa
 async def test_stale_realtime_is_not_shown(loaded, sql):
     """With the worker stopped (nothing newer in Redis), trip updates and vehicles measured longer ago than the feed's
     max age disappear from the map, boards and trips: the timetable stays."""
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, snapshot_dir=NO_SNAPSHOT
-    )  # max age 120 s
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)  # max age 120 s
     for at, fresh in ((NOW + 60, True), (NOW + 121 + 30, False)):
         app = create_app(settings, feeds=FEEDS, clock=lambda at=at: at)
         async with (
@@ -1130,13 +1078,12 @@ async def test_deleted_trips_leave_the_board_canceled_ones_stay(api, sql):
     live = [d for d in deps if d["status"] == "live" and feed_of(d) == "kmk_t"][:2]
     assert len(live) == 2
     r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
-    saved = {d["trip_key"]: await r.get(f"rt:trip:{d['trip_key']}") for d in live}
+    saved = await r.get("rt:trips:kmk_t")
     try:
+        trips = json.loads(saved)
         for d, relationship in zip(live, ("DELETED", "CANCELED"), strict=True):
-            await r.set(
-                f"rt:trip:{d['trip_key']}",
-                json.dumps({**json.loads(saved[d["trip_key"]]), "schedule_relationship": relationship}),
-            )
+            trips[d["trip_key"]]["schedule_relationship"] = relationship
+        await r.set("rt:trips:kmk_t", json.dumps(trips))
         await reload_live(api)
         deleted, canceled = live
         after = {d["trip_key"]: d for d in (await api.get(url)).json()["departures"]}
@@ -1144,154 +1091,9 @@ async def test_deleted_trips_leave_the_board_canceled_ones_stay(api, sql):
         assert after[canceled["trip_key"]]["status"] == "canceled"
         assert (await api.get(f"/trips/{deleted['trip_key']}/live")).json()["status"] == "canceled"
     finally:
-        for trip_key, value in saved.items():
-            await r.set(f"rt:trip:{trip_key}", value)
+        await r.set("rt:trips:kmk_t", saved)
         await reload_live(api)
         await r.aclose()
-
-
-# ------------------------------------------------------------------------------------------------- snapshot
-
-
-@pytest.fixture(scope="module")
-def snapshot_dir(loaded, tmp_path_factory):
-    """The worker's timetable snapshot of the test data, built as of NOW."""
-    from gtfs_backend.worker.static.snapshot import build, write
-
-    root = tmp_path_factory.mktemp("snapshot")
-    with psycopg.connect(loaded) as conn:
-        write(root, build(conn, FEEDS, NOW))
-    return root
-
-
-@pytest.fixture
-async def api_snapshot(loaded, snapshot_dir):
-    """`api` with the snapshot: boards and trips read it instead of Postgres."""
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=snapshot_dir
-    )
-    app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
-    async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
-        assert app.state.ctx.catalog.timetable is not None
-        yield c, app.state.ctx
-
-
-async def test_snapshot_departures_are_the_databases(api_snapshot, sql):
-    """For every served stop and a few windows (across midnight too): the same rows as core.stop_departure."""
-    from gtfs_backend.api.services import departures
-
-    _, ctx = api_snapshot
-    stops = [pid for (pid,) in sql("SELECT id FROM core.stop WHERE active AND cardinality(modes) > 0 ORDER BY id")]
-    assert len(stops) > 100
-    windows = [(NOW, NOW + 1800), (NOW - 3600, NOW + 7200), (NOW + 6 * 3600, NOW + 30 * 3600)]
-    compared = 0
-    for start, end in windows:
-        days = await ctx.catalog.days_between(start - departures.LOOKBACK_S, end)
-        assert ctx.catalog.timetable.days_for(days) is not None  # all in the snapshot: no fallback
-        for i in range(0, len(stops), 25):
-            pids = stops[i : i + 25]
-            mine = await departures.timetable(ctx, days, pids, start, end)
-            async with ctx.pool.connection() as conn:
-                theirs = await departures.scheduled(conn, days, pids, start, end)
-            assert sorted(mine, key=repr) == sorted(theirs, key=repr)
-            compared += len(theirs)
-    assert compared > 1000
-
-
-async def test_boards_and_trips_from_the_snapshot_are_the_same(api, api_snapshot, sql):
-    with_snapshot, ctx = api_snapshot
-    groups = [gid for (gid,) in sql("SELECT id FROM core.stop_group WHERE active ORDER BY id LIMIT 40")]
-    trips = set()
-    for gid in groups:
-        for query in ("?limit=30", f"?limit=20&time={NOW - 1800}", f"?limit=10&time={NOW + 20 * 3600}"):
-            a, b = await api.get(f"/stops/{gid}/departures{query}"), await with_snapshot.get(f"/stops/{gid}/departures{query}")
-            assert (a.status_code, a.content) == (b.status_code, b.content), (gid, query)
-            trips |= {d["trip_key"] for d in a.json().get("departures", [])[:3]}
-    assert len(trips) > 20
-    for key in sorted(trips):
-        for path in (f"/trips/{key}", f"/trips/{key}/live"):
-            a, b = await api.get(path), await with_snapshot.get(path)
-            assert (a.status_code, a.content) == (b.status_code, b.content), path
-    # a trip on a day it doesn't run: 404 from the snapshot too
-    some = sorted(trips)[0]
-    feed, _, trip_id = some.split(":", 2)
-    assert (await with_snapshot.get(f"/trips/{feed}:20261024:{trip_id}")).status_code == (
-        await api.get(f"/trips/{feed}:20261024:{trip_id}")
-    ).status_code
-
-
-async def test_boards_use_the_snapshot_without_postgres(api_snapshot, sql, monkeypatch):
-    c, ctx = api_snapshot
-    queries = []
-    real = ctx.pool.getconn
-
-    async def getconn(timeout=None):
-        queries.append(1)
-        return await real(timeout)
-
-    monkeypatch.setattr(ctx.pool, "getconn", getconn)
-    board = await c.get(f"/stops/{group_id(sql, '802')}/departures")
-    assert board.status_code == 200 and board.json()["departures"]
-    key = board.json()["departures"][0]["trip_key"]
-    assert (await c.get(f"/trips/{key}")).status_code == 200
-    assert (await c.get(f"/trips/{key}/live")).status_code == 200
-    assert queries == []  # the timetable from the snapshot, realtime from Redis
-
-
-async def test_a_new_snapshot_generation_is_picked_up_and_old_ones_go(loaded, tmp_path):
-    from gtfs_backend.snapshot import CURRENT, load_current
-    from gtfs_backend.worker.static.snapshot import KEEP_GENERATIONS, build, write
-
-    with psycopg.connect(loaded) as conn:
-        built = build(conn, FEEDS, NOW)
-    folders = [write(tmp_path, built) for _ in range(KEEP_GENERATIONS + 2)]
-    assert (tmp_path / CURRENT).resolve() == folders[-1]
-    assert sorted(p for p in tmp_path.iterdir() if p.is_dir() and not p.is_symlink()) == folders[-KEEP_GENERATIONS:]
-    snap = load_current(tmp_path)
-    assert snap.generation == folders[-1].name and snap.manifest["counts"]["departures"] > 0
-    assert {d.feed_id for d in snap.days} == {"kmk_a", "kmk_m", "kmk_t"}
-
-
-# the stop search's SQL before it moved into memory: what api/data/search.py must rank the same way
-SEARCH_SQL = """
-    WITH u AS (SELECT core.immutable_unaccent(lower(%(q)s)) AS q),
-    x AS (SELECT q, replace(replace(replace(q, '\\', '\\\\'), '%%', '\\%%'), '_', '\\_') AS esc FROM u)
-    SELECT g.id, g.name_search LIKE x.esc || '%%', g.name_search LIKE '%%' || x.esc || '%%',
-           word_similarity(x.q, g.name_search), similarity(x.q, g.name_search), g.name
-    FROM core.stop_group g, x
-    WHERE g.active AND g.code_namespace = ANY(%(ns)s)
-      AND EXISTS (SELECT 1 FROM core.stop p WHERE p.stop_group_id = g.id AND p.active AND cardinality(p.modes) > 0)
-      AND (x.q <%% g.name_search OR g.name_search LIKE '%%' || x.esc || '%%')
-    ORDER BY 2 DESC, 3 DESC, 4 DESC, 5 DESC, g.name
-    LIMIT %(limit)s
-"""
-
-
-async def test_stop_search_in_memory_ranks_as_the_sql_did(api_ctx, sql):
-    """For many queries (prefixes, words, typos, swapped words): the same groups in the same order, up to ties (same
-    scores and name), where Postgres' order is arbitrary."""
-    import random
-
-    from gtfs_backend.trigram import unaccent_lower
-
-    _, ctx = api_ctx
-    names = sorted({n for (n,) in sql("SELECT name FROM core.stop_group WHERE active")})
-    rng = random.Random(3)
-    queries = ["rondo", "dw", "a", "plac", "nowy", "kurdwanow", "rondo mog", "mogilsk", "teatr bagatela", "x", "12", "zz top"]
-    for name in rng.sample(names, 60):
-        n = unaccent_lower(name)
-        queries += [n[: rng.randint(1, len(n))], n.split()[-1], n[:-1] + "x", " ".join(reversed(n.split())), name.upper()]
-    assert len(ctx.catalog.search) > 50
-    with psycopg.connect(ctx.settings.database_url) as conn:
-        for q in queries:
-            params = {"q": q.strip(), "ns": ctx.feeds.searchable_namespaces, "limit": 500}
-            rows = conn.execute(SEARCH_SQL, params).fetchall()
-            mine = ctx.catalog.search.search(q, 500)
-            assert set(mine) == {r[0] for r in rows}, q
-            # the same ranking key at every position: ids may differ only within a tie
-            key = {r[0]: (r[1], r[2], np.float32(r[3]), np.float32(r[4]), r[5]) for r in rows}
-            assert [key[g] for g in mine] == [key[r[0]] for r in rows], q
-            assert ctx.catalog.search.search(q, 3) == mine[:3]
 
 
 async def test_vehicles_joined_from_pieces_are_the_models_json(api_ctx, monkeypatch):
@@ -1327,9 +1129,7 @@ async def served(loaded):
     """The app on a real port (uvicorn), for WebSocket clients: (ws url, http base url, app)."""
     import uvicorn
 
-    settings = ApiSettings(
-        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, snapshot_dir=NO_SNAPSHOT
-    )
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on"))
     task = asyncio.create_task(server.serve())
@@ -1378,10 +1178,9 @@ async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served
         # the worker reports the tram a few metres on: the tile gets it as an update
         r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
         feed = feed_of(v)
-        members = await r.zrange(f"rt:veh:geo:{feed}", 0, -1)
-        originals = [json.loads(x) for x in await r.mget([f"rt:veh:{m}" for m in members])]
+        originals = list(json.loads(await r.get(f"rt:vehicles:{feed}")).values())
         moved = [dict(o, lat=o["lat"] + 0.00005) if f"{feed}:{o['vehicle_id']}" == v["key"] else o for o in originals]
-        store = RealtimeStore(r, [feed], TTLS)
+        store = RealtimeStore(r, TTLS)
         try:
             from gtfs_backend.worker.realtime.normalize import Result
 
@@ -1393,9 +1192,9 @@ async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served
                 (update,) = await receive(ws, 1)
                 if update["topic"] == topics[0]:
                     break
-            assert update["type"] == "update" and update["data"]["remove"] == []
-            assert [u["key"] for u in update["data"]["upsert"]] == [v["key"]]
-            assert update["data"]["upsert"][0]["lat"] == round(v["lat"] + 0.00005, 5)
+            # the whole tile again, as GET /vehicles would give it now
+            assert update["type"] == "update" and len(update["data"]["vehicles"]) == len(tile_rest["vehicles"])
+            assert {u["key"]: u for u in update["data"]["vehicles"]}[v["key"]]["lat"] == round(v["lat"] + 0.00005, 5)
         finally:
             await store.write_vehicles(feed, Result(vehicles=originals))
             await store.publish(
@@ -1424,9 +1223,13 @@ async def test_extra_trips_come_from_realtime_onto_boards_and_trip_views(api_ctx
     pole, other = ident(tram["stop"]), stop_by_code(sql, "125-01")
     key = "kmk_t:20261025:extra_1"
     at = NOW + 600
-    entries = [[1, pole, at, at, None, False, at, False, at], [2, other, at + 300, None, None, False, None, False, at + 300]]
+    stops = [
+        StopState(1, pole, at, at, None, False, at, False, at),
+        StopState(2, other, at + 300, None, None, False, None, False, at + 300),
+    ]
+    extra = TripState(1, False, False, None, NOW, None, stops, (route_id, "Extra"))
     live = ctx.live
-    monkeypatch.setattr(live, "trips", {**live.trips, key: [1, False, None, NOW, False, None, entries, [route_id, "Extra"]]})
+    monkeypatch.setattr(live, "trips", {**live.trips, key: extra})
     at_stop = {k: set(v) for k, v in live._at_stop.items()}
     at_stop.setdefault(pole, set()).add((key, 0))
     at_stop.setdefault(other, set()).add((key, 1))

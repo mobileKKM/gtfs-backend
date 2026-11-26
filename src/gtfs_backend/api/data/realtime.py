@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+import orjson
 from redis.asyncio import Redis
 
 from gtfs_backend import live_layout
@@ -13,12 +13,36 @@ from gtfs_backend import live_layout
 async def get_json_many(redis: Redis, keys: list[str]) -> list[dict | list | None]:
     if not keys:
         return []
-    return [json.loads(v) if v else None for v in await redis.mget(keys)]
+    return [orjson.loads(v) if v else None for v in await redis.mget(keys)]
 
 
 async def vehicle_json(redis: Redis, ids: list[str]) -> list[dict]:
     """Vehicles by vehicle key, skipping ones that have expired."""
     return [v for v in await get_json_many(redis, [live_layout.vehicle(i) for i in ids]) if v]
+
+
+async def vehicle_values(redis: Redis, ids: list[str]) -> list[str]:
+    """The rt:veh JSON values (not decoded) of these vehicle keys, skipping ones that have expired."""
+    if not ids:
+        return []
+    return [v for v in await redis.mget([live_layout.vehicle(i) for i in ids]) if v]
+
+
+# alerts files change rarely, but every board and trip reads them: decoded once per value (the last few are kept)
+_ALERT_VALUES: dict[str, list[dict]] = {}
+_ALERT_VALUES_KEPT = 64
+
+
+def _alerts_of(value: str | None) -> list[dict]:
+    """An rt:alerts value, decoded (shared: callers don't change it)."""
+    if not value:
+        return []
+    parsed = _ALERT_VALUES.get(value)
+    if parsed is None:
+        if len(_ALERT_VALUES) >= _ALERT_VALUES_KEPT:
+            _ALERT_VALUES.clear()
+        parsed = _ALERT_VALUES[value] = orjson.loads(value)
+    return parsed
 
 
 async def vehicles_near(redis: Redis, lat: float, lon: float, width_km: float, height_km: float) -> list[str]:
@@ -29,13 +53,15 @@ async def vehicles_near(redis: Redis, lat: float, lon: float, width_km: float, h
 
 
 async def alerts_json(redis: Redis, feed_ids: list[str]) -> list[dict]:
-    return [a for feed in await get_json_many(redis, [live_layout.alerts(f) for f in feed_ids]) if feed for a in feed]
+    if not feed_ids:
+        return []
+    return [a for value in await redis.mget([live_layout.alerts(f) for f in feed_ids]) for a in _alerts_of(value)]
 
 
 async def trip_and_alerts(redis: Redis, trip_key: str, feed_ids: list[str]) -> tuple[dict | None, list[dict]]:
     """A trip's raw update (None without one) and all alerts of these feeds, in one call."""
-    values = await get_json_many(redis, [live_layout.trip(trip_key)] + [live_layout.alerts(f) for f in feed_ids])
-    return values[0], [a for feed in values[1:] if feed for a in feed]
+    values = await redis.mget([live_layout.trip(trip_key)] + [live_layout.alerts(f) for f in feed_ids])
+    return (orjson.loads(values[0]) if values[0] else None), [a for value in values[1:] for a in _alerts_of(value)]
 
 
 async def meta_json(redis: Redis, keys: list[tuple[str, str]]) -> dict[tuple[str, str], dict | None]:
@@ -159,7 +185,7 @@ class BoardRealtime:
             return self._decoded[trip_key]
         feed_id = trip_key.split(":", 1)[0]
         value = self._states.get(feed_id, {}).get(trip_key)
-        state = TripState(*json.loads(value)) if value else None
+        state = TripState(*orjson.loads(value)) if value else None
         if (
             state is not None
             and state.timestamp is not None
@@ -168,7 +194,7 @@ class BoardRealtime:
             state = None  # measured too long ago: the worker or the feed stopped
         if state is not None:
             for sequence, prediction in self._predictions.get(trip_key, []):
-                values = json.loads(prediction)  # live_layout.StopPrediction (6 elements from older workers)
+                values = orjson.loads(prediction)  # live_layout.StopPrediction (6 elements from older workers)
                 arrival, departure, delay, skipped, version = values[:5]
                 if version == state.version:  # else of another update than the state, with other stop sequences
                     propagated = len(values) > 6 and bool(values[6])
@@ -187,7 +213,7 @@ class BoardRealtime:
             self._timed = []
             for key, rows in self._predictions.items():
                 for _, value in rows:
-                    arrival, departure, _, _, version, scheduled = json.loads(value)[:6]
+                    arrival, departure, _, _, version, scheduled = orjson.loads(value)[:6]
                     # no scheduled departure: not a departure (a trip's last stop), never on a board
                     if (predicted := departure or arrival) is not None and scheduled is not None:
                         self._timed.append((scheduled, predicted, key, version))

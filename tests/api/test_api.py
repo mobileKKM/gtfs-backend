@@ -1288,3 +1288,28 @@ async def test_search_finds_stops_and_routes(api, sql):
     assert (await api.get(f"/search?q={q}")).json()["stops"] == (await api.get(f"/stops/search?q={q}")).json()["results"]
     assert (await api.get("/search?q=zzzzqqq")).json() == {"query": "zzzzqqq", "stops": [], "routes": []}
     assert (await api.get("/search?q=")).status_code == 422
+
+
+async def test_vehicles_joined_from_pieces_are_the_models_json(api_ctx, monkeypatch):
+    from gtfs_backend.api.data.geo import Bbox
+    from gtfs_backend.api.services import vehicles
+
+    c, ctx = api_ctx
+    for modes, routes in ((set(), set()), ({"tram"}, set()), (set(), {"52", "4"}), ({"bus"}, {"52"})):
+        bbox = Bbox.parse(CITY_BBOX)
+        joined = await vehicles.in_bbox_json(ctx, bbox, modes, routes)
+        assert joined == (await vehicles.in_bbox(ctx, bbox, modes, routes)).model_dump_json().encode()
+    assert (await c.get(f"/vehicles?bbox={CITY_BBOX}")).content == await vehicles.in_bbox_json(
+        ctx, Bbox.parse(CITY_BBOX), set(), set()
+    )
+    # the next request builds nothing: every vehicle's JSON is kept for its Redis value
+    built = []
+    real = vehicles.models
+
+    async def counting(ctx_, raws):
+        built.append(len(raws))
+        return await real(ctx_, raws)
+
+    monkeypatch.setattr(vehicles, "models", counting)
+    await c.get(f"/vehicles?bbox={CITY_BBOX}")
+    assert built == []

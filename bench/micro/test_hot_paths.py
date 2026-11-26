@@ -206,3 +206,32 @@ def test_board_overlay_and_select(benchmark, rng):
         return departures.select(out, NOW, 20, NOW - 30, NOW + 3600, True)
 
     assert len(benchmark(page)) == 20
+
+
+def test_vehicles_city_wide_response_from_pieces(benchmark, vehicle_raws):
+    """GET /vehicles since phase 3: each vehicle's JSON is built once per Redis value (VehiclePieces), so a request
+    filters and joins kept pieces, then hashes and gzips as before."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from gtfs_backend.api.services.vehicles import VehiclePieces
+
+    refs = {
+        (keys.version_id(f, 3), f"r{i}"): RouteRef(key=f"{f}:r{i}", name=str(i), mode="bus") for f in FEEDS for i in range(150)
+    }
+
+    async def route_refs(wanted):
+        return {k: refs[k] for k in wanted if k in refs}
+
+    ctx = SimpleNamespace(catalog=SimpleNamespace(route_refs=route_refs))
+    pieces = VehiclePieces()
+    asyncio.run(pieces.get(ctx, vehicle_raws))  # the first request after a poll builds them
+
+    def respond():
+        kept = asyncio.run(pieces.get(ctx, vehicle_raws))
+        shown = [p for p in kept if 19.0 <= p.lon <= 21.0]
+        body = b'{"timestamp":1,"vehicles":[' + b",".join(p.json for p in shown) + b"]}"
+        _etag(body)
+        return gzip.compress(body, 6)
+
+    assert benchmark(respond)

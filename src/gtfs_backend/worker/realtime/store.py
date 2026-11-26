@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
+import orjson
 from redis.asyncio import Redis
 
 from gtfs_backend import keys, live_layout
@@ -25,7 +25,8 @@ class TTLs:
 
 
 def _dumps(value) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    """Compact JSON, UTF-8 as is (json.dumps(value, ensure_ascii=False, separators=(",", ":")), a few times faster)."""
+    return orjson.dumps(value).decode()
 
 
 def _int_json(value: int | None) -> str:
@@ -122,7 +123,7 @@ class RealtimeStore:
         wanted = sorted(stored & current)
         values = await self.redis.mget([live_layout.trip(k) for k in wanted]) if wanted else []
         self._trip_keys[feed_id] = stored
-        self._trips[feed_id] = {k: json.loads(v) for k, v in zip(wanted, values, strict=True) if v}
+        self._trips[feed_id] = {k: orjson.loads(v) for k, v in zip(wanted, values, strict=True) if v}
 
     async def write_trips(self, feed_id: str, res: Result) -> None:
         current = {trip["key"] for trip in res.trips}

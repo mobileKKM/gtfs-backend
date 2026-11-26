@@ -34,6 +34,8 @@ def main() -> None:
         port=args.port,
         workers=args.workers,
         access_log=False,
+        loop="uvloop",  # what uvicorn's "auto" picks when installed (uvicorn[standard]): said, so it can't fall back unseen
+        http="httptools",
         proxy_headers=False,  # client addresses are never used, so don't resolve them from X-Forwarded-For
         server_header=False,
         log_level=settings.log_level.lower(),

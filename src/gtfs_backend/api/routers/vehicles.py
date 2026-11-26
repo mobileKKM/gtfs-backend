@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from gtfs_backend.api.cache import LIVE, json_response
+from gtfs_backend.api.cache import LIVE, json_bytes_response, json_response
 from gtfs_backend.api.deps import BboxQuery, Ctx, ModesQuery, RoutesQuery
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.api.schemas import TripLive, VehicleList
@@ -15,8 +15,7 @@ router = APIRouter(prefix=PREFIX, tags=["vehicles"])
 async def list_vehicles(request: Request, ctx: Ctx, bbox: BboxQuery, modes: ModesQuery, routes: RoutesQuery):
     """Live vehicles inside a bounding box (at most 50 km across), for the map.
     Only vehicles matched to a timetabled trip appear."""
-    body = await vehicles.in_bbox(ctx, bbox, modes, routes)
-    return json_response(request, body, LIVE)
+    return json_bytes_response(request, await vehicles.in_bbox_json(ctx, bbox, modes, routes), LIVE)
 
 
 @router.get("/vehicles/{vehicle_key:path}/trip", response_model=TripLive)

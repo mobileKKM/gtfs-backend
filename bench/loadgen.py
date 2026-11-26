@@ -39,7 +39,19 @@ import orjson
 
 CITY = (19.8, 49.97, 20.15, 50.13)  # minLon, minLat, maxLon, maxLat
 QUERIES = ["rondo", "dworzec", "plac", "nowy", "bronowice", "kurdwanow", "czerwone maki", "teatr", "wawel", "krowodrza"]
-NAMES = ["vehicles", "stops_map", "board", "trip", "trip_live", "vehicle_trip", "search", "ws_tile", "ws_stop", "ws_trip", "ws"]
+NAMES = [
+    "vehicles",
+    "stops_map",
+    "board",
+    "trip",
+    "trip_live",
+    "vehicle_trip",
+    "search",
+    "ws_vehicles",
+    "ws_stop",
+    "ws_trip",
+    "ws",
+]
 
 
 VIEW_OF = {"vehicles": "map", "board": "board", "trip_live": "trip", "vehicle_trip": "vehicle"}
@@ -162,7 +174,7 @@ class Client:
 
 
 class WsClient:
-    """The same views, pushed: one WebSocket, subscribed to the view's topics (a map box: the z14 tiles it covers)."""
+    """The same views, pushed: one WebSocket, subscribed to the view's topics (the map: every vehicle of the city)."""
 
     def __init__(self, base: str, data: dict, stats: Stats, rng: random.Random, poll_s: float):
         self.ws_url = base.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
@@ -176,9 +188,7 @@ class WsClient:
     def topics(self) -> tuple[str, list[str]]:
         r, d = self.rng.random(), self.data
         if r < 0.5:
-            lon0, lat0, lon1, lat1 = (float(v) for v in box(self.rng).split(","))
-            (x0, y0), (x1, y1) = tile_of(lat1, lon0, 14), tile_of(lat0, lon1, 14)
-            return "map", [f"tile:14/{x}/{y}" for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+            return "map", ["vehicles"]
         if r < 0.8:
             return "board", [f"stop:{self.rng.choice(d['stops'])}"]
         return "trip", [f"trip:{self.rng.choice(d['trips'])}"]  # a trip, or a followed vehicle's trip
@@ -219,13 +229,6 @@ class WsClient:
             if ts is not None:
                 self._held_by_topic[topic] = max(ts, self._held_by_topic.get(topic, 0))
             self.held = max(self._held_by_topic.values()) if self._held_by_topic else None
-
-
-def tile_of(lat: float, lon: float, z: int) -> tuple[int, int]:
-    n = 2**z
-    x = int((lon + 180) / 360 * n)
-    y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
-    return x, y
 
 
 async def sample_ages(stats: Stats, clients: list, until: float, offset: float) -> None:

@@ -1153,29 +1153,28 @@ async def receive(ws, n, seconds=5.0):
 async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served, sql):
     from websockets.asyncio.client import connect
 
-    from gtfs_backend.api.ws import tile_bbox, tile_of
-
     ws_url, http, _ = served
     async with AsyncClient(base_url=http) as c:
-        v = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"][0]
-        z = 14
-        x, y = tile_of(v["lat"], v["lon"], z)
-        box = tile_bbox(z, x, y)
-        tile_rest = (await c.get(f"/vehicles?bbox={box.min_lon},{box.min_lat},{box.max_lon},{box.max_lat}")).json()
+        city_rest = (await c.get(f"/vehicles?bbox={CITY_BBOX}")).json()
+        v = next(x for x in city_rest["vehicles"] if x["route"]["mode"] == "tram")
         stop = group_id(sql, "802")
         board_rest = (await c.get(f"/stops/{stop}/departures")).json()
         trip_rest = (await c.get(f"/trips/{v['trip_key']}/live")).json()
 
-    topics = [f"tile:{z}/{x}/{y}", f"stop:{stop}", f"trip:{v['trip_key']}"]
+    topics = ["vehicles", f"stop:{stop}", f"trip:{v['trip_key']}"]
     async with connect(ws_url) as ws:
-        await ws.send(json.dumps({"op": "subscribe", "topics": topics + ["tile:3/0/0", "stop:nope-zzzzz", "bad"]}))
+        await ws.send(json.dumps({"op": "subscribe", "topics": topics + ["tile:14/1/1", "stop:nope-zzzzz", "bad"]}))
         got = {m.get("topic"): m for m in await receive(ws, 6)}
-        assert got[topics[0]]["type"] == "snapshot" and got[topics[0]]["data"] == tile_rest
+        # every vehicle of the city, as GET /vehicles has them, without their own timestamps
+        snapshot = got["vehicles"]
+        assert snapshot["type"] == "snapshot" and snapshot["data"]["timestamp"] >= city_rest["timestamp"]
+        streamed = {x["key"]: x for x in snapshot["data"]["vehicles"]}
+        assert {x["key"]: {k: x[k] for k in x if k != "timestamp"} for x in city_rest["vehicles"]}.items() <= streamed.items()
         assert got[topics[1]]["data"] == board_rest and got[topics[2]]["data"] == trip_rest
-        assert got["tile:3/0/0"]["error"]["code"] == "invalid_input" and got["stop:nope-zzzzz"]["error"]["code"] == "not_found"
+        assert got["tile:14/1/1"]["error"]["code"] == "invalid_input" and got["stop:nope-zzzzz"]["error"]["code"] == "not_found"
         assert got["bad"]["type"] == "error"
 
-        # the worker reports the tram a few metres on: the tile gets it as an update
+        # the worker reports the tram a few metres on: an update with only it
         r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
         feed = feed_of(v)
         originals = list(json.loads(await r.get(f"rt:vehicles:{feed}")).values())
@@ -1190,11 +1189,10 @@ async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served
             )
             for _ in range(10):
                 (update,) = await receive(ws, 1)
-                if update["topic"] == topics[0]:
+                if update["topic"] == "vehicles":
                     break
-            # the whole tile again, as GET /vehicles would give it now
-            assert update["type"] == "update" and len(update["data"]["vehicles"]) == len(tile_rest["vehicles"])
-            assert {u["key"]: u for u in update["data"]["vehicles"]}[v["key"]]["lat"] == round(v["lat"] + 0.00005, 5)
+            assert update["type"] == "update" and update["data"]["remove"] == []
+            assert [(u["key"], u["lat"]) for u in update["data"]["upsert"]] == [(v["key"], round(v["lat"] + 0.00005, 5))]
         finally:
             await store.write_vehicles(feed, Result(vehicles=originals))
             await store.publish(

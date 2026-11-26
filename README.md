@@ -210,7 +210,7 @@ of the request, so their ETag only changes with the data.
 | `GET /routes/{route_key}/shapes[?date=YYYYMMDD]` | the route's shapes that day, most used first per direction |
 | `GET /alerts[?feed=…][&route=…][&stop=…][&active=true]`, `GET /alerts/{alert_key}` | alerts, severe first, with `entities` saying where each applies (boards and trips carry refs: no `url`, no `entities`) |
 | `GET /health` | DB/Redis reachability (503 if down), static versions, poll stats, `fresh` with each feed's `problems` |
-| `GET /ws` (WebSocket) | push instead of polling: `{"op": "subscribe" \| "unsubscribe", "topics": [...]}`; `tile:{z}/{x}/{y}` (z 10–16: vehicles), `stop:{key}` (the board), `trip:{key}` (its live state); always the whole REST body: a `snapshot` on subscribe, then an `update` whenever it changed |
+| `GET /ws` (WebSocket) | push instead of polling: `{"op": "subscribe" \| "unsubscribe", "topics": [...]}`; `vehicles` (every vehicle of the city: a `snapshot`, then `update`s with only those that changed: `upsert`, `remove`), `stop:{key}` (the board), `trip:{key}` (its live state; boards and trips: the REST body, again as an `update` whenever it changed) |
 | `GET /metrics[?window=300]` | p50/p90/p99 per endpoint (route template, all API processes) and each realtime file's data age (now minus its feed header timestamp), over the last `window` seconds (60–3600) |
 
 **Errors**: `{"error": {"code": "not_found" | "invalid_input" | "method_not_allowed" | …, "message": "…"}}`: 404
@@ -264,12 +264,18 @@ Notes:
   trip; its `stop_sequence` and `status` (where the feed reports them) say which stop it is at or heading to.
 - **Polling**: live responses are `no-cache`; clients refetch the open view about every 10 s with `If-None-Match`
   and stop in the background.
-- **Push** (`/ws`, `api/ws.py`): one WebSocket per client, JSON text messages (compressed with permessage-deflate). A
-  subscription gets a `snapshot`, the body the REST endpoint would return; then every change the process's live state
-  applies marks the topics it touches (a vehicle's old and new tile, its trip and the boards of its stops; a trip's
-  boards and itself; alerts every board and trip), and every 15 s all of them. A marked topic is computed again at
-  most every second (boards every 2 s) and sent whole as an `update` only if it changed. Each message is serialized
-  once and sent to every subscriber; a slow connection keeps only the latest one per topic. At most 50
+- **Push** (`/ws`, `api/ws.py`): one WebSocket per client, JSON text messages (compressed with permessage-deflate).
+  The map subscribes to `vehicles`, the whole city (~1,000 vehicles at the peak, ~20 kB compressed): a `snapshot`
+  `{"timestamp", "vehicles": [Vehicle]}`, then `update`s `{"timestamp", "upsert": [Vehicle], "remove": [key]}` with
+  only the vehicles that changed. A client applies them to what it has (a map by `key`) and shows what is in view
+  itself (MapLibre: a GeoJSON source), so moving the map needs no request. These vehicles have no `timestamp` of their
+  own, which is new at every poll: one standing at a stop sends nothing. Boards (`stop:{key}`) and trips
+  (`trip:{key}`) get the REST body as a `snapshot`, then whole again as an `update` whenever it changed. Every change
+  the process's live state applies marks the topics it touches (vehicles; a vehicle's trip and the boards of its
+  stops; a trip's boards and itself; alerts every board and trip), and every 15 s all of them are (vehicles no longer
+  shown are removed then). A marked topic is computed again at most every second (boards every 2 s). Each message is
+  serialized once and sent to every subscriber; a slow connection keeps only the latest one per topic (for
+  `vehicles`, a fresh snapshot instead of an update it couldn't apply). At most 50
   topics per connection; errors come as `{"type": "error", "topic", "error": {"code", "message"}}`. A reverse proxy
   needs to pass the upgrade (nginx: `proxy_http_version 1.1`, `Upgrade`/`Connection` headers, a `proxy_read_timeout`
   above the 20 s ping interval).

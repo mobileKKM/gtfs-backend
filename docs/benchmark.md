@@ -57,8 +57,8 @@ uv run python bench/load.py import bench/out/rec-peak     # the recording's time
 uv run python bench/load.py run bench/out/rec-peak --out bench/out/results/NAME   # 2,000 clients, 60 s ramp, 600 s
 ```
 
-`--mode ws` has the clients subscribe over the WebSocket instead of polling (the same views: a map box's z14 tiles,
-a board, a trip). Both modes sample, every second, how old the newest realtime data each client holds is
+`--mode ws` has the clients subscribe over the WebSocket instead of polling (the same views: the map's
+`vehicles`, a board, a trip). Both modes sample, every second, how old the newest realtime data each client holds is
 (`data_age_s`, in replayed time): what polling adds to freshness and push saves.
 
 `--code PATH` runs another checkout's worker and API with the same load (a git worktree of the commit before a
@@ -87,7 +87,9 @@ bucket's upper bound: up to 9 % (`bucket_error`) above the real one.
 These are the phases of PR #3 as measured. Afterwards (2026-11-26) the parts that cost more than they gave were taken
 out again, to keep the code small: the timetable snapshot (phase 2: boards and trips read their timetable from Postgres
 again, about 1 ms of the board's p50 at this load, and ~350 MB less API memory), the in-memory stop search (search is
-one Postgres query again), tile diffs on the WebSocket (tiles are sent whole, like boards), `Server-Timing` (`/metrics`
+one Postgres query again), the WebSocket's map tiles (the map subscribes to `vehicles`, the
+whole city, and gets only the vehicles that changed: an estimated ~1 kB/s per client compressed at the peak, not
+measured with the load yet), `Server-Timing` (`/metrics`
 remains), and the per-vehicle / per-trip Redis keys (one value per feed now; only an API process starting or catching
 up reads it). The live state in memory (phase 4a), where most of the gain came from, stays.
 

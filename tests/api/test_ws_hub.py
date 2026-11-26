@@ -1,11 +1,14 @@
-"""The WebSocket hub's bookkeeping (api/ws.py), without a server: which topics a change touches, slow clients."""
+"""The WebSocket hub's bookkeeping (api/ws.py), without a server: which topics a change touches, what the vehicles
+topic sends, slow clients."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from gtfs_backend.api.data.live import Changed
-from gtfs_backend.api.ws import Connection, Hub, TopicState, parse_topic, tile_bbox, tile_of
+from gtfs_backend.api.services import vehicles
+from gtfs_backend.api.ws import VEHICLES, Connection, Hub, TopicState, parse_topic
 
 KEY = "kmk_t:20261025:t1"
 
@@ -25,50 +28,86 @@ def make_hub():
     return Hub(ctx)
 
 
-def subscribe(hub, name):
+def subscribe(hub, name, conn=None):
     topic = parse_topic(hub.ctx, name)
-    hub.topics[topic.name] = TopicState(topic)
+    state = hub.topics.setdefault(topic.name, TopicState(topic))
     hub._index(topic, add=True)
-
-
-def test_tiles_number_as_slippy_maps():
-    x, y = tile_of(50.0614, 19.9366, 14)  # Kraków's main square
-    assert (x, y) == (9099, 5552)  # y = floor((1 - ln(tan(lat) + sec(lat)) / pi) / 2 * 2^14) = floor(5552.2)
-    box = tile_bbox(14, x, y)
-    assert box.min_lon <= 19.9366 <= box.max_lon and box.min_lat <= 50.0614 <= box.max_lat
+    if conn is not None:
+        state.subscribers.add(conn)
+        conn.topics.add(topic.name)
+    return state
 
 
 def test_changes_mark_the_topics_they_touch():
     hub = make_hub()
-    old, new = tile_of(50.06, 19.94, 15), tile_of(50.07, 19.94, 15)
-    watched = [f"tile:15/{old[0]}/{old[1]}", f"tile:15/{new[0]}/{new[1]}", f"trip:{KEY}", "stop:g1", "stop:p3"]
-    for name in [*watched, "tile:14/1/1"]:
+    watched = [VEHICLES, f"trip:{KEY}", "stop:g1", "stop:p3"]
+    for name in watched:
         subscribe(hub, name)
-    # a vehicle moved: its old and new tile, its trip, and that trip's boards (p1 is in group g1)
-    hub._mark(Changed(positions=[(50.06, 19.94), (50.07, 19.94)], trips={KEY}, stops={"p1", "p3"}))
+    # a vehicle moved: the vehicles, its trip, and that trip's boards (p1 is in group g1)
+    hub._mark(Changed(vehicles={"kmk_t:v1"}, trips={KEY}, stops={"p1", "p3"}))
     assert hub.dirty == set(watched)
     hub.dirty.clear()
     hub._mark(Changed(trips={"kmk_t:20261025:other"}, stops={"p9"}))
     assert hub.dirty == set()  # nobody watches those
     hub._mark(Changed(alerts=True))
-    assert hub.dirty == {f"trip:{KEY}", "stop:g1", "stop:p3"}  # every board and trip, no tile
+    assert hub.dirty == {f"trip:{KEY}", "stop:g1", "stop:p3"}  # every board and trip
     hub._mark(Changed(everything=True))
     assert hub.dirty == set(hub.topics)
+
+
+async def test_vehicles_send_a_snapshot_then_only_what_changed(monkeypatch):
+    city = {"a": b'{"key":"a","lat":1}', "b": b'{"key":"b","lat":2}'}
+
+    async def current(ctx):
+        return 1000, dict(city)
+
+    monkeypatch.setattr(vehicles, "city", current)
+    hub, conn = make_hub(), Connection(ws=None)
+    state = subscribe(hub, VEHICLES, conn)
+    await hub._compute(state)
+    assert json.loads(state.data) == {"timestamp": 1000, "vehicles": [{"key": "a", "lat": 1}, {"key": "b", "lat": 2}]}
+    assert conn._pending == {}  # the first state is what subscribing sends
+
+    city.update(a=b'{"key":"a","lat":1.5}', c=b'{"key":"c","lat":3}')
+    del city["b"]
+    await hub._compute(state)
+    sent = json.loads(conn._pending.pop(VEHICLES))
+    assert sent["type"] == "update"
+    assert sent["data"] == {"timestamp": 1000, "upsert": [{"key": "a", "lat": 1.5}, {"key": "c", "lat": 3}], "remove": ["b"]}
+
+    await hub._compute(state)  # nothing changed: nothing sent
+    assert conn._pending == {}
+
+
+async def test_a_client_behind_on_vehicles_gets_a_snapshot_instead_of_an_update(monkeypatch):
+    city = {"a": b'{"key":"a","lat":1}'}
+
+    async def current(ctx):
+        return 1000, dict(city)
+
+    monkeypatch.setattr(vehicles, "city", current)
+    hub, conn = make_hub(), Connection(ws=None)
+    state = subscribe(hub, VEHICLES, conn)
+    await hub._compute(state)
+    city["a"] = b'{"key":"a","lat":2}'
+    await hub._compute(state)  # an update, not sent yet
+    city["b"] = b'{"key":"b","lat":3}'
+    await hub._compute(state)  # applying only this one would miss the move of a
+    sent = json.loads(conn._pending[VEHICLES])
+    assert sent["type"] == "snapshot" and sent["data"]["vehicles"] == [{"key": "a", "lat": 2}, {"key": "b", "lat": 3}]
 
 
 def test_unsubscribing_cleans_the_indexes():
     hub = make_hub()
     conn = Connection(ws=None)
-    for name in ("stop:g1", "tile:14/9099/5552"):
-        subscribe(hub, name)
-        hub.topics[name].subscribers.add(conn)
-        conn.topics.add(name)
-    assert hub._stop_topics == {"p1": {"stop:g1"}, "p2": {"stop:g1"}} and hub._zooms == {14: 1}
+    for name in ("stop:g1", VEHICLES):
+        subscribe(hub, name, conn)
+    assert hub._stop_topics == {"p1": {"stop:g1"}, "p2": {"stop:g1"}}
     hub.drop(conn)
-    assert hub.topics == {} and hub._stop_topics == {} and hub._zooms == {} and conn.closed
+    assert hub.topics == {} and hub._stop_topics == {} and conn.closed
 
 
-@pytest.mark.parametrize("name", ["tile:9/1/1", "tile:14/99999/1", "tile:a/b/c", "stop:nope", "trip:bad", "x", "lines:1"])
+@pytest.mark.parametrize("name", ["tile:14/1/1", "vehicles:x", "stop:nope", "trip:bad", "x", "lines:1"])
 def test_bad_topics_are_refused(name):
     hub = make_hub()
     from gtfs_backend.api.ws import TopicError
@@ -80,6 +119,6 @@ def test_bad_topics_are_refused(name):
 def test_a_slow_client_gets_the_latest_message_per_topic():
     conn = Connection(ws=None)
     conn.push("stop:g1", "old board")
-    conn.push("tile:14/1/1", "update 1")
+    conn.push(VEHICLES, "update 1")
     conn.push("stop:g1", "new board")
-    assert conn._pending == {"stop:g1": "new board", "tile:14/1/1": "update 1"}
+    assert conn._pending == {"stop:g1": "new board", VEHICLES: "update 1"}

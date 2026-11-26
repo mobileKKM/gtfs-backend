@@ -13,6 +13,9 @@ from gtfs_backend.keys import vehicle_key, version_id
 
 MAX_BBOX_KM = 50
 COORD_DIGITS = 5  # ~1 m
+# the WebSocket stream (city): a Vehicle without its own timestamp, which is new at every poll: a vehicle standing at
+# a stop then sends nothing
+STREAM_EXCLUDE = {"timestamp"}
 
 
 def stop_state(raw: dict) -> tuple[int | None, str | None]:
@@ -91,6 +94,15 @@ async def _in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[s
     ]
 
 
+async def city(ctx: Context) -> tuple[int | None, dict[str, bytes]]:
+    """Every vehicle shown, of every feed: (the newest one's timestamp, vehicle key -> its stream JSON), for the
+    WebSocket's `vehicles` topic."""
+    pieces = await _pieces(ctx, sorted(ctx.live.vehicles.items()))
+    since = ctx.fresh_since()
+    shown = [p for p in pieces if ctx.fresh(p.feed_id, p.timestamp, since)]
+    return realtime.newest(p.timestamp for p in shown), {p.model.key: p.stream_json for p in shown}
+
+
 @dataclass(frozen=True, slots=True)
 class Piece:
     """One vehicle of /vehicles: what the filters look at, the model and its JSON."""
@@ -103,6 +115,7 @@ class Piece:
     timestamp: int | None
     model: Vehicle
     json: bytes
+    stream_json: bytes  # without STREAM_EXCLUDE
 
 
 async def _pieces(ctx: Context, found: list[tuple[str, dict]]) -> list[Piece]:
@@ -123,6 +136,7 @@ async def _pieces(ctx: Context, found: list[tuple[str, dict]]) -> list[Piece]:
             timestamp=model.timestamp,
             model=model,
             json=model.model_dump_json().encode(),
+            stream_json=model.model_dump_json(exclude=STREAM_EXCLUDE).encode(),
         )
         if model.route is not None:
             kept[key] = piece

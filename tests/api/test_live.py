@@ -154,9 +154,9 @@ def test_changes_say_what_they_touched():
     live.apply({**base, "kind": "trip_updates", "seq": 1, "trips": {"set": {"kmk_t:20261025:735": a}, "del": []}})
     assert told[-1] == Changed(trips={"kmk_t:20261025:735"}, stops={"pa"})
     live.apply({**base, "seq": 1, "vehicles": {"set": {"kmk_t:735": vehicle("735")}, "del": []}})
-    assert told[-1] == Changed(positions=[(50.06, 19.94)], trips={"kmk_t:20261025:735"}, stops={"pa"})  # its trip's boards
+    assert told[-1] == Changed(vehicles={"kmk_t:735"}, trips={"kmk_t:20261025:735"}, stops={"pa"})  # its trip's boards
     live.apply({**base, "seq": 2, "vehicles": {"set": {"kmk_t:735": vehicle("735", lat=50.07)}, "del": []}})
-    assert told[-1].positions == [(50.06, 19.94), (50.07, 19.94)]  # where it was and where it is
+    assert told[-1].vehicles == {"kmk_t:735"}
     b = [1, False, False, "735", 1000, 0, [[1, "pb", None, 10, 0, False, 10, False, 10]]]
     live.apply({**base, "kind": "trip_updates", "seq": 2, "trips": {"set": {"kmk_t:20261025:735": b}, "del": []}})
     assert told[-1].stops == {"pa", "pb"}  # it left pa's board

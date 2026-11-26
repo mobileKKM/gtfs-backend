@@ -1,27 +1,29 @@
 """WebSocket push (GET /api/v1/ws): one connection per client, topics instead of polling.
 
-Client -> server (JSON text):   {"op": "subscribe" | "unsubscribe", "topics": ["tile:14/9093/5555", "stop:{key}", ...]}
+Client -> server (JSON text):   {"op": "subscribe" | "unsubscribe", "topics": ["vehicles", "stop:{key}", ...]}
 Server -> client (JSON text):   {"topic", "type": "snapshot" | "update", "data"} | {"type": "error", "topic", "error"}
 
-`data` is always the whole current state, the body the REST endpoint would return: `snapshot` right after
-subscribing, `update` whenever it changed.
-
-    tile:{z}/{x}/{y}    vehicles in a map tile (slippy map numbering, z 10-16), as GET /vehicles for the tile's box
-    stop:{stop key}     the departure board, as GET /stops/{key}/departures (the next 20)
-    trip:{trip key}     the trip's live state, as GET /trips/{key}/live
+    vehicles            every vehicle of the city, for the map (~1,000 at the peak, ~20 kB compressed), which shows
+                        the ones in view itself. snapshot: {"timestamp", "vehicles": [Vehicle without `timestamp`]};
+                        update: {"timestamp", "upsert": [those that changed or are new], "remove": [vehicle key]}:
+                        apply it to the snapshot. A vehicle standing still sends nothing. `timestamp`: the newest
+                        position's.
+    stop:{stop key}     the departure board, as GET /stops/{key}/departures (the next 20): snapshot, then the whole
+                        board again as an update whenever it changed
+    trip:{trip key}     the trip's live state, as GET /trips/{key}/live: likewise
 
 The hub follows the process's live state (api/data/live.py): what each change touched (live.Changed) marks topics
-dirty (vehicle positions their tiles; trips themselves; stops their boards; alerts every board and trip), and every
-SWEEP_S all of them are (departures leave, data gets old). A dirty topic is computed again at most every
-MIN_INTERVAL_S of its kind, serialized once, and the same text goes to every subscriber. A connection keeps only the
-latest message per topic: a slow client gets the newest state, not a queue.
+dirty (vehicles the vehicles topic; trips themselves; stops their boards; alerts every board and trip), and every
+SWEEP_S all of them are (departures leave, data gets old: vehicles not shown any more are removed). A dirty topic is
+computed again at most every MIN_INTERVAL_S of its kind, serialized once, and the same text goes to every subscriber.
+A connection keeps only the latest message per topic: a slow client gets the newest state, not a queue (for
+vehicles, a new snapshot instead of an update it would miss the one before of).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import math
 import time
 from dataclasses import dataclass, field
 
@@ -31,16 +33,15 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from gtfs_backend import keys
 from gtfs_backend.api.context import Context
-from gtfs_backend.api.data.geo import Bbox
 from gtfs_backend.api.data.live import Changed
 from gtfs_backend.api.errors import ServiceError
 from gtfs_backend.api.routers import PREFIX
 from gtfs_backend.logs import log
 
-TILE_ZOOMS = range(10, 17)
+VEHICLES = "vehicles"
 MAX_TOPICS = 50  # per connection
 MAX_MESSAGE = 16 * 1024  # bytes a client sends at once
-MIN_INTERVAL_S = {"tile": 1.0, "stop": 2.0, "trip": 1.0}
+MIN_INTERVAL_S = {VEHICLES: 1.0, "stop": 2.0, "trip": 1.0}
 TICK_S = 0.25
 SWEEP_S = 15.0
 BOARD_LIMIT = 20
@@ -51,29 +52,11 @@ router = APIRouter(prefix=PREFIX, tags=["live"])
 # ------------------------------------------------------------------------------------------------- topics
 
 
-def tile_of(lat: float, lon: float, z: int) -> tuple[int, int]:
-    n = 2**z
-    x = int((lon + 180) / 360 * n)
-    lat_r = math.radians(max(-85.05112878, min(85.05112878, lat)))
-    y = int((1 - math.asinh(math.tan(lat_r)) / math.pi) / 2 * n)
-    return min(max(x, 0), n - 1), min(max(y, 0), n - 1)
-
-
-def tile_bbox(z: int, x: int, y: int) -> Bbox:
-    n = 2**z
-
-    def lat(yy: int) -> float:
-        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * yy / n))))
-
-    return Bbox(min_lon=x / n * 360 - 180, min_lat=lat(y + 1), max_lon=(x + 1) / n * 360 - 180, max_lat=lat(y))
-
-
 @dataclass(frozen=True)
 class Topic:
     name: str
-    kind: str  # tile, stop, trip
-    key: str  # the stop or trip key; for tiles "z/x/y"
-    zxy: tuple[int, int, int] | None = None
+    kind: str  # vehicles, stop, trip
+    key: str = ""  # the stop or trip key
 
 
 class TopicError(ValueError):
@@ -82,18 +65,15 @@ class TopicError(ValueError):
         self.code = code
 
 
+TOPICS_HELP = "a topic is vehicles, stop:{key} or trip:{key}"
+
+
 def parse_topic(ctx: Context, name: str) -> Topic:
+    if name == VEHICLES:
+        return Topic(VEHICLES, VEHICLES)
     kind, sep, rest = name.partition(":")
     if not sep or not rest:
-        raise TopicError("invalid_input", "a topic is tile:z/x/y, stop:{key} or trip:{key}")
-    if kind == "tile":
-        try:
-            z, x, y = (int(p) for p in rest.split("/"))
-        except ValueError:
-            raise TopicError("invalid_input", "tile:z/x/y with whole numbers") from None
-        if z not in TILE_ZOOMS or not (0 <= x < 2**z and 0 <= y < 2**z):
-            raise TopicError("invalid_input", f"tile zoom {TILE_ZOOMS.start}-{TILE_ZOOMS.stop - 1}, x and y within it")
-        return Topic(f"tile:{z}/{x}/{y}", "tile", f"{z}/{x}/{y}", (z, x, y))
+        raise TopicError("invalid_input", TOPICS_HELP)
     if kind == "stop":
         stop = ctx.catalog.stops.find(rest)
         if stop is None:
@@ -105,7 +85,7 @@ def parse_topic(ctx: Context, name: str) -> Topic:
         except keys.InvalidKey as exc:
             raise TopicError("invalid_input", str(exc)) from None
         return Topic(name, "trip", rest)
-    raise TopicError("invalid_input", "a topic is tile:z/x/y, stop:{key} or trip:{key}")
+    raise TopicError("invalid_input", TOPICS_HELP)
 
 
 # ------------------------------------------------------------------------------------------------- connections
@@ -122,6 +102,9 @@ class Connection:
     def push(self, topic: str, text: str) -> None:
         self._pending[topic] = text
         self._wake.set()
+
+    def has_pending(self, topic: str) -> bool:
+        return topic in self._pending
 
     async def send_loop(self) -> None:
         while not self.closed:
@@ -145,7 +128,8 @@ def error_message(topic: str | None, code: str, message: str) -> str:
 class TopicState:
     topic: Topic
     subscribers: set[Connection] = field(default_factory=set)
-    data: bytes | None = None  # the current body, as last sent
+    data: bytes | None = None  # the current state, as a snapshot sends it
+    sent: dict[str, bytes] = field(default_factory=dict)  # vehicles: vehicle key -> its JSON as last sent
     computed_at: float = 0.0
 
 
@@ -162,7 +146,6 @@ class Hub:
         self._task: asyncio.Task | None = None
         self.connections: set[Connection] = set()
         self._stop_topics: dict[str, set[str]] = {}  # public_stop_id -> stop topics covering it
-        self._zooms: dict[int, int] = {}  # tile zoom -> subscribed tiles
 
     # --------------------------------------------------------------------------------------- subscriptions
 
@@ -206,12 +189,7 @@ class Hub:
         self.connections.discard(conn)
 
     def _index(self, topic: Topic, add: bool) -> None:
-        if topic.kind == "tile":
-            z = topic.zxy[0]
-            self._zooms[z] = self._zooms.get(z, 0) + (1 if add else -1)
-            if not self._zooms[z]:
-                del self._zooms[z]
-        elif topic.kind == "stop":
+        if topic.kind == "stop":
             stop = self.ctx.catalog.stops.find(topic.key)
             for pid in self.ctx.catalog.stops.public_stop_ids(stop) if stop else []:
                 names = self._stop_topics.setdefault(pid, set())
@@ -230,10 +208,8 @@ class Hub:
         if changed.everything:
             self.dirty.update(self.topics)
             return
-        for lat, lon in changed.positions:
-            for z in self._zooms:
-                x, y = tile_of(lat, lon, z)
-                self.dirty.add(f"tile:{z}/{x}/{y}")
+        if changed.vehicles:
+            self.dirty.add(VEHICLES)
         self.dirty.update(f"trip:{key}" for key in changed.trips)
         for pid in changed.stops:
             self.dirty.update(self._stop_topics.get(pid, ()))
@@ -244,39 +220,60 @@ class Hub:
     # --------------------------------------------------------------------------------------- computing
 
     async def _compute(self, state: TopicState) -> None:
-        """The topic's current body; pushed to its subscribers if it changed."""
+        """The topic's current state; what changed goes to its subscribers."""
         topic = state.topic
         state.computed_at = time.monotonic()
         try:
-            body = await self._body(topic)
+            if topic.kind == VEHICLES:
+                await self._compute_vehicles(state)
+            else:
+                await self._compute_body(state)
         except ServiceError as exc:  # the stop or trip doesn't exist (any more)
             text = error_message(topic.name, exc.code, str(exc))
             for conn in list(state.subscribers):
                 conn.push(f"error:{topic.name}", text)
                 self.unsubscribe(conn, topic.name)
-            return
         except Exception as exc:  # noqa: BLE001 - the next change tries again
             log.warning("ws_topic_failed", kind=topic.kind, error=f"{type(exc).__name__}: {exc}")
-            return
+
+    async def _compute_body(self, state: TopicState) -> None:
+        """A board or trip: the whole body, as an update whenever it changed."""
+        from gtfs_backend.api.services import departures, trips
+
+        if state.topic.kind == "stop":
+            model = await departures.board(self.ctx, state.topic.key, None, set(), set(), BOARD_LIMIT)
+        else:
+            model = await trips.live_by_key(self.ctx, state.topic.key)
+        body = model.model_dump_json().encode()
         if body == state.data:
             return
         first = state.data is None
         state.data = body
         if not first:
-            text = envelope(topic.name, "update", body)
+            text = envelope(state.topic.name, "update", body)
             for conn in state.subscribers:
-                conn.push(topic.name, text)
+                conn.push(state.topic.name, text)
 
-    async def _body(self, topic: Topic) -> bytes:
-        from gtfs_backend.api.services import departures, trips, vehicles
+    async def _compute_vehicles(self, state: TopicState) -> None:
+        """The city's vehicles: an update with those that changed since the last one, and those that went."""
+        from gtfs_backend.api.services import vehicles
 
-        if topic.kind == "tile":
-            return await vehicles.in_bbox_json(self.ctx, tile_bbox(*topic.zxy), set(), set())
-        if topic.kind == "stop":
-            model = await departures.board(self.ctx, topic.key, None, set(), set(), BOARD_LIMIT)
-        else:
-            model = await trips.live_by_key(self.ctx, topic.key)
-        return model.model_dump_json().encode()
+        newest, current = await vehicles.city(self.ctx)
+        upsert = [msgspec.Raw(j) for key, j in current.items() if state.sent.get(key) != j]
+        remove = sorted(state.sent.keys() - current.keys())
+        first = state.data is None
+        state.sent = current
+        state.data = msgspec.json.encode({"timestamp": newest, "vehicles": [msgspec.Raw(j) for j in current.values()]})
+        if first or not (upsert or remove):
+            return
+        update = envelope(VEHICLES, "update", msgspec.json.encode({"timestamp": newest, "upsert": upsert, "remove": remove}))
+        snapshot = None
+        for conn in state.subscribers:
+            if conn.has_pending(VEHICLES):  # it hasn't got the last one yet: this update alone would leave a gap
+                snapshot = snapshot or envelope(VEHICLES, "snapshot", state.data)
+                conn.push(VEHICLES, snapshot)
+            else:
+                conn.push(VEHICLES, update)
 
     # --------------------------------------------------------------------------------------- running
 

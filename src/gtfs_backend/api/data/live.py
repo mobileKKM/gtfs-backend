@@ -41,10 +41,10 @@ def feed_of(key: str) -> str:
 
 @dataclass
 class Changed:
-    """What an applied message touched: vehicle positions (before and after), trips (changed ones, and those of moved
-    vehicles), the stops of those trips (before and after), alerts. `everything`: a feed was loaded again."""
+    """What an applied message touched: vehicles, trips (changed ones, and those of changed vehicles), the stops of
+    those trips (before and after), alerts. `everything`: a feed was loaded again."""
 
-    positions: list[tuple[float, float]] = field(default_factory=list)
+    vehicles: set[str] = field(default_factory=set)
     trips: set[str] = field(default_factory=set)
     stops: set[str] = field(default_factory=set)
     alerts: bool = False
@@ -96,7 +96,7 @@ class LiveState:
         self._drop_vehicle(key, changed)
         self.vehicles[key] = v
         self._grid[cell(v["lat"], v["lon"])].add(key)
-        changed.positions.append((v["lat"], v["lon"]))
+        changed.vehicles.add(key)
         changed.trips.add(v["trip"]["key"])
 
     def _drop_vehicle(self, key: str, changed: Changed) -> None:
@@ -108,7 +108,7 @@ class LiveState:
         self._grid[c].discard(key)
         if not self._grid[c]:
             del self._grid[c]
-        changed.positions.append((v["lat"], v["lon"]))
+        changed.vehicles.add(key)
         changed.trips.add(v["trip"]["key"])
 
     def _set_trip(self, key: str, trip: TripState, changed: Changed) -> None:

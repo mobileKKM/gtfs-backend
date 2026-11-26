@@ -1,6 +1,7 @@
 """Poll meta (rt:meta:{feed_id}:{kind}): written after every poll, keeps the last good stats through failures."""
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from conftest import FIXTURES
 
@@ -38,8 +39,11 @@ def make_task(monkeypatch, *responses, **task_kwargs):
     """A trip-updates task whose downloads return `responses` in order (an Exception is raised)."""
     runtime = FeedRuntime(FeedConfig(feed_id="kmk_t", static="https://x.test/t.zip"), pool=None)
 
+    index = SimpleNamespace(generation=1)  # a TripIndex as far as the task looks at it
+
     async def get_index(now):
-        return object()
+        runtime.index = index
+        return index
 
     async def process_message(feed_id, msg, index, state, load, now):
         res = Result(trips=[{"key": "kmk_t:a:20261025", "delay_s": 60}], entities=1)
@@ -181,3 +185,40 @@ async def test_data_age_is_sampled_every_poll_with_the_tasks_clock(monkeypatch):
     assert store.meta["last_poll"].startswith(datetime.fromtimestamp(now[0], UTC).isoformat(timespec="seconds"))
     assert store.meta["trip_relationships"] == {"CANCELED": 1, "SCHEDULED": 3}  # sorted by name
     assert (store.meta["block_late_next"], store.meta["block_late_next_without_update"]) == (2, 1)
+
+
+def older(msg, seconds):
+    """`msg` with its header timestamp `seconds` earlier."""
+    out = type(msg)()
+    out.CopyFrom(msg)
+    out.header.timestamp -= seconds
+    return out
+
+
+async def test_an_older_feed_timestamp_is_taken_only_after_max_age_without_news(monkeypatch):
+    back = older(MSG, 3600)  # the producer restarted with its clock an hour behind
+    task, store = make_task(
+        monkeypatch,
+        Fetched(False, MSG, etag='"v1"'),
+        Fetched(False, back, etag='"v0"'),  # within max_age: an older copy, ignored
+        Fetched(False, back, etag='"v0"'),
+    )
+    await task.cycle()
+    await task.cycle()
+    assert task.last_ts == MSG.header.timestamp and store.published == 1
+    task.last_change -= task.max_age + 1  # nothing newer for max_age: the feed would freeze, so take it
+    await task.cycle()
+    assert task.last_ts == back.header.timestamp and store.published == 2
+
+
+async def test_a_new_index_rewrites_the_last_update_at_the_next_poll(monkeypatch):
+    task, store = make_task(monkeypatch, Fetched(False, MSG, etag='"v1"'), Fetched(True, etag='"v1"'), Fetched(True, etag='"v1"'))
+    await task.cycle()
+    assert task.written_generation == 1 and store.published == 1
+    changed_at = task.last_change
+    task.runtime.index.generation = 2  # an import: FeedRuntime installed a new index
+    await task.cycle()  # 304, but written again with the new index
+    assert task.written_generation == 2 and store.published == 2 and store.touched == 0
+    assert task.last_change == changed_at  # the data itself is as old as before
+    await task.cycle()  # nothing new: kept alive only
+    assert store.published == 2 and store.touched == 1

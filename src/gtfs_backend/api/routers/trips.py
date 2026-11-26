@@ -14,7 +14,7 @@ router = APIRouter(prefix=PREFIX, tags=["trips"])
 # before /trips/{trip_key:path}, which would take `/live` into the key
 @router.get("/trips/{trip_key:path}/live", response_model=TripLive)
 async def get_trip_live(request: Request, ctx: Ctx, trip_key: str):
-    """A trip's realtime state, to poll: every stop's predictions and whether it is skipped (match them to
+    """A trip's realtime state, to poll: every stop's predictions and status (as a departure's; match them to
     the trip view's `stops` by `stop_sequence`), the live vehicle (if any) and the alerts that apply."""
     return json_response(request, await trips.live_by_key(ctx, trip_key), LIVE)
 

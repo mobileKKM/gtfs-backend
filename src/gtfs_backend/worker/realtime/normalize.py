@@ -28,6 +28,12 @@ from gtfs_backend.worker.realtime.vehicles import build_vehicle
 Loader = Callable[[set[tuple[int, str]]], Awaitable[None]]  # loads the stop times of (version, trip_id)s
 DELAY_MEMORY_S = 600  # a trip's last delay is kept this long for its vehicle (the files are polled separately)
 
+TD = pb.TripDescriptor.ScheduleRelationship
+# Trips that aren't the timetabled trip their id names (GTFS-RT): extra trips (NEW; ADDED, deprecated and unspecified)
+# and copies at another time (DUPLICATED, which carries the original's id: taken as is, it would overwrite the
+# original's realtime). Not shown yet: counted as unmatched, with the relationship.
+EXTRA_TRIPS = frozenset({TD.ADDED, TD.NEW, TD.DUPLICATED})
+
 
 @dataclass
 class FeedRealtimeState:
@@ -37,7 +43,12 @@ class FeedRealtimeState:
     early_window_s: int = EARLY_WINDOW_S  # how far before/after its timetable a trip_id can match
     late_window_s: int = LATE_WINDOW_S
     ignore_service_suffix: bool = False  # FeedConfig.ignore_service_suffix
+    # vehicles whose position the feed measured longer ago than this (by the feed's own clock: its header timestamp)
+    # are dropped: a fresh file can carry fixes of minutes ago (seen 290 s on ZTP), a vehicle that isn't there any more
+    max_age_s: int = 120
     motion: MotionTracker = field(default_factory=MotionTracker)  # last fix per vehicle, to fill bearing/speed
+    # trip key -> feed ts of trips the feed DELETED (not to be shown): their vehicles aren't either (another file)
+    deleted_trips: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -56,6 +67,7 @@ class Result:
     # trips predicted at their last stop after the next trip of their block is due (blocks.block_overruns)
     block_late_next: int = 0
     block_late_next_without_update: int = 0
+    stale_vehicles: int = 0  # positions older than FeedRealtimeState.max_age_s, not shown
 
 
 def _relationship(enum, value: int) -> str:
@@ -103,10 +115,15 @@ async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealti
         res.trip_relationships[_relationship(pb.TripDescriptor.ScheduleRelationship, tu.trip.schedule_relationship)] += 1
         for u in tu.stop_time_update:
             res.stop_relationships[_relationship(pb.TripUpdate.StopTimeUpdate.ScheduleRelationship, u.schedule_relationship)] += 1
+        if tu.trip.schedule_relationship in EXTRA_TRIPS:
+            res.unmatched_trips.append(f"{tu.trip.trip_id or f'<entity {e.id}>'} ({TD.Name(tu.trip.schedule_relationship)})")
+            continue
         ref = refs.get(ref_key(tu.trip))
         if ref is None:
             res.unmatched_trips.append(tu.trip.trip_id or f"<entity {e.id}>")
             continue
+        if tu.trip.schedule_relationship == TD.DELETED:
+            state.deleted_trips[ref.key(feed_id)] = ts
         if tu.trip.route_id and tu.trip.route_id != ref.info.route_id:
             res.mismatches += 1
         trip = build_trip(feed_id, ref, tu, index.stop_times.get((ref.info.version, ref.info.trip_id), []), index, now, ts)
@@ -118,7 +135,13 @@ async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealti
     # 3. vehicles
     for e in vps:
         vp = e.vehicle
-        ref = refs.get(ref_key(vp.trip)) if vp.trip.trip_id else None
+        if vp.timestamp and ts - vp.timestamp > state.max_age_s:
+            res.stale_vehicles += 1
+            continue
+        extra = vp.trip.schedule_relationship in EXTRA_TRIPS
+        ref = refs.get(ref_key(vp.trip)) if vp.trip.trip_id and not extra else None
+        if ref is not None and (vp.trip.schedule_relationship == TD.DELETED or ref.key(feed_id) in state.deleted_trips):
+            continue  # its trip is deleted: neither is shown
         if ref is None or not vp.HasField("position"):
             res.unmatched_vehicles.append({"vehicle_id": vp.vehicle.id or e.id, "trip_id": vp.trip.trip_id or None})
             continue
@@ -138,5 +161,7 @@ async def process_message(feed_id: str, msg, index: TripIndex, state: FeedRealti
     cutoff = ts - DELAY_MEMORY_S
     for k in [k for k, (_, t) in state.trip_delays.items() if t < cutoff]:
         del state.trip_delays[k]
+    for k in [k for k, t in state.deleted_trips.items() if t < cutoff]:
+        del state.deleted_trips[k]
     state.motion.forget_before(ts - FORGET_S)
     return res

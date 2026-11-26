@@ -48,8 +48,13 @@ async def models(ctx: Context, raws: list[dict]) -> list[Vehicle]:
 
 
 async def by_ids(ctx: Context, ids: list[str]) -> list[Vehicle]:
-    """Vehicles by key; expired ones are skipped."""
-    return await models(ctx, await realtime.vehicle_json(ctx.redis, ids))
+    """Vehicles by key; expired ones and positions older than their feed's realtime max age are skipped."""
+    return await models(ctx, fresh(ctx, await realtime.vehicle_json(ctx.redis, ids)))
+
+
+def fresh(ctx: Context, raws: list[dict]) -> list[dict]:
+    since = ctx.fresh_since()
+    return [v for v in raws if ctx.fresh(v["feed_id"], v.get("timestamp"), since)]
 
 
 async def in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[str]) -> VehicleList:

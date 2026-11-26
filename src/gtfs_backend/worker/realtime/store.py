@@ -32,13 +32,16 @@ def _int_json(value: int | None) -> str:
     return "null" if value is None else str(int(value))
 
 
+def _bool_json(value: bool) -> str:
+    return "true" if value else "false"
+
+
 def _prediction_json(p: live_layout.StopPrediction) -> str:
     """json.dumps of a StopPrediction (ints, None, a bool), written directly: thousands per poll, a third of the
     write's time with json.dumps."""
-    arrival, departure, delay, skipped, version, scheduled = p
-    flag = "true" if skipped else "false"
+    arrival, departure, delay, skipped, version, scheduled, propagated = p
     times = f"{_int_json(arrival)},{_int_json(departure)},{_int_json(delay)}"
-    return f"[{times},{flag},{_int_json(version)},{_int_json(scheduled)}]"
+    return f"[{times},{_bool_json(skipped)},{_int_json(version)},{_int_json(scheduled)},{_bool_json(propagated)}]"
 
 
 def _departure_index(trips: dict[str, LiveTrip]) -> tuple[dict[str, str], dict[str, dict[str, str]]]:

@@ -72,6 +72,7 @@ class TripIndex:
     version_ids: dict[int, str] = field(default_factory=dict)  # version number -> core.feed_version.id
     services: dict[int, frozenset[str]] = field(default_factory=dict)  # version -> its services on `days`
     loaded_for: date | None = None
+    generation: int = 0  # set by FeedRuntime when it installs the index: 1, 2, ... (what realtime was written with)
     # (version, block_id) -> the block's trips by first departure, built on first use (block_trips)
     blocks: dict[tuple[int, str], list[TripInfo]] | None = field(default=None, repr=False, compare=False)
 

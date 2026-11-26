@@ -41,6 +41,9 @@ FEEDS = FeedsFile(
     ]
 )
 NOW = message("TripUpdates", "T").header.timestamp
+# The snapshot's bus files were saved ~220 s before the tram files (NOW): the API, which ignores realtime measured
+# longer ago than a feed's max age, gets one that covers that (test_stale_realtime_is_not_shown checks the default).
+FIXTURE_MAX_AGE = 600
 
 
 async def _load_realtime(database_url: str) -> None:
@@ -92,7 +95,7 @@ def loaded(database_url):
 
 @pytest.fixture
 async def api(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c
@@ -277,7 +280,7 @@ async def test_stops_without_trips_are_never_returned(api_ctx, sql, loaded):
 
 async def test_stop_search_covers_only_search_namespaces(loaded, sql):
     """Search is limited to feeds.yml `search_namespaces` (ZTP); the map and the stop itself are not."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     feeds = FEEDS.model_copy(update={"search_namespaces": ["km_kolej"]})  # no stops loaded there; skips validation
     app = create_app(settings, feeds=feeds, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
@@ -312,7 +315,9 @@ async def test_departure_board_merges_feeds_with_realtime(api, sql):
     assert r.headers["cache-control"] == "no-cache"
     assert len(deps) == 60
     assert [d["time"] for d in deps] == sorted(d["time"] for d in deps)
-    assert all(d["time"] >= NOW - 30 and d["status"] != "departed" for d in deps)
+    assert all(d["time"] >= NOW - 30 and not d["departed"] for d in deps)
+    assert {d["status"] for d in deps} <= {"scheduled", "live", "predicted", "canceled", "skipped"}
+    assert {"live", "scheduled"} <= {d["status"] for d in deps}
     assert {feed_of(d) for d in deps} == {"kmk_a", "kmk_m", "kmk_t"}
     assert not {"feed_id", "trip_id", "service_date", "realtime", "vehicle_id"} & {k for d in deps for k in d}
     own = {p[0] for p in sql("SELECT id FROM core.stop WHERE stop_group_id = %s", gid)}
@@ -367,9 +372,9 @@ async def test_departure_board_pages_by_time(api, sql):
     past = (await api.get(f"{url}?limit=100&time={NOW - 3600}")).json()["departures"]
     assert [d["time"] for d in past] == sorted(d["time"] for d in past)
     assert all(d["time"] >= NOW - 3600 for d in past)
-    assert any(d["status"] == "departed" for d in past)
-    # vehicles that passed keep the last time realtime had
-    assert any(d["status"] == "departed" and d["estimated"] for d in past)
+    assert any(d["departed"] for d in past)
+    # vehicles that passed keep the last time realtime had, and where it came from
+    assert any(d["departed"] and d["estimated"] and d["status"] in ("live", "predicted") for d in past)
 
     assert (await api.get(f"{url}?time=garbage")).status_code == 422
     assert (await api.get(f"{url}?time=-1")).status_code == 422
@@ -422,7 +427,7 @@ async def test_departure_board_stop_and_other_days(api, sql):
 async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
     """Responses carry the time of their data, not of the request: a later poll of unchanged data is a 304."""
     clock = [NOW]
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: clock[0])
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         vehicles = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()
@@ -468,7 +473,7 @@ async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch, arr
     async def scheduled(conn, days, pids, start, end, lookback=departures.LOOKBACK_S):
         return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
 
-    async def read(redis, feed_ids, public_stop_ids):
+    async def read(redis, feed_ids, public_stop_ids, fresh_since=None):
         if arrival_only:  # its delay is against the scheduled arrival
             value = f"[{predicted},null,{predicted - scheduled_arrival},false,1,{early.scheduled_departure}]"
         else:
@@ -528,6 +533,11 @@ async def test_trip_of_a_live_vehicle(api):
     assert live["vehicle"] == v
     assert any(s["estimated_arrival"] or s["estimated_departure"] for s in live["stops"])
     assert not {"current_index"} & set(live) and not any("passed" in s for s in live["stops"])
+    # each stop says where its time comes from: the feed's (live, ZTP predicts every stop) or none (scheduled)
+    for s in live["stops"]:
+        timed = bool(s["estimated_arrival"] or s["estimated_departure"])
+        assert s["status"] in (("live", "predicted") if timed else ("scheduled", "skipped"))
+    assert "live" in {s["status"] for s in live["stops"]}
     # the same live state by trip key
     by_key = await api.get(f"/trips/{v['trip_key']}/live")
     assert by_key.json() == live and by_key.headers["cache-control"] == "no-cache"
@@ -851,7 +861,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
 @pytest.fixture
 async def api_no_raise(loaded):
     """Like `api`, but app exceptions become responses (as in production) instead of reaching the test."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     transport = ASGITransport(app, raise_app_exceptions=False)
     async with app.router.lifespan_context(app), AsyncClient(transport=transport, base_url="http://test/api/v1") as c:
@@ -883,7 +893,7 @@ async def test_unexpected_errors_keep_the_error_body(api_no_raise, monkeypatch):
 @pytest.fixture
 async def api_ctx(loaded):
     """Like `api`, with the app's context."""
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         yield c, app.state.ctx
@@ -912,7 +922,9 @@ async def test_server_timing(api_ctx, sql):
 
 
 async def test_server_timing_off(loaded):
-    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, server_timing=False)
+    settings = ApiSettings(
+        _env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE, server_timing=False
+    )
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
         assert "server-timing" not in (await c.get(f"/vehicles?bbox={CITY_BBOX}")).headers
@@ -1013,7 +1025,7 @@ async def test_metrics_count_requests_by_route_template_across_app_instances(loa
     r = Redis.from_url(TEST_REDIS_URL)
     try:
         await r.delete(*[k async for k in r.scan_iter(match="metrics:*")] or ["metrics:none"])
-        settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)
+        settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL, realtime_max_age=FIXTURE_MAX_AGE)
         app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
         async with (
             app.router.lifespan_context(app),
@@ -1040,3 +1052,50 @@ async def test_metrics_count_requests_by_route_template_across_app_instances(loa
     assert all(v["trip_key"] not in route for route in routes)
     assert 0 < live["p50_ms"] <= live["p90_ms"] <= live["p99_ms"] <= live["max_ms"]
     assert body["window_s"] == 120 and body["bucket_error"] == 0.091
+
+
+async def test_stale_realtime_is_not_shown(loaded, sql):
+    """With the worker stopped (nothing newer in Redis), trip updates and vehicles measured longer ago than the feed's
+    max age disappear from the map, boards and trips: the timetable stays."""
+    settings = ApiSettings(_env_file=None, database_url=loaded, redis_url=TEST_REDIS_URL)  # REALTIME_MAX_AGE 120 s
+    for at, fresh in ((NOW + 60, True), (NOW + 121 + 30, False)):
+        app = create_app(settings, feeds=FEEDS, clock=lambda at=at: at)
+        async with (
+            app.router.lifespan_context(app),
+            AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c,
+        ):
+            trams = (await c.get(f"/vehicles?bbox={CITY_BBOX}&modes=tram")).json()["vehicles"]
+            board = (await c.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()["departures"]
+            assert board  # the timetable either way
+            statuses = {d["status"] for d in board if feed_of(d) == "kmk_t"}
+            if fresh:
+                assert trams and "live" in statuses
+                trip = trams[0]["trip_key"]
+            else:
+                assert trams == [] and statuses == {"scheduled"}
+                live = (await c.get(f"/trips/{trip}/live")).json()
+                assert live["status"] == "scheduled" and live["vehicle"] is None
+                assert {s["status"] for s in live["stops"]} == {"scheduled"}
+
+
+async def test_deleted_trips_leave_the_board_canceled_ones_stay(api, sql):
+    url = f"/stops/{group_id(sql, '802')}/departures?limit=30"
+    deps = (await api.get(url)).json()["departures"]
+    live = [d for d in deps if d["status"] == "live" and feed_of(d) == "kmk_t"][:2]
+    assert len(live) == 2
+    r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    key = "rt:tripstate:kmk_t"
+    saved = {d["trip_key"]: await r.hget(key, d["trip_key"]) for d in live}
+    try:
+        (deleted, canceled) = live
+        v, _, veh, ts, *_ = json.loads(saved[deleted["trip_key"]])
+        await r.hset(key, deleted["trip_key"], json.dumps([v, True, veh, ts, True]))
+        v, _, veh, ts, *_ = json.loads(saved[canceled["trip_key"]])
+        await r.hset(key, canceled["trip_key"], json.dumps([v, True, veh, ts, False]))
+        after = {d["trip_key"]: d for d in (await api.get(url)).json()["departures"]}
+        assert deleted["trip_key"] not in after
+        assert after[canceled["trip_key"]]["status"] == "canceled"
+    finally:
+        for trip_key, value in saved.items():
+            await r.hset(key, trip_key, value)
+        await r.aclose()

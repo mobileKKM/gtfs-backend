@@ -119,6 +119,44 @@ async def test_schedule_relationships_are_counted_matched_or_not():
         tu("T2", relationship=TD.CANCELED),
         tu("extra_1", (1, BASE + hms(6, 30), STU.SCHEDULED), relationship=TD.NEW),  # not in the timetable
     )
-    assert res.unmatched_trips == ["extra_1"]
+    assert res.unmatched_trips == ["extra_1 (NEW)"]  # not shown yet, and why
     assert res.trip_relationships == {"SCHEDULED": 1, "CANCELED": 1, "NEW": 1}
     assert res.stop_relationships == {"SCHEDULED": 2, "SKIPPED": 1, "NO_DATA": 1}
+
+
+def vehicle(trip_id, vid, relationship=TD.SCHEDULED):
+    e = pb.FeedEntity(id=vid)
+    e.vehicle.trip.trip_id = trip_id
+    e.vehicle.trip.schedule_relationship = relationship
+    e.vehicle.vehicle.id = vid
+    e.vehicle.position.latitude, e.vehicle.position.longitude = 50.06, 19.94
+    return e
+
+
+async def test_deleted_trips_and_their_vehicles_are_not_shown():
+    idx, state = make_index(), FeedRealtimeState()
+    now = BASE + hms(6, 20)
+    res = await process_message("kmk_a", feed(tu("T1", relationship=TD.DELETED), ts=now), idx, state, noop, now)
+    assert [(t["key"], t["schedule_relationship"]) for t in res.trips] == [("kmk_a:20261126:T1", "DELETED")]
+    from gtfs_backend.live_layout import trip_state
+
+    assert trip_state(res.trips[0])[1:] == (True, None, now, True)  # canceled and deleted
+    # its vehicle comes in another file: not shown either
+    res = await process_message("kmk_a", feed(vehicle("T1", "v1"), vehicle("T2", "v2"), ts=now), idx, state, noop, now)
+    assert [v["vehicle_id"] for v in res.vehicles] == ["v2"]
+
+
+async def test_a_duplicated_trip_does_not_take_the_originals_place():
+    """GTFS-RT DUPLICATED names the timetabled trip it copies: taken as that trip, its times would replace the
+    original's. Until such trips are supported they are left out (and counted)."""
+    now = BASE + hms(6, 20)
+    res = await run(
+        tu("T1", (1, BASE + hms(6, 2), STU.SCHEDULED)),
+        tu("T1", (1, BASE + hms(8, 0), STU.SCHEDULED), relationship=TD.DUPLICATED),
+    )
+    assert [t["stops"][0]["predicted_arrival"] for t in res.trips] == [BASE + hms(6, 2)]
+    assert res.unmatched_trips == ["T1 (DUPLICATED)"]
+    res = await process_message(
+        "kmk_a", feed(vehicle("T1", "dup", TD.DUPLICATED), ts=now), make_index(), FeedRealtimeState(), noop, now
+    )
+    assert res.vehicles == [] and res.unmatched_vehicles == [{"vehicle_id": "dup", "trip_id": "T1"}]

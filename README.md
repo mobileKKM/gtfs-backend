@@ -10,7 +10,9 @@ feeder buses (vehicles, trip updates, alerts).
 
 Realtime files are polled every `REALTIME_POLL_INTERVAL` (10 s) unless a feed sets `realtime_poll_interval`: ZTP
 (updates every ~5 s) every 5 s, `km_kolej` (every ~5 min) every 30 s. Data stays live for `REALTIME_MAX_AGE` (120 s)
-after the last change, or the feed's `realtime_max_age` (`km_kolej`: 600).
+after the last change, or the feed's `realtime_max_age` (`km_kolej`: 600): the API ignores trip updates and vehicles
+measured longer ago (so nothing stale stays on boards or the map when the worker or a feed stops), and the worker
+drops vehicle positions older than that within a file (ZTP sends some minutes old).
 
 ## Running it
 
@@ -114,8 +116,8 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | `rt:veh:geo` | GEO set of all vehicles (member `{feed_id}:{vehicle_id}`) for bbox/radius queries |
 | `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop; removed when the vehicle leaves the feed (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times; removed when the trip leaves the feed |
-| `rt:tripstate:{feed_id}` | hash: trip key → `[version, canceled, vehicle_id, timestamp]` of every trip in `rt:trip` (TTL `TRIP_TTL`) |
-| `rt:stop:{feed_id}:{public_stop_id}` | hash: `{stop_sequence}\|{trip key}` → `[predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure]`: the trips' rows of `rt:trip` at this stop, so a board reads its stops, not whole trips. Written with `rt:trip` (only changed fields); only valid for trips in `rt:tripstate` with the same version; rewritten in full when the worker starts or finds `rt:tripstate` gone |
+| `rt:tripstate:{feed_id}` | hash: trip key → `[version, canceled, vehicle_id, timestamp, deleted]` of every trip in `rt:trip` (TTL `TRIP_TTL`) |
+| `rt:stop:{feed_id}:{public_stop_id}` | hash: `{stop_sequence}\|{trip key}` → `[predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure, propagated]`: the trips' rows of `rt:trip` at this stop, so a board reads its stops, not whole trips. Written with `rt:trip` (only changed fields); only valid for trips in `rt:tripstate` with the same version; rewritten in full when the worker starts or finds `rt:tripstate` gone |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s`, `trip_relationships`/`stop_relationships` (GTFS-RT `schedule_relationship` counts: `CANCELED`, `NEW`, `DUPLICATED`, `SKIPPED`, `NO_DATA`, ...), `block_late_next` (trips predicted at their last stop after the next trip of their block is due) and `block_late_next_without_update` (of those, next trips without an update of their own) |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
@@ -128,7 +130,11 @@ Rules:
   to (version + service day around "now"); realtime route ids are only compared and counted. A feed's `start_date`
   would pick the service day (none sends one yet).
 - **Unmatched means not shown**: unknown trips, trips outside their service window and idle vehicles never reach
-  the map or departures.
+  the map or departures. Nor do trips that aren't the timetabled trip their id names (GTFS-RT `NEW`, `ADDED`,
+  `DUPLICATED`: counted as unmatched with their kind, and a `/health` problem) until they are supported.
+  `CANCELED` trips show as canceled; `DELETED` ones (and their vehicles) aren't shown at all.
+- **Counted, not used yet** (`rt:meta`): `schedule_relationship` values, and how often a late trip runs into the next
+  trip of its block (GTFS-RT asks producers to send the next trips' updates; ZTP does).
 - **Delays are recomputed** as predicted − scheduled, scheduled = the feed's day start + GTFS time (noon minus 12 h
   unless `day_start: midnight`). They **propagate** (GTFS-RT): a stop without an update takes the last updated
   stop's delay (`propagated: true`); `NO_DATA` stops that, `SKIPPED` passes it on.
@@ -143,6 +149,11 @@ Rules:
   unreachable Postgres never stops the live data (a failed reload is retried after 10 s). Unchanged versions are
   reused, so only an import of the feed itself reads its trips again. Stop times are loaded per trip when it first
   appears; if that fails, its update goes out without per-stop times and the load is retried after 30 s.
+- **After an import** the worker loads the feed's new index, each of its realtime files processes its last update
+  again at its next poll, and only then `static:updated` goes out (at most 90 s later): the API uses realtime only
+  for the version serving the day, so switching it first would leave boards without realtime until the files change.
+- A feed whose header timestamp goes back (a producer restarted with its clock behind) is taken once nothing newer
+  came for its max age; before that an older copy (another server, a cache) is ignored.
 - Downloads are checked against `Content-Length` and parsed before use. ZTP briefly serves empty or partial files
   while replacing them; those, 5xx and 429 are retried and never overwrite good data. Each attempt gives up after
   the feed's poll interval (at least 5 s, at most `REALTIME_FETCH_TIMEOUT`). Requests send `USER_AGENT`
@@ -217,13 +228,15 @@ Notes:
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
   delayed departures stay. The timetable comes from `core.stop_departure`, realtime from `rt:tripstate` and the
-  board's `rt:stop:*` hashes (one pipelined call). Predictions are used only for the same version. `status`: `scheduled`, `live`,
-  `departed`, `canceled`, `skipped`; `time` is the estimate if known. `departed` is when the vehicle reports a later
-  stop of the trip (VehiclePosition `current_stop_sequence`), else when the time is past; a TripUpdate not listing a
-  stop doesn't count as passing it. `vehicle_state` (`at_stop`, `arriving`) is set when the vehicle reports this stop. Last stops and stops without pickup are not
+  board's `rt:stop:*` hashes (one pipelined call). Predictions are used only for the same version. `status` says
+  where the time comes from: `scheduled` (timetable; also where the feed says `NO_DATA`), `live` (the feed's
+  prediction for this stop), `predicted` (a delay the feed gave for an earlier stop, carried over), `canceled`,
+  `skipped`; `time` is the estimate if known. Trip views' stops (`/live`) carry the same `status`. `departed: true`
+  when the vehicle reports a later stop of the trip (VehiclePosition `current_stop_sequence`), else when the time is
+  past; a TripUpdate not listing a stop doesn't count as passing it. `vehicle_state` (`at_stop`, `arriving`) is set when the vehicle reports this stop. Last stops and stops without pickup are not
   departures; `on_demand` marks GTFS pickup type 2/3.
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
-  show as `departed`). Page forward by passing the last departure's `time`; departures in that second can repeat
+  come with `departed: true`). Page forward by passing the last departure's `time`; departures in that second can repeat
   (tell them apart by `trip_key` + `stop_sequence`). The first window is where the stop's hourly departures
   (today's timetables, counted once a day) expect 1.5 pages, so a board needs one query; if that isn't enough
   (filters, another day's timetable) it widens through 2 h, 6 h and 24 h, each step reading only the time it adds. A
@@ -247,8 +260,8 @@ Notes:
   alerts active now or starting within a day; `/alerts` returns all unless `active=true`.
 - **Health**: `ok` means Postgres and Redis answer. `fresh` is false while any feed has `problems`: no timetable,
   failed last import, static not checked for `HEALTH_STATIC_MAX_AGE` (3 h), or a realtime file not polled, failing
-  (5 polls) or older than `HEALTH_REALTIME_MAX_AGE` (5 min; a larger `realtime_max_age` wins). Alerts files are
-  exempt from the age check.
+  (5 polls) or older than `HEALTH_REALTIME_MAX_AGE` (5 min; a larger `realtime_max_age` wins), or sending trips of a
+  kind not shown yet (`NEW`, `DUPLICATED`, ...). Alerts files are exempt from the age check.
 - Responses carry `ETag` and `Cache-Control` (static data 5 min, alerts 15 s); bodies over 1 kB are gzipped (level 6).
 - **`Server-Timing`** on every response (`SERVER_TIMING`, on by default) says where the time went: `db` (queries),
   `db-wait` (waiting for a pooled connection), `redis` (commands; a pipeline is one), `serialize` and `total`;

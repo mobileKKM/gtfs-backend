@@ -137,3 +137,28 @@ async def test_close_cancels_a_running_reload(monkeypatch):
     await rt.get_index(NOW)
     await rt.close()
     assert rt._reload is None
+
+
+async def test_reload_after_an_import_waits_for_the_new_index_and_numbers_it(monkeypatch):
+    loads = FakeLoads(monkeypatch, index(1), index(1), index(2))
+    rt = make_runtime()
+    first = await rt.get_index(NOW)
+    assert first.generation == rt.generation == 1
+    # a reload started before the import committed (it reads the old version) is waited for, then one more runs
+    rt.invalidate()
+    loads.gate = asyncio.Event()
+    await rt.get_index(NOW)
+    reload = asyncio.create_task(rt.reload(NOW))
+    await settle()
+    loads.gate.set()
+    assert await reload is True
+    assert rt.index.version_ids == {2: "kmk_t_v2"} and rt.index.generation == rt.generation == 3
+    assert len(loads.calls) == 3
+
+
+async def test_reload_reports_a_failure(monkeypatch):
+    FakeLoads(monkeypatch, index(1), RuntimeError("db down"), RuntimeError("db down"))
+    rt = make_runtime()
+    await rt.get_index(NOW)
+    assert await rt.reload(NOW) is False
+    assert rt.index.generation == 1  # the old one keeps serving

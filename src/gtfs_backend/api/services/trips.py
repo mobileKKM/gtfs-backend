@@ -13,9 +13,10 @@ from gtfs_backend.api.context import Context
 from gtfs_backend.api.data import realtime
 from gtfs_backend.api.data.catalog import Day
 from gtfs_backend.api.data.geo import bbox_of, encode_polyline
-from gtfs_backend.api.data.realtime import TripUpdate
+from gtfs_backend.api.data.realtime import StopUpdate, TripUpdate
 from gtfs_backend.api.errors import NotFound
 from gtfs_backend.api.schemas import StopRef, TripLive, TripShape, TripStop, TripStopLive, TripView, Vehicle
+from gtfs_backend.api.schemas.trips import TripStopStatus
 from gtfs_backend.api.services import alerts, vehicles
 from gtfs_backend.api.services.routes import POLYLINE_SQL
 
@@ -126,15 +127,27 @@ async def view(ctx: Context, feed_id: str, service_date: date, trip_id: str) -> 
     )
 
 
+def stop_status(live: StopUpdate | None) -> TripStopStatus:
+    """`skipped`; `live` / `predicted` with a time from the feed for this stop / carried over from an earlier one; else
+    `scheduled` (also where the feed says it has no data: NO_DATA)."""
+    if live is None:
+        return "scheduled"
+    if live.skipped:
+        return "skipped"
+    if live.predicted is None:
+        return "scheduled"
+    return "predicted" if live.propagated else "live"
+
+
 def _live_stop(row, update: TripUpdate | None) -> TripStopLive:
     seq, _ = row
     live = update.stop(seq) if update else None
     return TripStopLive(
         stop_sequence=seq,
+        status=stop_status(live),
         estimated_arrival=live.predicted_arrival if live else None,
         estimated_departure=live.predicted_departure if live else None,
         delay_s=live.delay_s if live else None,
-        skipped=bool(live and live.skipped),
     )
 
 
@@ -149,6 +162,8 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     )
     rows = list(zip(seqs or [], pids or [], strict=True))
     update = TripUpdate.for_version(raw, day.version)
+    if update is not None and not ctx.fresh(feed_id, update.timestamp):
+        update = None  # measured too long ago: the worker or the feed stopped
     stops = [_live_stop(r, update) for r in rows]
 
     if vehicle is None and update and update.vehicle_id:
@@ -191,7 +206,7 @@ async def live_by_key(ctx: Context, trip_key: str) -> TripLive:
 async def for_vehicle(ctx: Context, vehicle_key: str) -> TripLive:
     """The live state of the trip the vehicle runs now; its `key` changes when the vehicle starts its next trip."""
     feed_id, _ = keys.split_feed(vehicle_key, "vehicle key")
-    raws = await realtime.vehicle_json(ctx.redis, [vehicle_key])
+    raws = vehicles.fresh(ctx, await realtime.vehicle_json(ctx.redis, [vehicle_key]))
     if not raws:
         raise NotFound("vehicle")
     (vehicle,) = await vehicles.models(ctx, raws)

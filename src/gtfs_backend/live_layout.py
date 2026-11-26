@@ -119,23 +119,28 @@ class LiveTrip(TripFields):
 
 
 # JSON arrays, not objects: boards read thousands of them.
-# rt:tripstate value: [version, canceled, vehicle_id, timestamp], from the LiveTrip
-TripState = tuple[int, bool, str | None, int]
-# rt:stop value: [predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure], from the
-# LiveTrip's StopRow. The version: writes and reads aren't atomic, so a board may read a trip state and predictions
-# of different updates, and stop sequences are only comparable within one version. The scheduled departure: what a
-# board's timetable rows are read by, to find trips running early (not predicted - delay_s: an arrival-only
-# prediction's delay is against the scheduled arrival).
-StopPrediction = tuple[int | None, int | None, int | None, bool, int, int | None]
+# rt:tripstate value: [version, canceled, vehicle_id, timestamp, deleted], from the LiveTrip. Deleted (GTFS-RT DELETED):
+# removed and not to be shown at all, also canceled. Readers accept the 4-element form of older workers.
+TripState = tuple[int, bool, str | None, int, bool]
+# rt:stop value: [predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure, propagated],
+# from the LiveTrip's StopRow. The version: writes and reads aren't atomic, so a board may read a trip state and
+# predictions of different updates, and stop sequences are only comparable within one version. The scheduled
+# departure: what a board's timetable rows are read by, to find trips running early (not predicted - delay_s: an
+# arrival-only prediction's delay is against the scheduled arrival). Propagated: the feed gave no time for this stop,
+# the delay is carried from an earlier one (status `predicted`). Readers accept the 6-element form of older workers.
+StopPrediction = tuple[int | None, int | None, int | None, bool, int, int | None, bool]
 
 
 def trip_state(trip: LiveTrip) -> TripState:
-    return trip["version"], trip["schedule_relationship"] == "CANCELED", trip["vehicle_id"], trip["timestamp"]
+    relationship = trip["schedule_relationship"]
+    deleted = relationship == "DELETED"
+    return trip["version"], deleted or relationship == "CANCELED", trip["vehicle_id"], trip["timestamp"], deleted
 
 
 def stop_prediction(row: StopRow, version: int) -> StopPrediction:
     skipped = row["schedule_relationship"] == "SKIPPED"
-    return row["predicted_arrival"], row["predicted_departure"], row["delay_s"], skipped, version, row["scheduled_departure"]
+    arrival, departure, scheduled = row["predicted_arrival"], row["predicted_departure"], row["scheduled_departure"]
+    return arrival, departure, row["delay_s"], skipped, version, scheduled, row["propagated"]
 
 
 class LiveVehicle(TypedDict):
@@ -243,3 +248,4 @@ class PollMeta(TypedDict):
     # had no trip update of their own (worker/realtime/blocks.py)
     block_late_next: NotRequired[int]
     block_late_next_without_update: NotRequired[int]
+    stale_vehicles: NotRequired[int]  # positions older than the feed's realtime max age, dropped

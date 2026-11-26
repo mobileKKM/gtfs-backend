@@ -18,10 +18,9 @@ class WorkerSettings(Settings):
     osm_stops_file: Path = Path("data/osm/stops.json")
     osm_refresh_interval: float = Field(default=86400, ge=0)
     static_poll_interval: float = Field(default=3600, gt=0)
-    # defaults for feeds.yml `realtime_poll_interval` / `realtime_max_age`: how often each realtime file is polled,
-    # and how long its last data stays live (TTLs refreshed) while the file doesn't change
+    # default for feeds.yml `realtime_poll_interval`: how often each realtime file is polled (REALTIME_MAX_AGE, how
+    # long data stays live, is shared with the API: gtfs_backend/settings.py)
     realtime_poll_interval: float = Field(default=10, gt=0)
-    realtime_max_age: int = Field(default=120, ge=1)
 
     # downloads
     http_connect_timeout: float = Field(default=10, gt=0)

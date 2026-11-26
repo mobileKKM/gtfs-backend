@@ -178,3 +178,50 @@ async def test_osm_loop_gives_up_on_the_first_fetch_after_a_few_tries_and_lets_t
 async def test_osm_is_not_used_when_refreshing_is_off_or_nobody_shares_stops(tmp_path):
     off = _worker(osm_refresh_interval=0)
     assert not off.uses_osm and off.osm_ready.is_set()
+
+
+class FakeTask:
+    def __init__(self, feed_id, interval, written):
+        self.feed_id, self.interval, self.name = feed_id, interval, f"{feed_id}:x"
+        self.last_msg, self.written_generation = object(), written
+
+
+class FakeRuntime:
+    generation = 0
+
+    def __init__(self, ok=True):
+        self.ok = ok
+
+    async def reload(self, now):
+        self.generation = 7
+        return self.ok
+
+
+async def test_static_updated_waits_until_the_feeds_realtime_is_written_with_the_new_index(monkeypatch):
+    worker = _worker()
+    feed = worker.enabled[0]
+    worker.runtimes = {feed.feed_id: FakeRuntime()}
+    slow = FakeTask(feed.feed_id, interval=5, written=6)
+    other = FakeTask("other_feed", interval=5, written=0)  # not this feed's: not waited for
+    worker.realtime_tasks = [slow, other]
+
+    async def poll_later():
+        await runner.asyncio.sleep(0.3)
+        slow.written_generation = 7  # its next poll wrote the last update again
+
+    started = time.monotonic()
+    await runner.asyncio.gather(worker._rewrite_realtime(feed), poll_later())
+    assert 0.3 <= time.monotonic() - started < 2
+
+
+async def test_static_updated_does_not_wait_for_ever(monkeypatch):
+    worker = _worker()
+    feed = worker.enabled[0]
+    worker.runtimes = {feed.feed_id: FakeRuntime()}
+    worker.realtime_tasks = [FakeTask(feed.feed_id, interval=0.1, written=0)]  # never writes
+    monkeypatch.setattr(runner, "REWRITE_WAIT_MAX_S", 0.5)
+    started = time.monotonic()
+    await worker._rewrite_realtime(feed)
+    assert time.monotonic() - started < 2
+    worker.runtimes = {feed.feed_id: FakeRuntime(ok=False)}  # no new index: nothing to wait for
+    await worker._rewrite_realtime(feed)

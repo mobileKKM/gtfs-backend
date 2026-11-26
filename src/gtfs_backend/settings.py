@@ -21,6 +21,15 @@ class Settings(BaseSettings):
     # Connections per process (the worker, and each API process). Postgres allows 100 in all: the worker's pool +
     # API_WORKERS x this (+ imports, psql) must stay below that.
     db_pool_max_size: int = Field(default=10, ge=1)
+    # Default for feeds.yml `realtime_max_age`: realtime data stays live this long. The worker keeps the last data of
+    # an unchanged file in Redis that long and drops vehicles whose position is older; the API ignores trip updates
+    # and vehicles measured longer ago (so nothing goes stale on the map or boards when the worker or a feed stops).
+    realtime_max_age: int = Field(default=120, ge=1)
+
+    def max_age(self, feed) -> int:
+        """A feed's (FeedConfig) realtime max age."""
+        return feed.realtime_max_age or self.realtime_max_age
+
     # Benchmark replays only (docs/benchmark.md): the worker and the API run as if it were this many seconds later
     # (negative: earlier), so a recorded realtime feed meets the timetable day it was recorded on. 0 in production.
     clock_offset: float = 0

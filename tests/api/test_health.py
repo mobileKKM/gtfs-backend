@@ -66,3 +66,14 @@ def test_slow_feeds_get_their_own_max_age():
     metas = {"trip_updates": meta(data_ago=500), "service_alerts": meta(data_ago=None)}
     assert problems(metas=metas, feed=slow) == []
     assert problems(metas=metas) == ["trip_updates: data is 8 min old"]
+
+
+def test_trips_of_unsupported_kinds_are_a_problem():
+    alerts = meta(data_ago=None)
+    shown = meta(trip_relationships={"SCHEDULED": 400, "CANCELED": 3, "DELETED": 1, "REPLACEMENT": 2})
+    assert problems(metas={"trip_updates": shown, "service_alerts": alerts}) == []
+    extra = meta(trip_relationships={"SCHEDULED": 400, "NEW": 2, "DUPLICATED": 1})
+    assert problems(metas={"trip_updates": extra, "service_alerts": alerts}) == [
+        "trip_updates: 1 DUPLICATED trips not shown (not supported yet)",
+        "trip_updates: 2 NEW trips not shown (not supported yet)",
+    ]

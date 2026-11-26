@@ -807,7 +807,6 @@ async def test_openapi_lists_every_endpoint(api):
         "/api/v1/alerts/{alert_key}",
         "/api/v1/health",
         "/api/v1/metrics",
-        "/api/v1/search",
     } == set(paths)
 
 
@@ -1293,24 +1292,6 @@ async def test_stop_search_in_memory_ranks_as_the_sql_did(api_ctx, sql):
             key = {r[0]: (r[1], r[2], np.float32(r[3]), np.float32(r[4]), r[5]) for r in rows}
             assert [key[g] for g in mine] == [key[r[0]] for r in rows], q
             assert ctx.catalog.search.search(q, 3) == mine[:3]
-
-
-async def test_search_finds_stops_and_routes(api, sql):
-    names = sorted(
-        {n for (n,) in sql("SELECT DISTINCT route_short_name FROM gtfs.routes WHERE route_short_name ~ '^[0-9]+$'")}, key=int
-    )
-    short = next(n for n in names if any(m != n and m.startswith(n) for m in names))  # e.g. 1, with 10, 11, ...
-    r = await api.get(f"/search?q={short}")
-    assert r.status_code == 200 and r.headers["cache-control"].startswith("public")
-    body = r.json()
-    routes = [x["name"] for x in body["routes"]]
-    assert routes[0] == short and all(n.startswith(short) for n in routes) and len(routes) > 1
-    assert {"query", "stops", "routes"} == set(body)
-    # stops as /stops/search has them
-    q = "rondo"
-    assert (await api.get(f"/search?q={q}")).json()["stops"] == (await api.get(f"/stops/search?q={q}")).json()["results"]
-    assert (await api.get("/search?q=zzzzqqq")).json() == {"query": "zzzzqqq", "stops": [], "routes": []}
-    assert (await api.get("/search?q=")).status_code == 422
 
 
 async def test_vehicles_joined_from_pieces_are_the_models_json(api_ctx, monkeypatch):

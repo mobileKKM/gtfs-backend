@@ -130,7 +130,6 @@ class Catalog:
         self._retry_at = 0.0  # time.monotonic()
         self.stops = StopData.empty()  # stops, groups, today's directions (api/data/stopdata.py)
         self.search = StopSearch([])  # stop search over self.stops (api/data/search.py)
-        self.today_routes: list[RouteInfo] = []  # every route of today's versions, one per (feed, name): route search
 
     @property
     def loaded(self) -> bool:
@@ -231,14 +230,6 @@ class Catalog:
                 await self._load_routes(missing)
         self._loaded_at = now
         self._loaded_generation = generation
-        self.today_routes = sorted(
-            {
-                (info.feed_id, info.name): info
-                for d in self.today_days()
-                for info in self._routes.get(d.feed_version_id, {}).values()
-            }.values(),
-            key=lambda i: (i.feed_id, i.route_id),
-        )
         await self.load_timetable()
 
     def timetable_changed(self) -> None:

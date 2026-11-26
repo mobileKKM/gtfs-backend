@@ -14,7 +14,7 @@ from gtfs_backend.api.schemas.common import Agency, Route, RouteRef, StopRef
 from gtfs_backend.api.schemas.departures import Departure, DepartureBoard, DepartureStatus
 from gtfs_backend.api.schemas.health import FeedHealth, Health
 from gtfs_backend.api.schemas.routes import RouteShape, RouteShapes
-from gtfs_backend.api.schemas.stops import Direction, Search, SearchResult, Stop, StopGroupInfo, StopInfo, StopList
+from gtfs_backend.api.schemas.stops import Direction, SearchResult, Stop, StopGroupInfo, StopInfo, StopList
 from gtfs_backend.api.schemas.trips import TripLive, TripShape, TripStop, TripStopLive, TripView
 from gtfs_backend.api.schemas.vehicles import Vehicle, VehicleList
 
@@ -38,7 +38,6 @@ __all__ = [
     "RouteRef",
     "RouteShape",
     "RouteShapes",
-    "Search",
     "SearchResult",
     "Stop",
     "StopGroupInfo",

@@ -8,7 +8,7 @@ from gtfs_backend.api import timing
 from gtfs_backend.api.cache import LIVE, json_bytes_response, json_response, public
 from gtfs_backend.api.deps import BboxQuery, Ctx, FeedsQuery, ModesQuery, RoutesQuery, StopKindQuery
 from gtfs_backend.api.routers import PREFIX
-from gtfs_backend.api.schemas import DepartureBoard, Search, SearchResult, StopList
+from gtfs_backend.api.schemas import DepartureBoard, SearchResult, StopList
 from gtfs_backend.api.services import departures, stops
 
 router = APIRouter(prefix=PREFIX, tags=["stops"])
@@ -37,18 +37,6 @@ async def search_stops(
 
     Each result has its stops with directions (`towards` = the next stop group trips go to, with routes)."""
     return json_response(request, await stops.search(ctx, q, limit), public(ctx.settings.cache_ttl_static))
-
-
-@router.get("/search", response_model=Search, tags=["search"])
-async def search(
-    request: Request,
-    ctx: Ctx,
-    q: Annotated[str, Query(min_length=1, max_length=100)],
-    limit: Annotated[int, Query(ge=1, le=50)] = 10,
-):
-    """Everything a query names: stop groups (as /stops/search) and routes of today's timetables by name (`52`,
-    `N1`, `A18`: the exact name first, then names starting with it)."""
-    return json_response(request, await stops.search_all(ctx, q, limit), public(ctx.settings.cache_ttl_static))
 
 
 @router.get("/stops/{stop_key}/departures", response_model=DepartureBoard)

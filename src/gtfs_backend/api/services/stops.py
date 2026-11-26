@@ -11,7 +11,6 @@ from gtfs_backend.api.errors import NotFound
 from gtfs_backend.api.schemas import (
     Direction,
     RouteRef,
-    Search,
     SearchResult,
     Stop,
     StopGroupInfo,
@@ -19,7 +18,6 @@ from gtfs_backend.api.schemas import (
     StopRef,
 )
 from gtfs_backend.keys import split_feed
-from gtfs_backend.trigram import unaccent_lower
 
 MIN_DIRECTION_SHARE = 0.05  # rarer directions are short turns, depot runs etc.
 MAX_RESULTS = 3000  # stops per map request
@@ -118,28 +116,6 @@ def in_bbox_json(ctx: Context, bbox: Bbox, modes: set[str], kind: str) -> bytes:
     found = ctx.catalog.stops.in_bbox_json(bbox, modes, kind, MAX_RESULTS + 1)
     truncated = b"true" if len(found) > MAX_RESULTS else b"false"
     return b'{"truncated":' + truncated + b',"stops":[' + b",".join(found[:MAX_RESULTS]) + b"]}"
-
-
-def search_routes(ctx: Context, query: str, limit: int) -> list[RouteRef]:
-    """Routes of today's timetables by name, accents and case ignored: the exact name first, then names starting
-    with the query, each in route order (mode, then numerically)."""
-    q = unaccent_lower(query.strip())
-    if not q:
-        return []
-    exact, prefix = [], []
-    for info in ctx.catalog.today_routes:
-        name = unaccent_lower(info.name)
-        if name == q:
-            exact.append(info.ref())
-        elif name.startswith(q):
-            prefix.append(info.ref())
-    return (sorted(exact, key=route_sort_key) + sorted(prefix, key=route_sort_key))[:limit]
-
-
-async def search_all(ctx: Context, query: str, limit: int) -> Search:
-    """GET /search: stop groups (as /stops/search) and routes the query names."""
-    stops = await search(ctx, query, limit)
-    return Search(query=query, stops=stops.results, routes=search_routes(ctx, query, limit))
 
 
 async def search(ctx: Context, query: str, limit: int) -> SearchResult:

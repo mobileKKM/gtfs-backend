@@ -213,7 +213,6 @@ of the request, so their ETag only changes with the data.
 | `GET /vehicles/{vehicle_key}/trip` | live state of the vehicle's current trip, as `/trips/{key}/live` (polling follows it onto the next: fetch `/trips/{key}` again when `key` changes) |
 | `GET /stops?bbox=…[&kind=group][&modes=…]` | stops (`kind=stop`, default) with `group_key` and `platform_code`, or stop groups (`kind=group`, for far zoom); only some modes, e.g. `kind=group&modes=rail` for train stations (≤ 3000, `truncated`) |
 | `GET /stops/search?q=…` | stop groups by name (accent/case-insensitive; only `search_namespaces`, `ztp`) with their `stops` and directions; `limit` default 10. In memory, ranked as pg_trgm (prefix, substring, `word_similarity`, `similarity`, name: `gtfs_backend/trigram.py`, checked against the database) |
-| `GET /search?q=…` | everything a query names: `stops` (as `/stops/search`) and `routes` of today's timetables by name (`52`, `N1`: the exact name first, then names starting with it) |
 | `GET /stops/{stop_key}/departures[?time=…][&feeds=…][&routes=…][&limit=20]` | timetable + realtime from `time` (epoch, default now) on, filtered by feed ids and route names; `vehicle_key` to follow; alerts as refs |
 | `GET /trips/{trip_key}` | what doesn't change while the trip runs: route, shape polyline, every stop with place and scheduled times (`Cache-Control` like stops) |
 | `GET /trips/{trip_key}/live` | to poll: every stop's predictions and `status` (match to the trip's `stops` by `stop_sequence`), the trip's status, live vehicle, alerts as refs |

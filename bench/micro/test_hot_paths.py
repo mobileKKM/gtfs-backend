@@ -19,10 +19,8 @@ import pytest
 
 from gtfs_backend import keys, live_layout
 from gtfs_backend.api.cache import _etag
-from gtfs_backend.api.data.realtime import BoardRealtime
 from gtfs_backend.api.schemas import RouteRef, VehicleList
 from gtfs_backend.api.services import departures, vehicles
-from gtfs_backend.worker.realtime.store import _departure_index
 
 FEEDS = ["kmk_a", "kmk_m", "kmk_t", "km_mld", "km_kolej"]
 TRIPS_PER_FEED = 300
@@ -132,6 +130,7 @@ def _live_trips(rng) -> dict[str, dict[str, live_layout.LiveTrip]]:
                 "version": 3,
                 "vehicle_id": f"v{t}",
                 "timestamp": NOW - 5,
+                "delay_s": delay,
                 "schedule_relationship": "SCHEDULED",
                 "stops": stops,
             }
@@ -144,32 +143,41 @@ def live_trips(rng):
     return _live_trips(rng)
 
 
-def test_worker_departure_index_of_a_big_feed(benchmark, live_trips):
-    """The rt:tripstate and rt:stop:* contents the worker builds on every trip-updates poll (one feed, 300 trips)."""
-    assert benchmark(_departure_index, live_trips["kmk_a"])
+def test_worker_trip_states_and_changes_of_a_big_feed(benchmark, live_trips):
+    """What the worker builds every trip-updates poll besides rt:trip: rt:tripstate and the compact trips of the change
+    message (one feed, 300 trips x 25 stops)."""
+    import orjson
+
+    from gtfs_backend.worker.realtime.store import _trip_states
+
+    def build():
+        states = _trip_states(live_trips["kmk_a"])
+        encoded = {key: orjson.dumps(live_layout.compact_trip(t)) for key, t in live_trips["kmk_a"].items()}
+        return states, encoded
+
+    assert benchmark(build)
 
 
 @pytest.fixture(scope="module")
-def board_redis(live_trips):
-    """What a board of 8 poles reads in its one pipeline: every feed's rt:tripstate, and each (feed, pole) rt:stop."""
-    states, stop_fields = {}, {}
-    for feed, trips in live_trips.items():
-        s, fields = _departure_index(trips)
-        states[feed] = s
-        stop_fields[feed] = fields
-    stops = [stop_fields[f].get(p, {}) for f in FEEDS for p in POLES]
-    return states, stops
+def live_state(live_trips):
+    """The API's live state with every feed's trips (what a board reads its realtime from)."""
+    from gtfs_backend.api.data.live import LiveState
+
+    live = LiveState(redis=None, feed_ids=FEEDS, kinds={})
+    for trips in live_trips.values():
+        for key, trip in trips.items():
+            live._set_trip(key, live_layout.compact_trip(trip))
+    return live
 
 
-def test_board_realtime_decode(benchmark, board_redis, live_trips):
-    """Decoding a board's realtime: the states of 60 shown trips, and the scan for trips running early."""
-    states, stops = board_redis
+def test_board_realtime_decode(benchmark, live_state, live_trips):
+    """A board's realtime from the live state: the states of 60 shown trips, and the scan for trips running early."""
     shown = [k for feed in FEEDS for k in list(live_trips[feed])[:12]]
 
     def decode():
-        rt = BoardRealtime(states, stops)
-        rt.states(shown)
-        return rt.earliest_early(NOW + 1800, NOW - 30)
+        board = live_state.board(FEEDS, POLES, {})
+        board.states(shown)
+        return board.earliest_early(NOW + 1800, NOW - 30)
 
     benchmark(decode)
 

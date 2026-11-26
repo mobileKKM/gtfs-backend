@@ -54,8 +54,9 @@ async def models(ctx: Context, raws: list[dict]) -> list[Vehicle]:
 
 
 async def by_ids(ctx: Context, ids: list[str]) -> list[Vehicle]:
-    """Vehicles by key; expired ones and positions older than their feed's realtime max age are skipped."""
-    return await models(ctx, fresh(ctx, await realtime.vehicle_json(ctx.redis, ids)))
+    """Vehicles by key; gone ones and positions older than their feed's realtime max age are skipped."""
+    live = ctx.live
+    return await models(ctx, fresh(ctx, [v for i in ids if (v := live.vehicle(i)) is not None]))
 
 
 def fresh(ctx: Context, raws: list[dict]) -> list[dict]:
@@ -83,10 +84,7 @@ async def _in_bbox(ctx: Context, bbox: Bbox, modes: set[str], route_names: set[s
     width, height = bbox.size_km()
     if max(width, height) > MAX_BBOX_KM:
         raise InvalidInput(f"bbox is larger than {MAX_BBOX_KM:g} km")
-    center = bbox.center
-    # GEOSEARCH boxes are approximate: search a little wider, then cut exactly
-    ids = await realtime.vehicles_near(ctx.redis, center.lat, center.lon, width * 1.02 + 0.01, height * 1.02 + 0.01)
-    values = await realtime.vehicle_values(ctx.redis, sorted(ids))
+    values = ctx.live.vehicle_values(bbox)  # the grid cells the box touches: cut exactly below
     pieces = await ctx.memo.setdefault("vehicles", VehiclePieces()).get(ctx, values)
     since = ctx.fresh_since()
     return [

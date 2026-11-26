@@ -1,5 +1,5 @@
 """Departure boards: the timetable from the snapshot (api/data/timetable.py; Postgres' core.stop_departure for days it
-doesn't have) with realtime predictions from Redis (rt:tripstate, rt:stop:*: only the board's stops) laid over it.
+doesn't have) with the realtime predictions at the board's stops from the process's live state (api/data/live.py).
 
 The timetable query covers every authoritative service day that can run in the window (a night trip of
 yesterday's service can still be running) and reaches back LOOKBACK_S so delayed trips stay on the board until
@@ -219,11 +219,12 @@ def select(rows: list[Row], now: int, limit: int, start: int, end: int, live: bo
 
 
 async def _vehicles(ctx: Context, found: list[Scheduled], states: dict[str, TripState]) -> dict[str, dict]:
-    """trip_key -> JSON of the vehicle running it, for the trips whose realtime names one (one Redis call)."""
+    """trip_key -> the vehicle running it, for the trips whose realtime names one."""
     wanted = {
         s.trip_key: keys.vehicle_key(s.feed_id, u.vehicle_id) for s in found if (u := states.get(s.trip_key)) and u.vehicle_id
     }
-    raws = await realtime.vehicle_json(ctx.redis, sorted(set(wanted.values())))
+    live = ctx.live
+    raws = [v for k in sorted(set(wanted.values())) if (v := live.vehicle(k)) is not None]
     since = ctx.fresh_since()
     by_key = {
         keys.vehicle_key(v["feed_id"], v["vehicle_id"]): v for v in raws if ctx.fresh(v["feed_id"], v.get("timestamp"), since)
@@ -249,7 +250,7 @@ async def _page(
     page: list[Row] = []
     fetched_to: int | None = None  # departures are read up to here (from lo - LOOKBACK_S)
     board_feeds = [f for f in ctx.feed_ids if not feeds or f in feeds]
-    live_data = await realtime.BoardRealtime.read(ctx.redis, board_feeds, pids, ctx.fresh_since())
+    live_data = ctx.live.board(board_feeds, pids, ctx.fresh_since())
     first_span = expected_span(ctx.catalog.stops.hourly(pids), _second_of_day(ctx.catalog, start), limit)
     for span in [first_span, *(w for w in WINDOWS_S if w > first_span)]:
         hi = start + span
@@ -263,7 +264,7 @@ async def _page(
         refs |= await ctx.catalog.route_refs({(f.feed_version_id, f.route_id) for f in found})
         if route_names:
             found = [f for f in found if (ref := refs.get((f.feed_version_id, f.route_id))) and ref.name in route_names]
-        # only what these stops need of each trip (rt:stop:*), not whole trips
+        # only what these stops need of each trip, not whole trips
         states = live_data.states({f.trip_key for f in found})
         # the feed deleted the trip (GTFS-RT DELETED, unlike CANCELED): not shown at all
         found = [f for f in found if not ((st := states.get(f.trip_key)) and st.deleted and st.version == f.version)]

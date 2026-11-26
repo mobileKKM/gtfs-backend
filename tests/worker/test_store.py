@@ -23,6 +23,7 @@ def trip(key, *stops, version=1, vehicle="V1", relationship="SCHEDULED"):
         "version": version,
         "vehicle_id": vehicle,
         "timestamp": 1000,
+        "delay_s": 60,
         "schedule_relationship": relationship,
         "stops": [
             {
@@ -40,13 +41,9 @@ def trip(key, *stops, version=1, vehicle="V1", relationship="SCHEDULED"):
     }
 
 
-async def departure_index(r, feed_id):
-    """rt:tripstate and rt:stop:* of a feed, decoded."""
-    states = {k: json.loads(v) for k, v in (await r.hgetall(f"rt:tripstate:{feed_id}")).items()}
-    stops = {}
-    for key in sorted(await r.keys(f"rt:stop:{feed_id}:*")):
-        stops[key.rsplit(":", 1)[1]] = {f: json.loads(v) for f, v in (await r.hgetall(key)).items()}
-    return states, stops
+async def trip_states(r, feed_id):
+    """rt:tripstate of a feed, decoded."""
+    return {k: json.loads(v) for k, v in (await r.hgetall(f"rt:tripstate:{feed_id}")).items()}
 
 
 async def test_vehicles_replace_per_feed_and_unmatched_never_reach_the_map(redis_url):
@@ -87,82 +84,76 @@ async def test_trips_mirror_the_latest_update(redis_url):
     assert sorted(await r.keys("rt:trip:*")) == ["rt:trip:kmk_a:a:20261025", "rt:trip:kmk_t:a:20261025"]
     stops = json.loads(await r.get("rt:trip:kmk_t:a:20261025"))["stops"]
     assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3)]
-    # the departure index: every trip's state, and at each stop its trips' rows (the dropped stop pa included)
-    assert await departure_index(r, "kmk_t") == (
-        {"kmk_t:a:20261025": [1, False, "V1", 1000, False]},
-        {
-            "pa": {"1|kmk_t:a:20261025": [None, 1, 60, False, 1, -59, False]},
-            "pb": {"2|kmk_t:a:20261025": [None, 3, 60, False, 1, -57, True]},
-        },
-    )
-    assert (await departure_index(r, "kmk_a"))[1] == {"pc": {"1|kmk_a:a:20261025": [None, 1, 60, False, 1, -59, False]}}
+    assert await trip_states(r, "kmk_t") == {"kmk_t:a:20261025": [1, False, "V1", 1000, False]}
+    assert await r.keys("rt:stop:*") == []  # nothing reads per-stop hashes any more: the API keeps trips in memory
     await r.aclose()
 
 
-async def test_the_departure_index_follows_the_trips(redis_url):
+async def test_trip_states_and_changes_follow_the_trips(redis_url):
     r = Redis.from_url(redis_url, decode_responses=True)
     store = RealtimeStore(r, ["kmk_t"], TTLS)
     a, b = "kmk_t:20261025:a", "kmk_t:20261025:b"
-    await store.write_trips("kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 20)), trip(b, (1, "pb", 30))]))
+    changes = await store.write_trips("kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 20)), trip(b, (1, "pb", 30))]))
+    assert sorted(changes["set"]) == [a, b] and changes["del"] == []
+    assert changes["set"][a] == [
+        1,
+        False,
+        "V1",
+        1000,
+        False,
+        60,
+        [[1, "pa", None, 10, 60, False, -50, False], [2, "pb", None, 20, 60, False, -40, True]],
+    ]
     # a's time at pb changed; b canceled, and the feed dropped its stop (kept with its last time, as in rt:trip)
-    await store.write_trips("kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 25)), trip(b, relationship="CANCELED")]))
-    states, stops = await departure_index(r, "kmk_t")
-    assert states == {a: [1, False, "V1", 1000, False], b: [1, True, "V1", 1000, False]}
-    assert stops == {
-        "pa": {f"1|{a}": [None, 10, 60, False, 1, -50, False]},
-        "pb": {f"2|{a}": [None, 25, 60, False, 1, -35, True], f"1|{b}": [None, 30, 60, False, 1, -30, False]},
-    }
-    # b left the feed; a new version of a: a whole new set of rows
-    await store.write_trips("kmk_t", Result(trips=[trip(a, (5, "pc", 50), version=2)]))
-    assert await departure_index(r, "kmk_t") == (
-        {a: [2, False, "V1", 1000, False]},
-        {"pc": {f"5|{a}": [None, 50, 60, False, 2, -10, True]}},
+    changes = await store.write_trips(
+        "kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 25)), trip(b, relationship="CANCELED")])
     )
+    assert await trip_states(r, "kmk_t") == {a: [1, False, "V1", 1000, False], b: [1, True, "V1", 1000, False]}
+    assert sorted(changes["set"]) == [a, b] and changes["set"][b][1] is True and changes["set"][b][6][0][3] == 30
+    # nothing changed: nothing to say
+    same = await store.write_trips(
+        "kmk_t", Result(trips=[trip(a, (1, "pa", 10), (2, "pb", 25)), trip(b, relationship="CANCELED")])
+    )
+    assert same == {"set": {}, "del": []}
+    # b left the feed
+    changes = await store.write_trips("kmk_t", Result(trips=[trip(a, (5, "pc", 50), version=2)]))
+    assert list(changes["set"]) == [a] and changes["del"] == [b]
+    assert await trip_states(r, "kmk_t") == {a: [2, False, "V1", 1000, False]}
     await store.write_trips("kmk_t", Result())  # nothing running
-    assert await departure_index(r, "kmk_t") == ({}, {})
+    assert await trip_states(r, "kmk_t") == {}
     await r.aclose()
 
 
-async def test_the_departure_index_is_rewritten_after_a_restart(redis_url):
+async def test_per_stop_hashes_of_older_workers_are_removed(redis_url):
     r = Redis.from_url(redis_url, decode_responses=True)
-    before = RealtimeStore(r, ["kmk_t"], TTLS)
-    gone, on = trip("kmk_t:20261025:gone", (1, "pa", 1)), trip("kmk_t:20261025:on", (1, "pb", 2))
-    await before.write_trips("kmk_t", Result(trips=[gone, on]))
+    await r.hset("rt:stop:kmk_t:pa", "1|kmk_t:20261025:x", "[null,1,0,false]")  # what an older worker wrote
     await r.hset("rt:stop:kmk_a:pa", "1|kmk_a:20261025:x", "[null,1,0,false]")  # another feed's
-
-    after = RealtimeStore(r, ["kmk_t"], TTLS)  # restarted: it doesn't know what it wrote
-    await after.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:on", (1, "pb", 3))]))
-    assert await departure_index(r, "kmk_t") == (
-        {"kmk_t:20261025:on": [1, False, "V1", 1000, False]},
-        {"pb": {"1|kmk_t:20261025:on": [None, 3, 60, False, 1, -57, False]}},
-    )
+    store = RealtimeStore(r, ["kmk_t"], TTLS)
+    await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:on", (1, "pb", 3))]))
+    assert await r.exists("rt:stop:kmk_t:pa") == 0
     assert await r.exists("rt:stop:kmk_a:pa") == 1  # other feeds are theirs to clean
     await r.aclose()
 
 
-async def test_the_departure_index_comes_back_when_redis_lost_it(redis_url, monkeypatch):
+async def test_trip_states_come_back_when_redis_lost_them(redis_url, monkeypatch):
     """rt:tripstate expires in an outage (or with a file older than its TTL), and Redis can lose everything: the next
-    update writes the index again, unchanged trips (a canceled one) included."""
+    update writes it again, unchanged trips (a canceled one) included."""
     r = Redis.from_url(redis_url, decode_responses=True)
     store = RealtimeStore(r, ["kmk_t"], TTLS)
     update = Result(trips=[trip("kmk_t:20261025:a", (1, "pa", 1)), trip("kmk_t:20261025:c", relationship="CANCELED")])
     await store.write_trips("kmk_t", update)
-    written = await departure_index(r, "kmk_t")
-    assert written[0]["kmk_t:20261025:c"] == [1, True, "V1", 1000, False]
+    written = await trip_states(r, "kmk_t")
+    assert written["kmk_t:20261025:c"] == [1, True, "V1", 1000, False]
 
     await r.delete("rt:tripstate:kmk_t")  # expired
     await store.write_trips("kmk_t", update)
-    assert await departure_index(r, "kmk_t") == written
-
-    await r.delete("rt:tripstate:kmk_t", *await r.keys("rt:stop:kmk_t:*"))  # Redis restarted without its data
-    await store.write_trips("kmk_t", update)
-    assert await departure_index(r, "kmk_t") == written
+    assert await trip_states(r, "kmk_t") == written
 
     # expired right after the check: the states are written in full anyway
     await r.delete("rt:tripstate:kmk_t")
     monkeypatch.setattr(r, "exists", lambda *keys: _one())
     await store.write_trips("kmk_t", update)
-    assert await departure_index(r, "kmk_t") == written
+    assert await trip_states(r, "kmk_t") == written
     await r.aclose()
 
 
@@ -188,7 +179,7 @@ async def test_touch_refreshes_the_ttls_of_the_last_update(redis_url):
     await r.expire("rt:tripstate:km_kolej", 5)
     await store.touch("km_kolej", RealtimeKind.COMBINED)
     assert (await r.ttl(keys[3]), await r.ttl(keys[4])) == (200, 300)
-    assert await r.ttl("rt:tripstate:km_kolej") == 200  # boards ignore predictions of trips without a state
+    assert await r.ttl("rt:tripstate:km_kolej") == 200  # what the API loads a feed's trips by
     await r.aclose()
 
 
@@ -245,9 +236,29 @@ async def test_a_failed_trip_write_is_merged_again_from_the_last_written_one(red
     await store.write_trips("kmk_t", Result(trips=[trip("kmk_t:20261025:a", (2, "pb", 3))]))
     stops = json.loads(await r.get("rt:trip:kmk_t:20261025:a"))["stops"]
     assert [(s["public_stop_id"], s["predicted_departure"]) for s in stops] == [("pa", 1), ("pb", 3)]
-    # the index too, although the failed write may have changed part of it
-    assert (await departure_index(r, "kmk_t"))[1] == {
-        "pa": {"1|kmk_t:20261025:a": [None, 1, 60, False, 1, -59, False]},
-        "pb": {"2|kmk_t:20261025:a": [None, 3, 60, False, 1, -57, True]},
-    }
+    assert await trip_states(r, "kmk_t") == {"kmk_t:20261025:a": [1, False, "V1", 1000, False]}
+    await r.aclose()
+
+
+async def test_vehicle_changes_and_published_messages(redis_url):
+    r = Redis.from_url(redis_url, decode_responses=True)
+    store = RealtimeStore(r, ["kmk_t"], TTLS)
+    first = await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735"), vehicle("302")]))
+    assert sorted(first["set"]) == ["kmk_t:302", "kmk_t:735"] and first["del"] == []
+    moved = await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735", lon=19.97)]))
+    assert list(moved["set"]) == ["kmk_t:735"] and moved["del"] == ["kmk_t:302"]
+    assert await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735", lon=19.97)])) == {"set": {}, "del": []}
+
+    async with r.pubsub() as ps:
+        await ps.subscribe("rt:updated")
+        await ps.get_message(timeout=1)  # the subscription
+        await store.publish("kmk_t", "vehicle_positions", 1000, {"vehicles": moved})
+        await store.publish("kmk_t", "vehicle_positions", 1005, {"vehicles": {"set": {}, "del": []}})
+        messages = [json.loads((await ps.get_message(timeout=1))["data"]) for _ in range(2)]
+    assert [(m["feed_id"], m["kind"], m["seq"], m["ts"]) for m in messages] == [
+        ("kmk_t", "vehicle_positions", 1, 1000),
+        ("kmk_t", "vehicle_positions", 2, 1005),
+    ]
+    assert messages[0]["run"] == store.run and messages[0]["vehicles"]["del"] == ["kmk_t:302"]
+    assert await r.get("rt:seq:kmk_t:vehicle_positions") == f"{store.run}:2"
     await r.aclose()

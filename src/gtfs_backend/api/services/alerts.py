@@ -11,7 +11,6 @@ from dataclasses import dataclass
 
 from gtfs_backend import keys
 from gtfs_backend.api.context import Context
-from gtfs_backend.api.data import realtime
 from gtfs_backend.api.errors import InvalidInput, NotFound
 from gtfs_backend.api.schemas import Alert, AlertEntity, AlertList, AlertRef
 from gtfs_backend.api.services import stops
@@ -150,7 +149,7 @@ async def in_scope(ctx: Context, scope: Scope, raws: list[dict] | None = None) -
     """The current alerts (active now or soon) that apply to what is being looked at, as boards and trips carry them.
     `raws`: all feeds' alerts, if already read from Redis."""
     if raws is None:
-        raws = await realtime.alerts_json(ctx.redis, ctx.feed_ids)
+        raws = ctx.live.alerts_of(ctx.feed_ids)
     raws = current(ctx, raws)
     return [ref(a) for a in sorted(raws, key=_order) if matches(a, scope)]
 
@@ -169,7 +168,7 @@ async def search(ctx: Context, feed: str | None, route_key: str | None, stop_key
         feed = route_feed
     if feed is not None and feed not in ctx.feed_ids:
         raise NotFound("feed")
-    raws = await realtime.alerts_json(ctx.redis, [feed] if feed else ctx.feed_ids)
+    raws = ctx.live.alerts_of([feed] if feed else ctx.feed_ids)
     if active:
         raws = current(ctx, raws)
     if route_id is not None or stop_key is not None:
@@ -189,7 +188,7 @@ async def get(ctx: Context, alert_key: str) -> Alert:
     feed_id, alert_id = keys.split_feed(alert_key, "alert key")
     if feed_id not in ctx.feed_ids:
         raise NotFound("alert")
-    raw = next((a for a in await realtime.alerts_json(ctx.redis, [feed_id]) if a["id"] == alert_id), None)
+    raw = next((a for a in ctx.live.alerts_of([feed_id]) if a["id"] == alert_id), None)
     if raw is None:
         raise NotFound("alert")
     return (await to_models(ctx, [raw]))[0]

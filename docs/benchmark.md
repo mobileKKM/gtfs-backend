@@ -22,9 +22,10 @@ uv run pytest bench/micro --benchmark-compare      # against the last saved run
 | benchmark | what |
 |---|---|
 | `vehicles_city_wide_response` | `/vehicles` after its MGET: 1,000 vehicles decoded, built, serialized, hashed, gzipped |
-| `board_realtime_decode` | a board's realtime: the states of 60 shown trips, and the scan for trips running early (a busy group of 8 poles, ~300 trips) |
+| `board_realtime_decode` | a board's realtime from the live state: the states of 60 shown trips, and the scan for trips running early (a busy group of 8 poles, ~300 trips) |
 | `board_overlay_and_select` | realtime laid over 600 timetable rows, page of 20 picked |
-| `worker_departure_index_of_a_big_feed` | the `rt:tripstate` / `rt:stop:*` contents the worker builds every trip-updates poll (300 trips x 25 stops) |
+| `worker_trip_states_and_changes_of_a_big_feed` | what the worker builds every trip-updates poll besides `rt:trip`: `rt:tripstate` and the change message's compact trips (300 trips x 25 stops) |
+| `vehicles_city_wide_response_from_pieces` | `/vehicles` since phase 3: kept per-vehicle JSON filtered and joined, hashed, gzipped |
 | `board_rows_from_the_snapshot` | a board's timetable rows (8 poles, 90 min) from a 1.35 M-row snapshot: what was a Postgres query |
 | `stop_search[...]` | stop search in memory over the fixtures' stop names |
 

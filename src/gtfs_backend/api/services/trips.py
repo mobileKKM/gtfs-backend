@@ -6,8 +6,6 @@ The timetable part comes from the snapshot (api/data/timetable.py) for the days 
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable
 from datetime import date
 
 from gtfs_backend import keys
@@ -79,15 +77,6 @@ async def _row(ctx: Context, sql: str, params: dict) -> tuple:
     if row is None:
         raise NotFound("trip")
     return row
-
-
-async def _both[A, B](first: Awaitable[A], second: Awaitable[B]) -> tuple[A, B]:
-    """Both at once; the first one's error wins (a missing trip is a 404 even while Redis is down)."""
-    a, b = await asyncio.gather(first, second, return_exceptions=True)
-    for result in (a, b):
-        if isinstance(result, BaseException):
-            raise result
-    return a, b
 
 
 def _stop(row, day: Day) -> TripStop:
@@ -208,17 +197,17 @@ async def live(ctx: Context, feed_id: str, service_date: date, trip_id: str, veh
     params = {"fv": day.feed_version_id, "trip": trip_id, "date": service_date}
     key = keys.trip_key(feed_id, service_date, trip_id)
     static = _static(ctx, day, trip_id)
+    live_state = ctx.live
     if static is not NOT_COVERED:
         route_id, direction_id = static.route_id, static.direction_id
         seqs, pids = [st[0] for st in static.stops], [st[4] for st in static.stops]
-        raw, alert_raws = await realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
     else:
-        # independent: the timetable from Postgres, the trip update and alerts from Redis (one call)
-        (route_id, direction_id, seqs, pids), (raw, alert_raws) = await _both(
-            _row(ctx, LIVE_SQL, params), realtime.trip_and_alerts(ctx.redis, key, ctx.feed_ids)
-        )
+        route_id, direction_id, seqs, pids = await _row(ctx, LIVE_SQL, params)
+    alert_raws = live_state.alerts_of(ctx.feed_ids)
     rows = list(zip(seqs or [], pids or [], strict=True))
-    update = TripUpdate.for_version(raw, day.version)
+    update = live_state.trip_update(key)
+    if update is not None and update.version != day.version:
+        update = None  # computed for another timetable version: stop sequences differ
     if update is not None and not ctx.fresh(feed_id, update.timestamp):
         update = None  # measured too long ago: the worker or the feed stopped
     stops = [_live_stop(r, update) for r in rows]
@@ -263,7 +252,7 @@ async def live_by_key(ctx: Context, trip_key: str) -> TripLive:
 async def for_vehicle(ctx: Context, vehicle_key: str) -> TripLive:
     """The live state of the trip the vehicle runs now; its `key` changes when the vehicle starts its next trip."""
     feed_id, _ = keys.split_feed(vehicle_key, "vehicle key")
-    raws = vehicles.fresh(ctx, await realtime.vehicle_json(ctx.redis, [vehicle_key]))
+    raws = vehicles.fresh(ctx, [v] if (v := ctx.live.vehicle(vehicle_key)) is not None else [])
     if not raws:
         raise NotFound("vehicle")
     (vehicle,) = await vehicles.models(ctx, raws)

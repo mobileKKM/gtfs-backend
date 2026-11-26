@@ -24,8 +24,9 @@ class FakeStore:
     async def write_meta(self, feed_id, kind, meta):
         self.meta = dict(meta)
 
-    async def publish(self, feed_id, kind, ts):
+    async def publish(self, feed_id, kind, ts, changes=None):
         self.published += 1
+        self.changes = changes
 
     async def touch(self, feed_id, kind):
         self.touched += 1

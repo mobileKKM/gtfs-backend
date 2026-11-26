@@ -114,10 +114,15 @@ Static imports are CPU-heavy and run in a separate process.
     by position alone).
     Details: [docs/stop-matching.md](docs/stop-matching.md).
 
-### Live data (Redis)
+### Live data (Redis, and each API process's memory)
 
-Redis mirrors only the latest realtime updates plus poll stats; departures combine the Postgres timetable with
-`rt:trip:*`. The layout lives in `gtfs_backend/live_layout.py` (worker writes, API reads).
+Redis holds only the latest realtime updates plus poll stats. After every write the worker publishes what changed
+(`rt:updated`: changed vehicles and trips, the feed's alerts, numbered per file); each API process loads every feed
+from Redis when it starts and then follows those messages, keeping vehicles (in a grid for box queries), trips with
+their per-stop predictions (indexed by stop) and alerts in memory (`api/data/live.py`). Requests read that, not Redis:
+`/vehicles`, boards, trips and alerts make no Redis call. A message missed (its number jumps) or from another worker
+run loads that feed from Redis again; a lost subscription loads all. While the worker or Redis is down the last data
+stays, hidden once older than the feed's max age. The layout lives in `gtfs_backend/live_layout.py`.
 
 | key | content |
 |---|---|
@@ -125,11 +130,12 @@ Redis mirrors only the latest realtime updates plus poll stats; departures combi
 | `rt:veh:{feed_id}:{vehicle_id}` | vehicle JSON: trip, route, headsign, delay, stop; removed when the vehicle leaves the feed (TTL `VEHICLE_TTL` 120 s, refreshed while the file is unchanged, up to `realtime_max_age`) |
 | `rt:trip:{feed_id}:{YYYYMMDD}:{trip_id}` | per-stop scheduled/predicted times and delays plus the `version`; stops the feed dropped stay with their last known times; removed when the trip leaves the feed |
 | `rt:tripstate:{feed_id}` | hash: trip key → `[version, canceled, vehicle_id, timestamp, deleted]` of every trip in `rt:trip` (TTL `TRIP_TTL`) |
-| `rt:stop:{feed_id}:{public_stop_id}` | hash: `{stop_sequence}\|{trip key}` → `[predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure, propagated]`: the trips' rows of `rt:trip` at this stop, so a board reads its stops, not whole trips. Written with `rt:trip` (only changed fields); only valid for trips in `rt:tripstate` with the same version; rewritten in full when the worker starts or finds `rt:tripstate` gone |
 | `rt:alerts:{feed_id}` | service alerts, informed entities resolved to ours (trip key, public stop ids, station → stop group) |
 | `rt:meta:{feed_id}:{kind}` | poll stats after every poll: `ok`/`last_error`, `last_poll`/`last_change`, `age_s`, timings, counts, unmatched, route mismatches, `median_delay_s`, `trip_relationships`/`stop_relationships` (GTFS-RT `schedule_relationship` counts: `CANCELED`, `NEW`, `DUPLICATED`, `SKIPPED`, `NO_DATA`, ...), `block_late_next` (trips predicted at their last stop after the next trip of their block is due) and `block_late_next_without_update` (of those, next trips without an update of their own) |
 | `rt:unmatched:{feed_id}:{kind}` | unmatched ids (trips, vehicles, alert entities), for debugging |
-| pub/sub `rt:updated`, `static:updated` | change notifications |
+| `rt:seq:{feed_id}:{kind}` | `{run}:{seq}` of the file's last change message: what an API process loading from Redis already has |
+| pub/sub `rt:updated` | what each write changed (`LiveChanges`: `run`, `seq`, `vehicles` `{set, del}`, `trips` `{set, del}` as compact trips, `alerts`) |
+| pub/sub `static:updated`, `snapshot:updated` | a new timetable version (and its snapshot) / a new day's snapshot |
 | `metrics:{epoch minute}` | latency (API, per route template) and data age (worker, per realtime file) histograms of all processes, for `/metrics` (`gtfs_backend/metrics.py`, kept 2 h) |
 
 Rules:
@@ -238,8 +244,7 @@ Notes:
   Route colors are not passed on (often unset or wrong).
 - **Departure boards** cover every authoritative service day that can run in the window and reach back an hour so
   delayed departures stay. The timetable comes from the snapshot (`core.stop_departure` for days it lacks), realtime
-  from `rt:tripstate` and the
-  board's `rt:stop:*` hashes (one pipelined call). Predictions are used only for the same version. `status` says
+  from the live state's predictions at the board's stops. Predictions are used only for the same version. `status` says
   where the time comes from: `scheduled` (timetable; also where the feed says `NO_DATA`), `live` (the feed's
   prediction for this stop), `predicted` (a delay the feed gave for an earlier stop, carried over), `canceled`,
   `skipped`; `time` is the estimate if known. Trip views' stops (`/live`) carry the same `status`. `departed: true`
@@ -249,10 +254,10 @@ Notes:
 - **Paging**: a board starts at `time` (epoch seconds, default now: departed ones are left out; with a time they
   come with `departed: true`). Page forward by passing the last departure's `time`; departures in that second can repeat
   (tell them apart by `trip_key` + `stop_sequence`). The first window is where the stop's hourly departures
-  (today's timetables, counted once a day) expect 1.5 pages, so a board needs one query; if that isn't enough
+  (today's timetables, counted once a day) expect 1.5 pages, so a board needs one read; if that isn't enough
   (filters, another day's timetable) it widens through 2 h, 6 h and 24 h, each step reading only the time it adds. A
   page is full unless a trip scheduled past the window is predicted before its last departure (feeds allow any
-  amount early; the board finds such trips in its stops' `rt:stop:*` hashes).
+  amount early; the board finds such trips among its stops' predictions).
 - **Filters**: `feeds` (feed ids) and `routes` (route names, `RouteRef.name`), comma separated or repeated; they
   narrow the board and its alerts, and an unknown feed is a 422. The board lists `routes`, every route departing from
   the stop in today's timetables on any day (weekend-only ones too), so clients know what to filter by. Feeds publish

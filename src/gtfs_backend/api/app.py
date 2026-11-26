@@ -15,6 +15,7 @@ from gtfs_backend import live_layout, metrics
 from gtfs_backend.api import errors
 from gtfs_backend.api.context import Context
 from gtfs_backend.api.data.catalog import Catalog, Clock
+from gtfs_backend.api.data.live import LiveState
 from gtfs_backend.api.metrics import RequestMetricsMiddleware
 from gtfs_backend.api.routers import alerts, health, routes, stops, trips, vehicles
 from gtfs_backend.api.routers import metrics as metrics_router
@@ -25,6 +26,7 @@ from gtfs_backend.feeds import FeedsFile, load_feeds
 from gtfs_backend.logs import log, setup_logging
 
 GZIP_LEVEL = 6
+LIVE_WARMUP_S = 10  # how long the start waits for the live data's first load
 
 
 async def _listen_static_updates(redis: Redis, catalog: Catalog, retry_delay: float) -> None:
@@ -99,7 +101,15 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
             await catalog.ensure_fresh()
         except Exception as exc:  # noqa: BLE001
             log.warning("catalog_warmup_failed", error=str(exc))
-        app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings)
+        live = LiveState(
+            redis,
+            [f.feed_id for f in feeds_file.enabled],
+            {f.feed_id: [k.value for k, _ in f.realtime.items()] for f in feeds_file.enabled},
+        )
+        live.start()
+        if not await live.wait_ready(LIVE_WARMUP_S):  # requests before the first load get 503s
+            log.warning("live_warmup_failed")
+        app.state.ctx = Context(pool, redis, feeds_file, catalog, clock, settings, live)
         listener = asyncio.create_task(_listen_static_updates(redis, catalog, settings.static_listener_retry_delay))
         # a context of its own: flushing is no request's work (api/timing.py)
         flusher = asyncio.create_task(recorder.run(redis), context=contextvars.Context())
@@ -110,6 +120,7 @@ def create_app(settings: ApiSettings | None = None, *, feeds: FeedsFile | None =
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            await live.close()
             await catalog.close()
             await redis.aclose()
             await pool.close()

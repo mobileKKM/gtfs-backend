@@ -3,7 +3,8 @@
 from datetime import date
 
 from gtfs_backend import keys
-from gtfs_backend.api.data.realtime import BoardRealtime, TripUpdate
+from gtfs_backend.api.data.live import LiveState
+from gtfs_backend.api.data.realtime import TripUpdate
 from gtfs_backend.api.services.departures import (
     GRACE_S,
     WINDOWS_S,
@@ -206,75 +207,69 @@ def test_expected_span_without_departures_reads_a_day():
     assert expected_span(few, 0, 20) == WINDOWS_S[-1]  # 24 a day: 30 aren't expected within it
 
 
-def test_board_realtime_ignores_predictions_of_another_version():
-    """A board can read a trip's state and its predictions from different updates (neither write nor read is atomic):
-    after a timetable change, predictions of the old version have other stop sequences."""
+def live_with(*trips) -> LiveState:
+    """A live state holding (trip key, CompactTrip) pairs, no Redis."""
+    live = LiveState(redis=None, feed_ids=["kmk_t", "kmk_a"], kinds={})
+    for key, trip in trips:
+        live._set_trip(key, trip)
+    return live
+
+
+def compact(*entries, version=1, canceled=False, deleted=False, ts=1000):
+    """entries: (seq, pid, predicted_arrival, predicted_departure, delay, scheduled_departure, propagated)"""
+    stops = [[q, pid, a, d, delay, False, sched, prop] for q, pid, a, d, delay, sched, prop in entries]
+    return [version, canceled, None, ts, deleted, None, stops]
+
+
+def test_board_reads_the_predictions_at_its_stops_only():
     key = "kmk_t:20261025:a"
-    states = {"kmk_t": {key: "[2,false,null,1000]"}}
-    stops = [{f"1|{key}": "[null,50,60,false,1,-10]", f"2|{key}": "[null,60,60,false,2,0]"}]
-    state = BoardRealtime(states, stops).state(key)
-    assert state.version == 2 and state.stop(1) is None
-    assert state.stop(2).predicted == 60 and state.stop(2).delay_s == 60
+    live = live_with((key, compact((1, "p1", None, 50, 60, -10, True), (2, "p2", None, 60, 60, 0, False))))
+    state = live.board(["kmk_t"], ["p1"], {}).state(key)
+    assert state.stop(1).propagated and state.stop(1).predicted == 50
+    assert state.stop(2) is None  # not one of the board's stops
+    assert overlay(sched(seq=1, dep=-10), state, 0).status == "predicted"
+    assert overlay(sched(seq=2, dep=0), live.board(["kmk_t"], ["p2"], {}).state(key), 0).status == "live"
+    assert live.board(["kmk_a"], ["p1"], {}).state(key) is None  # another feed's board
 
 
-def test_board_realtime_finds_trips_running_early():
-    """Trips scheduled to depart after a time but predicted before the page ends: of the state's version, from
-    `since` on. By the scheduled departure, which boards read their rows by."""
-    early, other_version, last_stop = "kmk_t:20261025:early", "kmk_t:20261025:v1", "kmk_t:20261025:end"
-    states = {"kmk_t": {k: "[2,false,null,1000]" for k in (early, other_version, last_stop)}}
-    stops = [
-        {
-            f"3|{early}": "[null,1600,-1100,false,2,2700]",  # departs at 2700, 1100 s early
-            f"3|{other_version}": "[null,1500,-1200,false,1,2700]",
-            f"9|{last_stop}": "[1400,null,-1000,false,2,null]",  # no departure: never on a board
-        }
-    ]
-    rt = BoardRealtime(states, stops)
-    assert rt.earliest_early(after=1800, since=0) == 1600
-    assert rt.earliest_early(after=2700, since=0) is None  # its row is read
-    assert rt.earliest_early(after=1800, since=1700) is None  # before the board starts
+def test_board_finds_trips_running_early():
+    """Trips scheduled to depart after a time but predicted before the page ends, from `since` on. By the scheduled
+    departure, which boards read their rows by."""
+    early, last_stop = "kmk_t:20261025:early", "kmk_t:20261025:end"
+    live = live_with(
+        (early, compact((3, "p", None, 1600, -1100, 2700, False))),  # departs at 2700, 1100 s early
+        (last_stop, compact((9, "p", 1400, None, -1000, None, False))),  # no departure: never on a board
+    )
+    board = live.board(["kmk_t"], ["p"], {})
+    assert board.earliest_early(after=1800, since=0) == 1600
+    assert board.earliest_early(after=2700, since=0) is None  # its row is read
+    assert board.earliest_early(after=1800, since=1700) is None  # before the board starts
 
 
-def test_board_realtime_finds_arrival_only_predictions_by_the_scheduled_departure():
+def test_board_finds_arrival_only_predictions_by_the_scheduled_departure():
     """An arrival-only prediction's delay is against the scheduled arrival: predicted - delay_s would be the arrival
     (+29 min), inside a 30 min window, though the row is read by its departure (+31 min), outside it."""
     key = "kmk_t:20261025:dwell"
-    arrival, departure = 29 * 60, 31 * 60
-    predicted = 16 * 60
-    stops = [{f"4|{key}": f"[{predicted},null,{predicted - arrival},false,1,{departure}]"}]
-    rt = BoardRealtime({"kmk_t": {key: "[1,false,null,1000]"}}, stops)
-    assert rt.earliest_early(after=30 * 60, since=0) == predicted
+    arrival, departure, predicted = 29 * 60, 31 * 60, 16 * 60
+    live = live_with((key, compact((4, "p", predicted, None, predicted - arrival, departure, False))))
+    assert live.board(["kmk_t"], ["p"], {}).earliest_early(after=30 * 60, since=0) == predicted
 
 
-def test_board_realtime_reads_propagated_and_older_six_element_predictions():
-    key = "kmk_t:20261025:a"
-    states = {"kmk_t": {key: "[1,false,null,1000]"}}
-    stops = [
-        {
-            f"1|{key}": "[null,50,60,false,1,-10,true]",
-            f"2|{key}": "[null,60,60,false,1,0,false]",
-            f"3|{key}": "[null,70,60,false,1,10]",
-        }
-    ]
-    state = BoardRealtime(states, stops).state(key)
-    assert [state.stop(i).propagated for i in (1, 2, 3)] == [True, False, False]
-    assert overlay(sched(seq=1, dep=-10), state, 0).status == "predicted"
-    assert overlay(sched(seq=2, dep=0), state, 0).status == "live"
-
-
-def test_deleted_trip_state_reads_as_canceled_and_deleted():
-    key = "kmk_t:20261025:a"
-    rt = BoardRealtime({"kmk_t": {key: "[1,true,null,1000,true]", "kmk_t:20261025:b": "[1,true,null,1000]"}}, [])
-    a, b = rt.state(key), rt.state("kmk_t:20261025:b")
-    assert (a.canceled, a.deleted) == (True, True)
-    assert (b.canceled, b.deleted) == (True, False)  # an older worker's 4-element state
+def test_deleted_and_canceled_trips_read_as_such():
+    a, b = "kmk_t:20261025:a", "kmk_t:20261025:b"
+    live = live_with((a, compact(canceled=True, deleted=True)), (b, compact(canceled=True)))
+    board = live.board(["kmk_t"], [], {})
+    assert (board.state(a).canceled, board.state(a).deleted) == (True, True)
+    assert (board.state(b).canceled, board.state(b).deleted) == (True, False)
+    update = live.trip_update(a)
+    assert update.canceled and update.deleted
     deleted = TripUpdate({"version": 1, "schedule_relationship": "DELETED", "stops": []})
     assert deleted.canceled and deleted.deleted
 
 
 def test_stale_trip_states_count_as_no_realtime():
     key = "kmk_t:20261025:a"
-    states = {"kmk_t": {key: "[1,false,null,1000]"}}
-    assert BoardRealtime(states, [], {"kmk_t": 1000}).state(key) is not None
-    assert BoardRealtime(states, [], {"kmk_t": 1001}).state(key) is None
-    assert BoardRealtime(states, [], {"kmk_a": 5000}).state(key) is not None  # another feed's limit
+    live = live_with((key, compact(ts=1000)))
+    assert live.board(["kmk_t"], [], {"kmk_t": 1000}).state(key) is not None
+    assert live.board(["kmk_t"], [], {"kmk_t": 1001}).state(key) is None
+    assert live.board(["kmk_t"], [], {"kmk_a": 5000}).state(key) is not None  # another feed's limit

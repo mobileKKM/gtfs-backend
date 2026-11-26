@@ -214,25 +214,27 @@ class RealtimeTask:
         t2 = time.perf_counter()
         res = await process_message(self.feed_id, msg, index, self.runtime.state, load, now)
         t3 = time.perf_counter()
-        await self._store(res)
+        changes = await self._store(res)
         t4 = time.perf_counter()
         self.last_msg, self.last_size, self.written_generation = msg, size, index.generation
         self.last_ts = ts
         if not again:  # the data itself didn't change: its age (max_age) counts from when it did
             self.last_change = time.monotonic()
         self._record_change(size, ts, res, index_s=t2 - t1, process_s=t3 - t2, write_s=t4 - t3)
-        await self.store.publish(self.feed_id, self.kind.value, ts)
+        await self.store.publish(self.feed_id, self.kind.value, ts, changes)
         return res
 
-    async def _store(self, res: Result) -> None:
-        """Write what this file carries."""
+    async def _store(self, res: Result) -> dict:
+        """Write what this file carries; returns what changed (live_layout.LiveChanges' parts)."""
+        changes = {}
         if self.kind.carries(RealtimeKind.VEHICLE_POSITIONS):
-            await self.store.write_vehicles(self.feed_id, res)
+            changes["vehicles"] = await self.store.write_vehicles(self.feed_id, res)
         if self.kind.carries(RealtimeKind.TRIP_UPDATES):
-            await self.store.write_trips(self.feed_id, res)
+            changes["trips"] = await self.store.write_trips(self.feed_id, res)
         if self.kind.carries(RealtimeKind.SERVICE_ALERTS):
-            await self.store.write_alerts(self.feed_id, res)
+            changes["alerts"] = await self.store.write_alerts(self.feed_id, res)
         await self.store.write_unmatched(self.feed_id, self.kind.value, res)
+        return changes
 
     def _record_change(self, size: int, ts: int, res: Result, *, index_s: float, process_s: float, write_s: float):
         """The stats of a poll that changed data; they stay in meta until the next change."""

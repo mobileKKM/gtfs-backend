@@ -9,14 +9,11 @@ rt:trip:{trip_key}                  trip update JSON with per-stop predictions, 
                                     already dropped (their last known times); the JSON has the version.
                                     Removed when the trip leaves the feed (TTL TRIP_TTL as a fallback)
 rt:tripstate:{feed_id}              HASH trip key -> TripState of every trip in rt:trip (TTL TRIP_TTL)
-rt:stop:{feed_id}:{public_stop_id}  HASH "{stop_sequence}|{trip key}" -> StopPrediction: the trips' rows of rt:trip at
-                                    this stop, for departure boards (which read only their stops' hashes, not whole
-                                    trips). Only valid for trips in rt:tripstate, with the same version; no TTL,
-                                    rewritten in full when the worker starts or finds rt:tripstate gone
 rt:alerts:{feed_id}                 alerts JSON (TTL ALERT_TTL)
 rt:unmatched:{feed_id}:{kind}       unmatched trip ids / vehicles for debugging (TTL UNMATCHED_TTL), never shown
 rt:meta:{feed_id}:{kind}            poll stats: last poll, last data change, timings, counters
-pub/sub rt:updated                  {"feed_id", "kind", "ts"} after each write
+rt:seq:{feed_id}:{kind}             "{run}:{seq}" of the last change message of this file (see rt:updated)
+pub/sub rt:updated                  after each write, what changed (LiveChanges): the API's live state follows it
 pub/sub static:updated              feed_id, after a static import became ready (and its snapshot was written)
 pub/sub snapshot:updated            generation, after the timetable snapshot was rebuilt for a new day
 
@@ -50,21 +47,12 @@ def trip_states(feed_id: str) -> str:
     return f"rt:tripstate:{feed_id}"
 
 
-def stop_predictions(feed_id: str, public_stop_id: str) -> str:
-    return f"rt:stop:{feed_id}:{public_stop_id}"
-
-
-def stop_prediction_field(stop_sequence: int, trip_key: str) -> str:
-    return f"{stop_sequence}|{trip_key}"
-
-
-def parse_stop_prediction_field(field: str) -> tuple[int, str]:
-    sequence, _, trip_key = field.partition("|")
-    return int(sequence), trip_key
-
-
 def alerts(feed_id: str) -> str:
     return f"rt:alerts:{feed_id}"
+
+
+def seq(feed_id: str, kind: str) -> str:
+    return f"rt:seq:{feed_id}:{kind}"
 
 
 def unmatched(feed_id: str, kind: str) -> str:
@@ -124,25 +112,50 @@ class LiveTrip(TripFields):
 # rt:tripstate value: [version, canceled, vehicle_id, timestamp, deleted], from the LiveTrip. Deleted (GTFS-RT DELETED):
 # removed and not to be shown at all, also canceled. Readers accept the 4-element form of older workers.
 TripState = tuple[int, bool, str | None, int, bool]
-# rt:stop value: [predicted_arrival, predicted_departure, delay_s, skipped, version, scheduled_departure, propagated],
-# from the LiveTrip's StopRow. The version: writes and reads aren't atomic, so a board may read a trip state and
-# predictions of different updates, and stop sequences are only comparable within one version. The scheduled
-# departure: what a board's timetable rows are read by, to find trips running early (not predicted - delay_s: an
-# arrival-only prediction's delay is against the scheduled arrival). Propagated: the feed gave no time for this stop,
-# the delay is carried from an earlier one (status `predicted`). Readers accept the 6-element form of older workers.
-StopPrediction = tuple[int | None, int | None, int | None, bool, int, int | None, bool]
+# A trip as the API keeps it in memory (change messages and its first load from rt:trip):
+# [version, canceled, vehicle_id, timestamp, deleted, delay_s, [StopEntry, ...]], with
+# StopEntry = [stop_sequence, public_stop_id, predicted_arrival, predicted_departure, delay_s, skipped,
+#              scheduled_departure, propagated]
+CompactTrip = list
+StopEntry = list
+
+
+def compact_trip(trip: LiveTrip) -> CompactTrip:
+    version, canceled, vehicle_id, timestamp, deleted = trip_state(trip)
+    stops = [
+        [
+            r["stop_sequence"],
+            r["public_stop_id"],
+            r["predicted_arrival"],
+            r["predicted_departure"],
+            r["delay_s"],
+            r["schedule_relationship"] == "SKIPPED",
+            r["scheduled_departure"],
+            r["propagated"],
+        ]
+        for r in trip["stops"]
+    ]
+    return [version, canceled, vehicle_id, timestamp, deleted, trip["delay_s"], stops]
+
+
+class LiveChanges(TypedDict):
+    """A message on rt:updated: what one poll of one file changed. `run` identifies the worker process (a new one starts
+    at 1 again), `seq` counts this file's messages: a reader that misses one reads the feed from Redis again."""
+
+    run: str
+    feed_id: str
+    kind: str
+    seq: int
+    ts: int  # the feed header timestamp
+    vehicles: NotRequired[dict]  # {"set": {vehicle key: LiveVehicle}, "del": [vehicle key]}
+    trips: NotRequired[dict]  # {"set": {trip key: CompactTrip}, "del": [trip key]}
+    alerts: NotRequired[list]  # the feed's alerts (LiveAlert), all of them
 
 
 def trip_state(trip: LiveTrip) -> TripState:
     relationship = trip["schedule_relationship"]
     deleted = relationship == "DELETED"
     return trip["version"], deleted or relationship == "CANCELED", trip["vehicle_id"], trip["timestamp"], deleted
-
-
-def stop_prediction(row: StopRow, version: int) -> StopPrediction:
-    skipped = row["schedule_relationship"] == "SKIPPED"
-    arrival, departure, scheduled = row["predicted_arrival"], row["predicted_departure"], row["scheduled_departure"]
-    return arrival, departure, row["delay_s"], skipped, version, scheduled, row["propagated"]
 
 
 class LiveVehicle(TypedDict):

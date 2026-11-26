@@ -8,6 +8,8 @@ from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
 
 from gtfs_backend.api.data.catalog import Catalog, Clock
+from gtfs_backend.api.data.live import LiveState
+from gtfs_backend.api.errors import LiveUnavailable
 from gtfs_backend.api.settings import ApiSettings
 from gtfs_backend.feeds import FeedsFile
 
@@ -20,6 +22,7 @@ class Context:
     catalog: Catalog
     clock: Clock
     settings: ApiSettings
+    live_state: LiveState | None = None  # the live data in memory (api/data/live.py)
     _max_age: dict[str, int] = field(init=False, repr=False)
     # what services keep between requests of this process, built from data that doesn't change while kept (the JSON
     # of a vehicle per Redis value, ...): never a response
@@ -34,6 +37,13 @@ class Context:
 
     def now(self) -> int:
         return int(self.clock())
+
+    @property
+    def live(self) -> LiveState:
+        """The live data, once loaded; else 503 (LiveUnavailable)."""
+        if self.live_state is None or not self.live_state.ready:
+            raise LiveUnavailable
+        return self.live_state
 
     def fresh_since(self) -> dict[str, int]:
         """Per feed, the oldest realtime measurement time (epoch) still shown: now - the feed's realtime max age."""

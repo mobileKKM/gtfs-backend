@@ -103,7 +103,13 @@ async def api(loaded):
     )
     app = create_app(settings, feeds=FEEDS, clock=lambda: NOW)
     async with app.router.lifespan_context(app), AsyncClient(transport=ASGITransport(app), base_url="http://test/api/v1") as c:
+        c.ctx = app.state.ctx  # for tests that change Redis: the app's live state reloads it (reload_live)
         yield c
+
+
+async def reload_live(api, feed_id: str = "kmk_t") -> None:
+    """The app's live data, read from Redis again (what a change message would have brought): after a test wrote it."""
+    await api.ctx.live.load_feed(feed_id)
 
 
 @pytest.fixture(scope="module")
@@ -458,13 +464,14 @@ async def test_polls_revalidate_while_the_data_is_unchanged(loaded, sql):
 
 
 @pytest.mark.parametrize("arrival_only", [False, True])
-async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch, arrival_only):
+async def test_departure_board_widens_for_early_trips(api_ctx, sql, monkeypatch, arrival_only):
     """A trip scheduled to depart past the window but running early enough to come before the page's last departure
     still makes the page, however early it runs (feeds allow any amount): the board finds it in its realtime index.
     Also when the feed predicts only its arrival, and the stop's arrival (+29 min) is inside the window while its
     departure (+31 min), by which the timetable is read, is past it."""
-    from gtfs_backend.api.data.realtime import BoardRealtime
     from gtfs_backend.api.services import departures
+
+    api, ctx = api_ctx
 
     pid = stop_by_code(sql, "802-01")
     day = date(2026, 10, 25)
@@ -482,15 +489,14 @@ async def test_departure_board_widens_for_early_trips(api, sql, monkeypatch, arr
     async def scheduled(conn, days, pids, start, end, lookback=departures.LOOKBACK_S):
         return [s for s in timetable if start - lookback <= s.scheduled_departure <= end]
 
-    async def read(redis, feed_ids, public_stop_ids, fresh_since=None):
-        if arrival_only:  # its delay is against the scheduled arrival
-            value = f"[{predicted},null,{predicted - scheduled_arrival},false,1,{early.scheduled_departure}]"
-        else:
-            value = f"[null,{predicted},{predicted - early.scheduled_departure},false,1,{early.scheduled_departure}]"
-        return BoardRealtime({"kmk_t": {early.trip_key: f"[1,false,null,{NOW}]"}}, [{f"1|{early.trip_key}": value}])
-
+    if arrival_only:  # its delay is against the scheduled arrival
+        entry = [1, pid, predicted, None, predicted - scheduled_arrival, False, early.scheduled_departure, False]
+    else:
+        entry = [1, pid, None, predicted, predicted - early.scheduled_departure, False, early.scheduled_departure, False]
+    live = ctx.live
+    monkeypatch.setattr(live, "trips", {early.trip_key: [1, False, None, NOW, False, None, [entry]]})
+    monkeypatch.setattr(live, "_at_stop", {pid: {(early.trip_key, 0)}})
     monkeypatch.setattr(departures, "scheduled", scheduled)
-    monkeypatch.setattr(departures.realtime.BoardRealtime, "read", read)
     monkeypatch.setattr(departures, "expected_span", lambda *_: departures.WINDOWS_S[0])  # whatever the stop's profile
     # the first window alone has 10 departures (+1 to +19 min); the early one comes after the 8th (+15 min)
     board = (await api.get(f"/stops/{pid}/departures?limit=10")).json()
@@ -688,8 +694,10 @@ async def alerts_in_redis(api, sql):
     ]
     r = Redis.from_url(TEST_REDIS_URL)
     await r.set("rt:alerts:kmk_t", json.dumps(raws))
+    await reload_live(api)
     yield {"raws": raws, "tram": tram, "pid": pid, "group": group, "far": far}
     await r.delete("rt:alerts:kmk_t")
+    await reload_live(api)
     await r.aclose()
 
 
@@ -854,6 +862,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
     current = {"always", "now", "open_end", "soon", "over_and_soon"}
     r = Redis.from_url(TEST_REDIS_URL)
     await r.set("rt:alerts:kmk_t", json.dumps(raws))
+    await reload_live(api)
     try:
         board = (await api.get(f"/stops/{group_id(sql, '802')}/departures?limit=60")).json()
         keys = {f"kmk_t:{a}" for a in current}
@@ -865,6 +874,7 @@ async def test_boards_and_trips_only_carry_current_alerts(api, sql):
         assert {a["key"] for a in (await api.get("/alerts?active=true")).json()["alerts"]} == keys
     finally:
         await r.delete("rt:alerts:kmk_t")
+        await reload_live(api)
         await r.aclose()
 
 
@@ -927,12 +937,15 @@ async def test_server_timing(api_ctx, sql):
     r = await api.get(f"/stops/{group_id(sql, '802')}/departures")
     timing = server_timing(r)
     assert set(timing) == {"db", "db-wait", "redis", "serialize", "total"}
-    assert int(timing["db"]["desc"].split()[0]) > 0 and int(timing["redis"]["desc"].split()[0]) > 0
+    # the timetable from Postgres (no snapshot here), realtime from memory: no Redis call
+    assert int(timing["db"]["desc"].split()[0]) > 0 and timing["redis"]["desc"] == "0 calls"
     assert all(float(m["dur"]) >= 0 for m in timing.values())
     assert float(timing["total"]["dur"]) >= float(timing["serialize"]["dur"])
     # an answer without the database: none counted, and nothing left over from the request before
     timing = server_timing(await api.get(f"/vehicles?bbox={CITY_BBOX}"))
-    assert timing["db"]["desc"] == "0 queries" and timing["redis"]["desc"] != "0 calls"
+    assert timing["db"]["desc"] == "0 queries" and float(timing["serialize"]["dur"]) > 0
+    # what still asks Redis: health
+    assert server_timing(await api.get("/health"))["redis"]["desc"] != "0 calls"
 
 
 async def test_server_timing_off(loaded):
@@ -1021,19 +1034,26 @@ async def test_catalog_days_need_no_query(api_ctx, monkeypatch):
     assert len(queries) == 1  # outside the preloaded days: one indexed lookup
 
 
-async def test_trip_live_reads_postgres_and_redis_at_once(api_ctx, monkeypatch):
+async def test_live_data_is_served_from_memory_while_redis_is_down(api_ctx, monkeypatch):
+    """Requests read the live state of the process, not Redis: a Redis outage leaves the last data (until it is
+    older than the feeds' max age); a process that never loaded it answers 503."""
     from redis.exceptions import ConnectionError as RedisConnectionError
 
     api, ctx = api_ctx
     v = (await api.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"][0]
-    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 200
+    live = (await api.get(f"/trips/{v['trip_key']}/live")).json()
 
     async def down(*args, **kwargs):
         raise RedisConnectionError("down")
 
-    monkeypatch.setattr(ctx.redis, "mget", down)
-    assert (await api.get(f"/trips/{v['trip_key']}/live")).status_code == 503
+    for command in ("mget", "get", "hgetall", "geosearch", "pipeline", "execute_command"):
+        monkeypatch.setattr(ctx.redis, command, down)
+    assert (await api.get(f"/trips/{v['trip_key']}/live")).json() == live
+    assert v in (await api.get(f"/vehicles?bbox={CITY_BBOX}")).json()["vehicles"]
     assert (await api.get("/trips/kmk_t:20261025:nope/live")).status_code == 404  # a missing trip still is a 404
+    monkeypatch.setattr(ctx.live_state, "ready", False)
+    r = await api.get(f"/vehicles?bbox={CITY_BBOX}")
+    assert r.status_code == 503 and r.headers["retry-after"] == "1"
 
 
 # ------------------------------------------------------------------------------------------------- metrics
@@ -1111,20 +1131,23 @@ async def test_deleted_trips_leave_the_board_canceled_ones_stay(api, sql):
     live = [d for d in deps if d["status"] == "live" and feed_of(d) == "kmk_t"][:2]
     assert len(live) == 2
     r = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
-    key = "rt:tripstate:kmk_t"
-    saved = {d["trip_key"]: await r.hget(key, d["trip_key"]) for d in live}
+    saved = {d["trip_key"]: await r.get(f"rt:trip:{d['trip_key']}") for d in live}
     try:
-        (deleted, canceled) = live
-        v, _, veh, ts, *_ = json.loads(saved[deleted["trip_key"]])
-        await r.hset(key, deleted["trip_key"], json.dumps([v, True, veh, ts, True]))
-        v, _, veh, ts, *_ = json.loads(saved[canceled["trip_key"]])
-        await r.hset(key, canceled["trip_key"], json.dumps([v, True, veh, ts, False]))
+        for d, relationship in zip(live, ("DELETED", "CANCELED"), strict=True):
+            await r.set(
+                f"rt:trip:{d['trip_key']}",
+                json.dumps({**json.loads(saved[d["trip_key"]]), "schedule_relationship": relationship}),
+            )
+        await reload_live(api)
+        deleted, canceled = live
         after = {d["trip_key"]: d for d in (await api.get(url)).json()["departures"]}
         assert deleted["trip_key"] not in after
         assert after[canceled["trip_key"]]["status"] == "canceled"
+        assert (await api.get(f"/trips/{deleted['trip_key']}/live")).json()["status"] == "canceled"
     finally:
         for trip_key, value in saved.items():
-            await r.hset(key, trip_key, value)
+            await r.set(f"rt:trip:{trip_key}", value)
+        await reload_live(api)
         await r.aclose()
 
 

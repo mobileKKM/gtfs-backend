@@ -4,7 +4,6 @@ import pytest
 from pydantic import ValidationError
 
 from gtfs_backend.feeds import RealtimeKind, load_feeds
-from gtfs_backend.worker.static.fetch import import_order
 
 ROOT = Path(__file__).parents[2]
 
@@ -86,19 +85,3 @@ def test_disabled_feed_gets_no_tasks(tmp_path):
         )
     )
     assert [f.feed_id for f in feeds.enabled] == ["a"]
-    assert [f.feed_id for f in import_order(feeds)] == ["a"]
-
-
-def test_import_order_puts_shared_stop_providers_first(tmp_path):
-    feeds = load_feeds(
-        write(
-            tmp_path,
-            (
-                "feeds:\n"
-                "  - feed_id: mld\n    share_stops_with: [ztp]\n    static: https://x.test/m.zip\n"
-                "  - feed_id: train\n    static: https://x.test/t.zip\n"
-                "  - feed_id: tram\n    stop_namespace: ztp\n    static: https://x.test/z.zip\n"
-            ),
-        )
-    )
-    assert [f.feed_id for f in import_order(feeds)] == ["tram", "train", "mld"]

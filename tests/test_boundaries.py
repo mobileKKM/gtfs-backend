@@ -1,22 +1,10 @@
-"""The worker and the API are separate programs: they share only gtfs_backend."""
+"""The shared modules (gtfs_backend/*.py) are the API's base: they never import the API itself. The worker is a
+separate program (worker/, Rust) that shares only the Redis/Postgres layout with it."""
 
 import ast
-import subprocess
-import sys
 from pathlib import Path
 
-import pytest
-
 SRC = Path(__file__).parents[1] / "src" / "gtfs_backend"
-FORBIDDEN = {
-    "shared": ("gtfs_backend.api", "gtfs_backend.worker"),  # the modules directly in gtfs_backend/
-    "api": ("gtfs_backend.worker",),
-    "worker": ("gtfs_backend.api",),
-}
-
-
-def files(package: str) -> list[Path]:
-    return sorted(SRC.glob("*.py")) if package == "shared" else sorted((SRC / package).rglob("*.py"))
 
 
 def imports(path: Path) -> list[str]:
@@ -30,22 +18,10 @@ def imports(path: Path) -> list[str]:
     return out
 
 
-@pytest.mark.parametrize("package", sorted(FORBIDDEN))
-def test_packages_keep_to_their_side(package):
-    bad = [
-        f"{path.relative_to(SRC)}: {name}"
-        for path in files(package)
-        for name in imports(path)
-        if name.startswith(FORBIDDEN[package])
-    ]
+def test_shared_modules_do_not_import_the_api():
+    bad = [f"{p.name}: {name}" for p in sorted(SRC.glob("*.py")) for name in imports(p) if name.startswith("gtfs_backend.api")]
     assert not bad, "\n".join(bad)
 
 
-def test_api_does_not_load_worker_dependencies():
-    code = (
-        "import sys, gtfs_backend.api.app, gtfs_backend.api.cli; "
-        "print(sorted(m for m in ('pandas', 'gtfs_kit', 'pyarrow', 'google.protobuf', 'httpx', 'gtfs_backend.worker') "
-        "if m in sys.modules))"
-    )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout.strip()
-    assert out == "[]"
+def test_there_is_no_python_worker_left():
+    assert not (SRC / "worker").exists()

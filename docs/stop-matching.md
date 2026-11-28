@@ -20,13 +20,13 @@ where it did.
 | **Shared namespace** | A feed that mostly uses another namespace's poles (`share_stops_with: [ztp]`): MLD feeder buses in Kraków. |
 
 Our ids are 5 random letters that never derive from a code or a name, so renames keep them. The code is in
-[`src/gtfs_backend/worker/static/stops/`](../src/gtfs_backend/worker/static/stops/): `plan.py` and `shared.py` decide
-without the database (and are unit-tested in `tests/worker/test_stops_match.py`), `apply.py` reads the inputs and writes the
+[`worker/src/static_feed/stops/`](../worker/src/static_feed/stops/): `plan.rs` and `shared.rs` decide
+without the database (and are unit-tested there: `cargo test stops`), `apply.rs` reads the inputs and writes the
 links.
 
 ## A feed's stops in GTFS shape
 
-Before matching, every stop of the feed gets a station and a `platform_code` (`normalize_stop` in `model.py`):
+Before matching, every stop of the feed gets a station and a `platform_code` (`normalize_stop` in `stops/mod.rs`):
 
 - its own GTFS `parent_station` and `platform_code` where it has them (Koleje Małopolskie's trains and MLD have stations);
 - otherwise what the feed's `stop_code_pattern` (feeds.yml) reads from its `stop_code`. ZTP has no stations and names them
@@ -38,11 +38,11 @@ code is never split, so another operator's dashes can't be mistaken for ZTP's nu
 
 ## Two kinds of matching
 
-**Within a namespace** (`plan.py`). A new version of a ZTP feed matches its stops to the existing stops by code, then by
+**Within a namespace** (`plan.rs`). A new version of a ZTP feed matches its stops to the existing stops by code, then by
 name plus `platform_code` nearby, then by location. When it can't tell, it creates a new id rather than guess. Stops of
 one station form one stop group.
 
-**Onto another namespace's poles** (`shared.py`). This is the hard case: MLD's own stop list has no numbering in common with
+**Onto another namespace's poles** (`shared.rs`). This is the hard case: MLD's own stop list has no numbering in common with
 ZTP's, and its coordinates are often 10–60 m off, so a stop has to be recognised as a ZTP pole, or as a pole of its own that
 ZTP doesn't publish. The rest of this page is about that. The shared namespace is never modified.
 
@@ -111,13 +111,13 @@ this step. If no pole qualifies, the stop keeps its own pole.
 
 | Input | Where from |
 |---|---|
-| Direction of travel | previous stop → next stop, averaged over trips (`queries.py`) |
+| Direction of travel | previous stop → next stop, averaged over trips (`stop_bearings` in `apply.rs`) |
 | Modes a pole serves | the shared feeds' own trips only (`served_modes`), **not** `core.stop.modes`, which counts every linked feed: a wrongly linked bus stop would turn a tram pole into a "bus pole" |
 | Next stops | `stop_times` of the new version and `core.stop_direction` of the shared feeds |
 | OSM poles | `data/osm/stops.json` (`OSM_STOPS_FILE`) |
 
 The worker keeps the OSM file up to date itself. On start it downloads the [Geofabrik](https://download.geofabrik.de/europe/poland/malopolskie.html)
-Małopolskie extract (about 200 MB, parsed in the import process, then discarded) and keeps the bus and tram poles; after that
+Małopolskie extract (about 200 MB, parsed on a blocking thread, then discarded) and keeps the bus and tram poles; after that
 it checks hourly and downloads again once the file is older than `OSM_REFRESH_INTERVAL` (1 day, the extract is published daily). Feeds that share stops
 wait for the first download, trying three times before they start without it. A failed refresh is logged and the old file
 stays. The file is replaced in one step, so an import never reads half of it. A new file is used by the next import:
@@ -126,7 +126,7 @@ stops are matched when a feed version is imported, so existing links don't chang
 To do it by hand (the file is also needed outside the worker, e.g. for a local import):
 
 ```sh
-uv run gtfs-worker fetch-osm
+gtfs-worker fetch-osm
 ```
 
 Without the file, steps 1–3 run alone and the OSM guarantees above are gone. Set `OSM_REFRESH_INTERVAL=0` to turn the
@@ -134,7 +134,7 @@ automatic download off.
 
 ## Constants
 
-All distances live at the top of [`shared.py`](../src/gtfs_backend/worker/static/stops/shared.py).
+All distances live at the top of [`shared.rs`](../worker/src/static_feed/stops/shared.rs).
 
 | Constant | Value | Used for |
 |---|---|---|
@@ -159,7 +159,7 @@ imported again. Stop the worker first, or it may import the same zip with the ol
 ```sh
 # worker stopped
 psql ... -c "DELETE FROM core.feed_version WHERE id = 'km_mld_v9'"
-uv run gtfs-worker import-static --feed km_mld --file data/archive/km_mld/<sha256>.zip
+gtfs-worker import-static --feed km_mld --file data/archive/km_mld/<sha256>.zip
 ```
 
 **Cases the tests keep right:**

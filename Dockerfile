@@ -1,42 +1,41 @@
-# Two images from one build: `--target api` (gtfs-api) and `--target worker` (gtfs-worker, the default).
-# Each gets only its own dependencies (pyproject extras). Migrations run from the worker image (`alembic upgrade head`).
+# Two images from one build: `--target api` (gtfs-api, Python) and `--target worker` (gtfs-worker, Rust; the default).
+# Each gets only what it needs; the worker applies the schema migrations itself (worker/migrations/*.sql, built in).
 
-FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS build-base
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS build-api
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-
-FROM build-base AS build-api
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project --extra api
 COPY README.md LICENSE ./
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --extra api
 
-FROM build-base AS build-worker
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project --extra worker
-COPY README.md LICENSE alembic.ini ./
-COPY src ./src
-COPY migrations ./migrations
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --extra worker
+FROM rust:1.91-slim-bookworm AS build-worker
+WORKDIR /build
+COPY worker/Cargo.toml worker/Cargo.lock worker/build.rs ./worker/
+COPY worker/proto ./worker/proto
+COPY worker/migrations ./worker/migrations
+COPY worker/src ./worker/src
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/build/worker/target \
+    cd worker && cargo build --release --locked && cp target/release/gtfs-worker /usr/local/bin/gtfs-worker
 
-FROM python:3.14-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS api
 RUN useradd --create-home --uid 1000 app
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
-
-FROM runtime AS api
 COPY --from=build-api --chown=app:app /app /app
 COPY --chown=app:app feeds.yml ./
 USER app
 EXPOSE 8000
 CMD ["gtfs-api", "--host", "0.0.0.0", "--port", "8000"]
 
-FROM runtime AS worker
-# pyosmium links against the system libexpat, which the slim image lacks.
+FROM debian:bookworm-slim AS worker
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libexpat1 \
-    && rm -rf /var/lib/apt/lists/*
-COPY --from=build-worker --chown=app:app /app /app
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 app
+COPY --from=build-worker /usr/local/bin/gtfs-worker /usr/local/bin/gtfs-worker
+WORKDIR /app
 COPY --chown=app:app feeds.yml ./
 ENV ARCHIVE_DIR=/data/archive
 RUN mkdir -p /data/archive && chown -R app:app /data

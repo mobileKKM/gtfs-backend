@@ -24,7 +24,7 @@ uv run pytest bench/micro --benchmark-compare      # against the last saved run
 | `vehicles_city_wide_response` | `/vehicles` after its MGET: 1,000 vehicles decoded, built, serialized, hashed, gzipped |
 | `board_realtime_decode` | a board's realtime from the live state: the states of 60 shown trips, and the scan for trips running early (a busy group of 8 poles, ~300 trips) |
 | `board_overlay_and_select` | realtime laid over 600 timetable rows, page of 20 picked |
-| `worker_trip_states_of_a_big_feed` | what the worker builds every trip-updates poll besides `rt:trips`: each trip's `TripState` and its JSON, which tell what the change message carries (300 trips x 25 stops) |
+| `worker_trip_states_of_a_big_feed` | what the (Python) worker built every trip-updates poll besides `rt:trips`, and the API when it loads a feed from Redis: each trip's `TripState` and its JSON, which tell what the change message carries (300 trips x 25 stops) |
 | `vehicles_city_wide_response_from_pieces` | `/vehicles` since phase 3: kept per-vehicle JSON filtered and joined, hashed, gzipped |
 
 ## Load: record once, replay as often as needed
@@ -46,7 +46,7 @@ uv run python bench/replay.py record bench/out/rec-peak --minutes 40
 
 ```sh
 PGPASSWORD=gtfs createdb -h localhost -U gtfs gtfs_replay
-DATABASE_URL=postgresql://gtfs:gtfs@localhost:5432/gtfs_replay uv run alembic upgrade head
+DATABASE_URL=postgresql://gtfs:gtfs@localhost:5432/gtfs_replay worker/target/release/gtfs-worker migrate
 uv run python bench/load.py import bench/out/rec-peak     # the recording's timetables (minutes)
 ```
 

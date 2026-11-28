@@ -3,6 +3,8 @@
 .env
 data
 tests
+bench
 .pytest_cache
 .ruff_cache
 **/__pycache__
+worker/target

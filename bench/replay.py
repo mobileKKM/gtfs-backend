@@ -23,20 +23,99 @@ import json
 import signal
 import sys
 import time
+import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 
+import httpx
 import yaml
+from google.transit import gtfs_realtime_pb2 as pb
 
 from gtfs_backend.feeds import load_feeds
-from gtfs_backend.worker.http import fetch_bytes, fetch_to_file, make_client
-from gtfs_backend.worker.realtime.poller import parse_feed
-from gtfs_backend.worker.static.archive import validate_zip
 
 MANIFEST = "manifest.json"
 DEFAULT_INTERVAL_S = 10  # REALTIME_POLL_INTERVAL's default
 FETCH_TIMEOUT_S = 15
+
+
+# ------------------------------------------------------------------------------------------------- downloads
+# (as the worker takes them: only complete files; retried while the operators replace a file)
+
+USER_AGENT = "mobileKKM-gtfs-backend/bench"
+RETRY_STATUSES = frozenset({404, 408, 429})
+
+
+def parse_feed(body: bytes) -> pb.FeedMessage:
+    msg = pb.FeedMessage()
+    msg.ParseFromString(body)
+    if not msg.header.gtfs_realtime_version:
+        raise ValueError("feed message without header")
+    return msg
+
+
+def validate_zip(path: Path) -> None:
+    with zipfile.ZipFile(path) as zf:
+        if (bad := zf.testzip()) is not None:
+            raise ValueError(f"corrupt member in zip: {bad}")
+
+
+def make_client(timeout: float, connect_timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout, connect=connect_timeout), follow_redirects=True, headers={"User-Agent": USER_AGENT}
+    )
+
+
+class Fetched(NamedTuple):
+    not_modified: bool
+    value: object = None
+    etag: str | None = None
+    last_modified: str | None = None
+
+
+async def _retrying(attempt, retries: int, retry_delay: float):
+    for n in range(1, retries + 1):
+        try:
+            return await attempt()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if (status < 500 and status not in RETRY_STATUSES) or n == retries:
+                raise
+        except Exception:
+            if n == retries:
+                raise
+        await asyncio.sleep(retry_delay)
+
+
+async def fetch_bytes(client, url, parse, *, etag=None, last_modified=None, retries=3, retry_delay=1.0, timeout=None):
+    headers = {k: v for k, v in (("If-None-Match", etag), ("If-Modified-Since", last_modified)) if v}
+
+    async def attempt():
+        resp = await client.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 304:
+            return Fetched(True, None, etag, last_modified)
+        resp.raise_for_status()
+        expected = resp.headers.get("Content-Length")
+        if expected and not resp.headers.get("Content-Encoding") and int(expected) != len(resp.content):
+            raise ValueError(f"truncated: {len(resp.content)} of {expected} bytes")
+        return Fetched(False, parse(resp.content), resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+
+    return await _retrying(attempt, retries, retry_delay)
+
+
+async def fetch_to_file(client, url, dest: Path, validate, *, retries=3, retry_delay=1.0) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    async def attempt():
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            with dest.open("wb") as fh:
+                async for chunk in resp.aiter_bytes():
+                    fh.write(chunk)
+        validate(dest)
+
+    await _retrying(attempt, retries, retry_delay)
 
 
 def _sha(body: bytes) -> str:

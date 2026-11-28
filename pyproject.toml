@@ -1,12 +1,12 @@
 [project]
 name = "gtfs-backend"
 version = "0.1.0"
-description = "GTFS static + realtime ingestion and map API for mobileKKM (ZTP Kraków)"
+description = "Map API for mobileKKM (ZTP Kraków); the GTFS worker is in worker/ (Rust)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-# Shared by the worker and the API (the modules at the gtfs_backend root).
+# The API and the modules it shares (gtfs_backend/*.py: settings, feeds.yml, the Redis layout, keys, ...).
 dependencies = [
     "msgspec>=0.19",
     "orjson>=3.11",
@@ -22,18 +22,8 @@ api = [
     "fastapi>=0.162.0",
     "uvicorn[standard]>=0.54.0",
 ]
-worker = [
-    "alembic>=1.20.1",
-    "gtfs-kit>=13.0.1",
-    "gtfs-realtime-bindings>=3.0.0",
-    "httpx>=0.28.1",
-    "osmium>=4.3.2",
-    "pyarrow>=26.0.0",
-    "sqlalchemy>=2.1.6",
-]
 
 [project.scripts]
-gtfs-worker = "gtfs_backend.worker.cli:main"
 gtfs-api = "gtfs_backend.api.cli:main"
 
 [build-system]
@@ -54,7 +44,9 @@ asyncio_default_fixture_loop_scope = "function"
 
 [dependency-groups]
 dev = [
-    "gtfs-backend[api,worker]",
+    "gtfs-backend[api]",
+    "gtfs-realtime-bindings>=3.0.0",  # tests and bench/replay.py read GTFS-RT files
+    "httpx>=0.28.1",  # the API tests' client, bench/replay.py's downloads
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-benchmark>=5.3.1",

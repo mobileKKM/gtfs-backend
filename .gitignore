@@ -20,3 +20,6 @@ wheels/
 # Benchmarks (docs/benchmark.md): recordings, results
 /bench/out/
 .benchmarks/
+
+# Rust worker build
+/worker/target/

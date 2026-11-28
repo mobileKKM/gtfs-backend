@@ -12,20 +12,16 @@ from datetime import date, timedelta
 import psycopg
 import pytest
 import redis
-from conftest import FIXTURES, TEST_REDIS_URL, TTLS, do_import, message, reset_db
+from conftest import FIXTURES, TEST_REDIS_URL, ZTP_STOP_CODES, import_static, message, process_realtime, reset_db
 from httpx import ASGITransport, AsyncClient
+from live_writer import LiveWriter
 from redis.asyncio import Redis
 
 from gtfs_backend import keys
 from gtfs_backend.api.app import create_app
 from gtfs_backend.api.settings import ApiSettings
-from gtfs_backend.db import async_pool
 from gtfs_backend.feeds import FeedConfig, FeedsFile
 from gtfs_backend.live_layout import StopState, TripState
-from gtfs_backend.worker.feed_sync import sync_feeds
-from gtfs_backend.worker.realtime.normalize import FeedRealtimeState, process_message
-from gtfs_backend.worker.realtime.store import RealtimeStore
-from gtfs_backend.worker.realtime.trip_index import ensure_stop_times, load_index
 
 SUFFIX = {"kmk_a": "A", "kmk_m": "M", "kmk_t": "T"}
 KINDS = {"TripUpdates": "trip_updates", "VehiclePositions": "vehicle_positions", "ServiceAlerts": "service_alerts"}
@@ -34,6 +30,7 @@ FEEDS = FeedsFile(
         FeedConfig(
             feed_id=feed_id,
             stop_namespace="ztp",
+            stop_code_pattern=ZTP_STOP_CODES,
             static=f"https://example.invalid/{s}.zip",
             realtime={kind: f"https://example.invalid/{name}_{s}.pb" for name, kind in KINDS.items()},
             day_start="midnight" if feed_id == "kmk_t" else "noon_minus_12h",
@@ -47,36 +44,20 @@ NOW = message("TripUpdates", "T").header.timestamp
 FIXTURE_MAX_AGE = 600
 
 
-async def _load_realtime(database_url: str) -> None:
-    pool = async_pool(database_url)
-    await pool.open()
-    r = Redis.from_url(TEST_REDIS_URL)
-    store = RealtimeStore(r, TTLS)
-    try:
-        for f in FEEDS.feeds:
-            index = await load_index(pool, f.feed_id, NOW, f.day_start)
-            state = FeedRealtimeState()
-
-            async def load(keys, index=index):
-                await ensure_stop_times(pool, index, keys)
-
-            for kind in KINDS:
-                msg = message(kind, SUFFIX[f.feed_id])
-                res = await process_message(f.feed_id, msg, index, state, load, NOW)
-                if kind == "TripUpdates":
-                    await store.write_trips(f.feed_id, res)
-                elif kind == "VehiclePositions":
-                    await store.write_vehicles(f.feed_id, res)
-                else:
-                    await store.write_alerts(f.feed_id, res)
-                await store.write_meta(f.feed_id, KINDS[kind], {"ok": True, "age_s": 3})
-    finally:
-        await r.aclose()
-        await pool.close()
+def _load_realtime(tmp) -> None:
+    """The snapshot's files, each feed's trip updates before its vehicles (they take their trip's delay), at NOW."""
+    dst = FIXTURES / "dst_2026-10-25"
+    files = {f.feed_id: {kind: dst / f"{name}_{SUFFIX[f.feed_id]}.pb" for name, kind in KINDS.items()} for f in FEEDS.feeds}
+    process_realtime(FEEDS, files, NOW, tmp)
+    r = redis.Redis.from_url(TEST_REDIS_URL)
+    for f in FEEDS.feeds:
+        for kind in KINDS.values():
+            r.set(f"rt:meta:{f.feed_id}:{kind}", json.dumps({"ok": True, "age_s": 3}))
+    r.close()
 
 
 @pytest.fixture(scope="module")
-def loaded(database_url):
+def loaded(database_url, tmp_path_factory):
     try:
         r = redis.Redis.from_url(TEST_REDIS_URL, socket_connect_timeout=2)
         r.ping()
@@ -85,12 +66,10 @@ def loaded(database_url):
     except redis.exceptions.ConnectionError as exc:
         pytest.skip(f"Redis not available ({exc})")
     reset_db(database_url)
-    with psycopg.connect(database_url) as conn:
-        sync_feeds(conn, FEEDS)
-        for feed_id, name in (("kmk_t", "GTFS_KRK_T.zip"), ("kmk_a", "GTFS_KRK_A.zip"), ("kmk_m", "GTFS_KRK_M.zip")):
-            do_import(conn, feed_id, FIXTURES / "static" / name)
-        conn.commit()
-    asyncio.run(_load_realtime(database_url))
+    tmp = tmp_path_factory.mktemp("worker")
+    for feed_id, name in (("kmk_t", "GTFS_KRK_T.zip"), ("kmk_a", "GTFS_KRK_A.zip"), ("kmk_m", "GTFS_KRK_M.zip")):
+        import_static(FEEDS, feed_id, FIXTURES / "static" / name, tmp)
+    _load_realtime(tmp)
     return database_url
 
 
@@ -1179,14 +1158,10 @@ async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served
         feed = feed_of(v)
         originals = list(json.loads(await r.get(f"rt:vehicles:{feed}")).values())
         moved = [dict(o, lat=o["lat"] + 0.00005) if f"{feed}:{o['vehicle_id']}" == v["key"] else o for o in originals]
-        store = RealtimeStore(r, TTLS)
+        store = LiveWriter(r, run="ws-test")
         try:
-            from gtfs_backend.worker.realtime.normalize import Result
-
-            await store.write_vehicles(feed, Result(vehicles=originals))  # what the store last said: the originals
-            await store.publish(
-                feed, "vehicle_positions", NOW, {"vehicles": await store.write_vehicles(feed, Result(vehicles=moved))}
-            )
+            await store.write_vehicles(feed, originals)  # what the store last said: the originals
+            await store.publish(feed, "vehicle_positions", NOW, {"vehicles": await store.write_vehicles(feed, moved)})
             for _ in range(10):
                 (update,) = await receive(ws, 1)
                 if update["topic"] == "vehicles":
@@ -1194,7 +1169,7 @@ async def test_websocket_snapshots_are_the_rest_bodies_and_updates_follow(served
             assert update["type"] == "update" and update["data"]["remove"] == []
             assert [(u["key"], u["lat"]) for u in update["data"]["upsert"]] == [(v["key"], round(v["lat"] + 0.00005, 5))]
         finally:
-            await store.write_vehicles(feed, Result(vehicles=originals))
+            await store.write_vehicles(feed, originals)
             await store.publish(
                 feed,
                 "vehicle_positions",

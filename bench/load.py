@@ -147,13 +147,24 @@ def sample(pids: list[int]) -> tuple[float, int]:
     return cpu, int(rss)
 
 
+def worker_cmd(code: Path) -> list[str]:
+    """The checkout's worker: its Rust binary (build it first: cargo build --release in worker/), or the Python worker
+    of a checkout from before the Rust one."""
+    binary = code / "worker" / "target" / "release" / "gtfs-worker"
+    if binary.exists():
+        return [str(binary)]
+    if (code / "worker" / "Cargo.toml").exists():
+        raise SystemExit(f"build the worker first: cargo build --release --manifest-path {code / 'worker' / 'Cargo.toml'}")
+    return ["uv", "run", "gtfs-worker"]
+
+
 def cmd_import(args) -> None:
     out = ROOT / "bench" / "out" / "import"
     out.mkdir(parents=True, exist_ok=True)
     feeds = replay_feeds(args.recording, out, args.code)
     server, _ = serve(args.recording, out)
     try:
-        subprocess.run(["uv", "run", "gtfs-worker", "import-static", "--all"], cwd=args.code, env=env(feeds), check=True)
+        subprocess.run([*worker_cmd(args.code), "import-static", "--all"], cwd=args.code, env=env(feeds), check=True)
     finally:
         stop([server])
 
@@ -169,7 +180,7 @@ def cmd_run(args) -> None:
     server, offset = serve(args.recording, out)
     procs = [server]
     try:
-        procs.append(start(["uv", "run", "gtfs-worker", "run"], args.code, env(feeds, offset), out / "worker.log"))
+        procs.append(start([*worker_cmd(args.code), "run"], args.code, env(feeds, offset), out / "worker.log"))
         api = start(
             ["uv", "run", "gtfs-api", "--host", "127.0.0.1", "--port", str(API_PORT), "--workers", str(args.workers)],
             args.code,

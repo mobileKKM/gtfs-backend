@@ -2,7 +2,10 @@
 
 GTFS ingestion and map API for **mobileKKM**: the worker loads static timetables into Postgres/PostGIS and live
 vehicles and predictions into Redis; the API serves the app's map view (live vehicles, trip details, stop search,
-departures) from both. They are separate programs (`gtfs-worker`, `gtfs-api`) with separate images.
+departures) from both. They are separate programs with separate images: `gtfs-worker` (Rust, [`worker/`](worker/))
+and `gtfs-api` (Python, `src/gtfs_backend/api/`). What they share is the Postgres schema ([`worker/migrations/`](worker/migrations/),
+applied by the worker) and the Redis layout ([`live_layout.py`](src/gtfs_backend/live_layout.py), written by
+[`worker/src/realtime/layout.rs`](worker/src/realtime/layout.rs)).
 
 Feeds ([`feeds.yml`](feeds.yml)): `kmk_a` MPK buses, `kmk_m` Mobilis buses, `kmk_t` trams (all ZTP; vehicles, trip
 updates, alerts), `km_kolej` Koleje Małopolskie trains (one combined `realtime.pb`), `km_mld` Koleje Małopolskie
@@ -16,32 +19,35 @@ drops vehicle positions older than that within a file (ZTP sends some minutes ol
 
 ## Running it
 
-Requirements: Python 3.12+ with [uv](https://docs.astral.sh/uv/), Docker.
+Requirements: Rust 1.88+ ([rustup](https://rustup.rs)) for the worker, Python 3.12+ with
+[uv](https://docs.astral.sh/uv/) for the API, Docker.
 
 ```sh
 docker compose -f docker-compose.dev.yml up -d   # Postgres/PostGIS + Redis only
 cp .env.example .env
+cargo build --release --manifest-path worker/Cargo.toml
+worker/target/release/gtfs-worker run            # migrations, then all static + realtime tasks (imports on start)
 uv sync
-uv run alembic upgrade head
-uv run gtfs-worker run                           # all static + realtime tasks (imports static data on start)
 uv run gtfs-api                                  # API on :8000, docs at /api/docs (--workers N / API_WORKERS)
 ```
 
-Other commands:
+Other commands (`gtfs-worker --help`):
 
 ```sh
-uv run gtfs-worker import-static --all | --feed kmk_t [--retry] [--file x.zip]
-uv run gtfs-worker fetch-osm                # OpenStreetMap stop poles now (the worker also fetches and refreshes them itself)
-uv run gtfs-worker retire                  # drop versions nobody needs anymore
-uv run gtfs-worker rebuild-service-days
+gtfs-worker import-static --all | --feed kmk_t [--retry] [--file x.zip]
+gtfs-worker fetch-osm                # OpenStreetMap stop poles now (the worker also fetches and refreshes them itself)
+gtfs-worker retire [--feed kmk_t]    # drop versions nobody needs anymore
+gtfs-worker rebuild-service-days
+gtfs-worker migrate                  # the schema migrations alone (`run` applies them too)
+gtfs-worker replay manifest.json     # process recorded realtime files into Redis (bench/replay.py recordings, tests)
 ```
 
 **Production**: `POSTGRES_PASSWORD=... docker compose up -d --build` runs Postgres, Redis, the worker (migrates on
 start) and the API (`API_PORT`, default 8000; `API_WORKERS`, default 4). The API also joins the external
 `nginx_proxy` network (`docker network create nginx_proxy` once), so a proxy there reaches it as `http://api:8000`.
-The Dockerfile has a target per program (`worker`, `api`); the API image lacks the worker's dependencies (pandas,
-gtfs-kit, pyarrow, protobuf). On Apple Silicon set `POSTGIS_IMAGE=imresamu/postgis:17-3.5` (the official image is
-amd64-only).
+The Dockerfile has a target per program (`worker`: the Rust binary on Debian slim, ~170 MB; `api`). On Apple Silicon
+set `POSTGIS_IMAGE=imresamu/postgis:17-3.5` (the official image is amd64-only). A database the Python worker set up
+(alembic revisions 0001/0002) is taken over as it is.
 
 Settings come from env vars or `.env`; [`.env.example`](.env.example) lists all with defaults. Realtime timings can
 also be set per feed in `feeds.yml`.
@@ -49,32 +55,39 @@ also be set per feed in `feeds.yml`.
 ## Code layout
 
 ```
-src/gtfs_backend/
-  *.py       shared: settings, feeds.yml models, db, logging, service-day time, stop ids, keys,
-             Redis layout (live_layout.py), route_type -> mode
-  worker/    cli.py, runner.py (task loop), http.py (downloads)
-    static/  fetch -> archive -> read -> validate -> load (+ derive, integrity, partitions, versions)
-      stops/ stop matching: plan.py and shared.py decide (no DB), apply.py writes, osm.py reads OSM poles
-    realtime/ poller (one task per file) -> normalize -> store (Redis)
-             runtime.py: per feed, the trip index (trip_index.py) and recent delays/fixes;
-             normalize: resolve.py (trip_id -> timetable trip), trip_updates.py, vehicles.py, alerts.py
-  api/       cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog + stops in memory, Redis, SQL/geo)
+worker/src/          the worker (Rust)
+  main.rs            commands; runner.rs: the tasks; config.rs: env + feeds.yml; db.rs: pool + migrations;
+                     http.rs: downloads; metrics.rs; util.rs: service-day time, keys, stop slugs/ids, route_type -> mode
+  static_feed/       check (download, dedupe, archive) -> import: load.rs (parse + check + COPY), derive.rs,
+                     versions.rs (serving days, retirement), spec.rs (the GTFS tables)
+    stops/           stop matching: plan.rs and shared.rs decide (no DB), apply.rs reads and writes, osm.rs (OSM poles)
+  realtime/          poller.rs (one task per file) -> process.rs -> store.rs (Redis, change messages)
+                     runtime.rs: per feed, the trip index (index.rs) and what its files share; resolve.rs (trip_id ->
+                     timetable trip), trips.rs, vehicles.rs, alerts.rs, extra.rs (NEW/DUPLICATED trips, blocks)
+worker/migrations/   the schema, built into the worker and applied in order (*.sql)
+src/gtfs_backend/    the API (Python)
+  *.py               shared by the API's parts: settings, feeds.yml models, db, logging, service-day time, stop ids, keys,
+                     Redis layout (live_layout.py), route_type -> mode
+  api/               cli.py, app.py, routers/ (HTTP only), services/ (logic), schemas/, data/ (catalog + stops in memory, Redis, SQL/geo)
 ```
 
-Shared modules import neither `worker` nor `api`, and those don't import each other; `tests/test_boundaries.py`
-enforces this and checks the API loads none of the worker's dependencies.
+Shared modules don't import `api` (`tests/test_boundaries.py`).
 
 ## How it works
 
-One worker process runs one asyncio task per static feed and per realtime file, plus a daily retirement task.
-Static imports are CPU-heavy and run in a separate process.
+One worker process runs one task per static feed and per realtime file, plus OSM refresh, a daily retirement, a
+heartbeat that also flushes the metrics (tokio, multi-threaded: an import never holds up the polls). Imports run one at a time;
+a file is parsed and checked on a blocking thread while its rows stream into `COPY`, the rest is SQL.
 
 ### Static data (Postgres)
 
 - `gtfs.*`: one table per GTFS file with exactly its columns (plus `feed_version_id`), partitioned by version
-  (`gtfs.stop_times__kmk_t__v3`). Real Postgres types (`interval` for times, so `25:10:00` survives). An
-  **integrity check** compares stored values with the raw CSV after every import; any difference fails it. ZTP's
-  non-standard `blocks.txt` is kept as `gtfs.blocks`.
+  (`gtfs.stop_times__kmk_t__v3`). Real Postgres types (`interval` for times, so `25:10:00` survives). Values are stored
+  as published: empty fields are NULL, typed ones are checked (time, date, integer ranges, number) and trimmed, text is
+  kept byte for byte (no `NA` or `null` turned into NULL). Every problem of a file, missing required values and
+  references to unknown routes, services, trips or stops are collected and fail the import together; unknown shapes or
+  blocks are warnings. ZTP's non-standard `blocks.txt` is kept as `gtfs.blocks`. `frequencies.txt` isn't supported (a
+  warning says so: its trips would run once at their template times); no feed has one.
 - **Derived at import**: `core.service_date` (calendar expanded), `core.shape_line`, `core.stop_direction` (where
   trips go next) and `core.stop_departure`: every stop time a board can show (pickup allowed, not the trip's last
   stop), with its route and headsign, indexed by (stop, service, time), so a board reads one index range per stop
@@ -86,7 +99,7 @@ Static imports are CPU-heavy and run in a separate process.
   authoritative (`core.service_day_version`), so night trips survive an overnight update. A version is retired
   (rows dropped, zip kept in `ARCHIVE_DIR`) once it serves nothing from yesterday on. A failed import never
   replaces anything. Dropping partitions needs an exclusive lock, so retirement never runs during a worker import
-  and gives up after 2 s of waiting (it is retried). A crashed import process is replaced.
+  and gives up after 2 s of waiting (it is retried).
 - **Stops** (`core.stop_group` logical, `core.stop` physical poles, `core.stop_link` feed stop to our stop) have
   our own stable 5-letter ids and URL keys like `rondo-mogilskie01-qphdu`; only the part after the last dash counts.
   GTFS words keep their GTFS meaning: a *station* is a feed's `location_type=1` stop and `platform_code` is the
@@ -138,7 +151,7 @@ Rules:
   the map or departures. Nor do trips that aren't the timetabled trip their id names (GTFS-RT `NEW`, `ADDED`,
   `DUPLICATED`) unless the feed shows them (below): counted as unmatched with their kind, and a `/health` problem.
   `CANCELED` trips show as canceled; `DELETED` ones (and their vehicles) aren't shown at all.
-- **Extra trips** (`worker/realtime/extra.py`, feeds.yml `extra_trips`, default `new` and `duplicated`; `added` opt-in,
+- **Extra trips** (`worker/src/realtime/extra.rs`, feeds.yml `extra_trips`, default `new` and `duplicated`; `added` opt-in,
   as GTFS-RT never said what it means): a `NEW` trip comes from its update (its stops, absolute times, the descriptor's
   route and trip_properties' headsign; scheduled = predicted), a `DUPLICATED` one is the original trip shifted to the
   copy's start time under its own key (`trip_properties.trip_id`, else `{trip_id}#{date}T{start_time}`), so it never
@@ -148,14 +161,19 @@ Rules:
   trip of its block (GTFS-RT asks producers to send the next trips' updates; ZTP does).
 - **Delays are recomputed** as predicted − scheduled, scheduled = the feed's day start + GTFS time (noon minus 12 h
   unless `day_start: midnight`). They **propagate** (GTFS-RT): a stop without an update takes the last updated
-  stop's delay (`propagated: true`); `NO_DATA` stops that, `SKIPPED` passes it on.
+  stop's delay (`propagated: true`); `NO_DATA` stops that, `SKIPPED` passes it on. A trip-level `TripUpdate.delay`
+  applies from the trip's start up to its first stop update (no feed sends one yet).
+- **GTFS-RT details**: a `start_date` names the trip instance: only that service day's is matched (no feed sends one
+  yet). A vehicle with a `current_stop_sequence` but no `current_status` is `IN_TRANSIT_TO` it (the spec's default;
+  ~12 % of MPK's positions). `DIFFERENTIAL` feeds are refused (the spec calls them unsupported); every feed sends
+  `FULL_DATASET`.
 - **Clock-change days**: ZTP's trams count times from local midnight, not noon minus 12 h, so on the two
   clock-change days they run an hour off the GTFS reading (seen 2026-10-25, checked against tram GPS). `kmk_t`
   therefore has `day_start: midnight`. `median_delay_s` of about ±3600 on such a day would mean ZTP changed this.
 - **Service suffix**: after midnight ZTP's trams name a still-running trip of yesterday's timetable with today's
   `_service_N` (seen 2026-10-31, when a new timetable started), an id that exists in no version. `kmk_t` has
   `ignore_service_suffix: true`: an id not found as is is retried without the suffix and the time window picks the trip.
-- **Timetables in memory**: per feed, the trips running yesterday/today/tomorrow (`trip_index.py`). It is reloaded
+- **Timetables in memory**: per feed, the trips running yesterday/today/tomorrow (`worker/src/realtime/index.rs`). It is reloaded
   after an import and on a new day **in the background**, while the previous index keeps serving: a slow or
   unreachable Postgres never stops the live data (a failed reload is retried after 10 s). Unchanged versions are
   reused, so only an import of the feed itself reads its trips again. Stop times are loaded per trip when it first
@@ -168,9 +186,9 @@ Rules:
 - Downloads are checked against `Content-Length` and parsed before use. ZTP briefly serves empty or partial files
   while replacing them; those, 5xx and 429 are retried and never overwrite good data. Each attempt gives up after
   the feed's poll interval (at least 5 s, at most `REALTIME_FETCH_TIMEOUT`). Requests send `USER_AGENT`
-  (`worker/http.py`); put a contact for the feed operators in it.
+  (`worker/src/http.rs`); put a contact for the feed operators in it.
 - **Liveness**: the worker touches `/tmp/gtfs-worker.alive` every 30 s while all realtime tasks keep polling (the
-  compose healthcheck reads it). A task without a finished poll for `WATCHDOG_TIMEOUT` (10 min) stops the worker
+  compose healthcheck, `gtfs-worker healthcheck`, reads it). A task without a finished poll for `WATCHDOG_TIMEOUT` (10 min) stops the worker
   with exit code 1 and Docker restarts it.
 - A zip whose import failed is not retried (`static_previously_failed`, shown by `/health`) until the publisher
   changes it or someone runs `import-static --feed … --retry`.
@@ -303,10 +321,14 @@ lets the worker and the API run at a recording's time; it is 0 in production.
 ## Tests
 
 ```sh
-docker compose -f docker-compose.dev.yml up -d && uv run pytest
+docker compose -f docker-compose.dev.yml up -d
+cargo test --manifest-path worker/Cargo.toml     # the worker; its DB tests use `gtfs_test_worker` (TEST_WORKER_DATABASE_URL)
+cargo build --release --manifest-path worker/Cargo.toml && uv run pytest   # the API, on data the worker binary loads
 ```
 
-DB and Redis tests use a separate `gtfs_test` database / Redis db 15 and are skipped when the services are down.
+The API tests import their timetables and process the realtime snapshot with the worker binary (`GTFS_WORKER`,
+default `worker/target/release/gtfs-worker`). DB and Redis tests use a separate `gtfs_test` database / Redis db 15 and
+are skipped when the services (or the binary) are missing.
 `tests/fixtures/dst_2026-10-25/` is the realtime snapshot from the clock change; `tests/fixtures/static/` holds the
 matching timetables (made by `tests/fixtures/make_fixtures.py`).
 

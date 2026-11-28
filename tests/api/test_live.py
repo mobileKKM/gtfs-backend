@@ -4,13 +4,11 @@ import asyncio
 import random
 
 import pytest
-from conftest import TTLS
+from live_writer import LiveWriter
 from redis.asyncio import Redis
 
 from gtfs_backend.api.data.geo import Bbox
 from gtfs_backend.api.data.live import GRID_DEG, Changed, LiveState
-from gtfs_backend.worker.realtime.normalize import Result
-from gtfs_backend.worker.realtime.store import RealtimeStore
 
 KINDS = {"kmk_t": ["vehicle_positions", "trip_updates"], "kmk_a": ["vehicle_positions"]}
 
@@ -66,35 +64,35 @@ async def redis(redis_url):
     await r.aclose()
 
 
-async def poll(store, feed_id, kind, res):
-    """One poll of a file, as the poller writes and publishes it."""
+async def poll(store, feed_id, kind, items):
+    """One poll of a file, as the worker writes and publishes it."""
     changes = {}
     if kind == "vehicle_positions":
-        changes["vehicles"] = await store.write_vehicles(feed_id, res)
+        changes["vehicles"] = await store.write_vehicles(feed_id, items)
     else:
-        changes["trips"] = await store.write_trips(feed_id, res)
+        changes["trips"] = await store.write_trips(feed_id, items)
     await store.publish(feed_id, kind, 1000, changes)
 
 
 async def test_follows_the_workers_changes(redis):
-    store = RealtimeStore(redis, TTLS)
-    await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("735")]))  # before the API starts
+    store = LiveWriter(redis)
+    await poll(store, "kmk_t", "vehicle_positions", [vehicle("735")])  # before the API starts
     live = LiveState(redis, ["kmk_t", "kmk_a"], KINDS)
     live.start()
     try:
         assert await live.wait_ready(3)
         assert live.vehicle("kmk_t:735")["lat"] == 50.06  # loaded from Redis
-        await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("735", lat=50.07), vehicle("302")]))
+        await poll(store, "kmk_t", "vehicle_positions", [vehicle("735", lat=50.07), vehicle("302")])
         await until(lambda: live.vehicle("kmk_t:302") is not None)
         assert live.vehicle("kmk_t:735")["lat"] == 50.07
-        await poll(store, "kmk_t", "trip_updates", Result(trips=[trip("kmk_t:20261025:a", (1, "pa", 100), (2, "pb", 200))]))
+        await poll(store, "kmk_t", "trip_updates", [trip("kmk_t:20261025:a", (1, "pa", 100), (2, "pb", 200))])
         await until(lambda: "kmk_t:20261025:a" in live.trips)
         board = live.board(["kmk_t"], ["pb"], {})
         assert board.trip("kmk_t:20261025:a").version == 1
         assert board.stop("kmk_t:20261025:a", 2).predicted == 200 and board.stop("kmk_t:20261025:a", 1) is None
-        await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("302")]))  # 735 left
+        await poll(store, "kmk_t", "vehicle_positions", [vehicle("302")])  # 735 left
         await until(lambda: live.vehicle("kmk_t:735") is None)
-        await poll(store, "kmk_t", "trip_updates", Result())
+        await poll(store, "kmk_t", "trip_updates", [])
         await until(lambda: not live.trips)
         assert live._at_stop == {}  # the index follows
     finally:
@@ -102,14 +100,14 @@ async def test_follows_the_workers_changes(redis):
 
 
 async def test_a_missed_message_or_another_worker_loads_the_feed_again(redis):
-    store = RealtimeStore(redis, TTLS)
-    await poll(store, "kmk_t", "vehicle_positions", Result(vehicles=[vehicle("735")]))
+    store = LiveWriter(redis)
+    await poll(store, "kmk_t", "vehicle_positions", [vehicle("735")])
     live = LiveState(redis, ["kmk_t"], KINDS)
     await live.load()
     seq = live._seq[("kmk_t", "vehicle_positions")]
     # a message lost: the next one has the number after it
-    await store.write_vehicles("kmk_t", Result(vehicles=[vehicle("735"), vehicle("302")]))
-    store._seq[("kmk_t", "vehicle_positions")] += 1  # one published while the API wasn't listening
+    await store.write_vehicles("kmk_t", [vehicle("735"), vehicle("302")])
+    store.seq[("kmk_t", "vehicle_positions")] += 1  # one published while the API wasn't listening
     message = {
         "run": store.run,
         "feed_id": "kmk_t",

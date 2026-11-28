@@ -1,6 +1,6 @@
 # Production: Postgres/PostGIS + Redis + the worker (one process running every static/realtime task) + the HTTP API
 # (API_WORKERS processes behind one port).
-# The worker and the API are separate images (Dockerfile targets) with separate dependencies.
+# The worker (Rust) and the API (Python) are separate images (Dockerfile targets).
 #   POSTGRES_PASSWORD=... docker compose up -d --build
 # The API also joins the external `nginx_proxy` network (create it once: docker network create nginx_proxy), so a
 # reverse proxy on that network reaches it as http://api:8000.
@@ -49,14 +49,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ARCHIVE_DIR: /data/archive
       OSM_STOPS_FILE: /data/osm/stops.json
-    command: ["sh", "-c", "alembic upgrade head && exec gtfs-worker run"]
+    # `gtfs-worker run` (the image's command) applies the schema migrations first
     volumes:
       - ./data:/data
       - ./feeds.yml:/app/feeds.yml:ro
     # the worker touches /tmp/gtfs-worker.alive every 30 s while all realtime tasks keep polling (and exits, so it is
     # restarted, when one is stuck for WATCHDOG_TIMEOUT); unhealthy = no touch for 2 minutes
     healthcheck:
-      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/gtfs-worker.alive') > 120)"]
+      test: ["CMD", "gtfs-worker", "healthcheck", "--max-age", "120"]
       interval: 30s
       timeout: 5s
       retries: 3
